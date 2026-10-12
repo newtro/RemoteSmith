@@ -1,2 +1,4 @@
 .claude/
 .DS_Store
+# local build outputs and logs (scripts/build-mac.sh, scripts/bootstrap-mac.sh)
+build/

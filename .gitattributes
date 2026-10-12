@@ -1,0 +1,7 @@
+# Patch files must reach git am byte-for-byte (CRLF hunks, binary diffs), whatever core.autocrlf says.
+patches/** -text
+# Scripts run by bash (including Git Bash / CI on Windows) must keep LF line endings.
+*.sh text eol=lf
+*.bash text eol=lf
+*.cmake text eol=lf
+*.py text eol=lf
