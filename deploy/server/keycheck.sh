@@ -7,9 +7,9 @@
 #
 # Why this exists: hbbs and hbbr 1.1.16 FAIL OPEN on key problems. When `-k _` cannot
 # read id_ed25519 and cannot write a new one, they log nothing alarming, use an empty
-# key and accept every client. The units run this check after hbbs starts
-# (ExecStartPost, with --wait) and before hbbr starts (ExecStartPre), so a key problem
+# key and accept every client. Both units run this as ExecStartPre, so a key problem
 # fails the unit instead of silently turning enforcement off (PLAN §9, AC-5).
+# install.sh also uses it to validate generated and restored keys.
 set -eu
 
 wait_s=0

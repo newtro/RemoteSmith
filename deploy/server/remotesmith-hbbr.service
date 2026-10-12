@@ -7,8 +7,7 @@
 [Unit]
 Description=RemoteSmith relay server (RustDesk hbbr)
 Documentation=https://github.com/rustdesk/rustdesk-server
-# hbbr must load the keypair hbbs owns. If hbbr started first on a fresh install it
-# would mint a different key of its own and refuse every real client.
+# Started after hbbs so a broken key shows up on hbbs first; both check it themselves.
 After=network-online.target remotesmith-hbbs.service
 Wants=network-online.target
 ConditionPathExists=/opt/remotesmith-server/bin/hbbr

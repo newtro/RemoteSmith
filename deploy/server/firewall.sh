@@ -65,10 +65,30 @@ case "$MODE" in
       printf '%s\n' "$status" | grep -qE "^${r} \(v6\)[[:space:]]+ALLOW IN" \
         || { echo "FAIL: missing IPv6 allow $r"; fail=1; }
     done
-    # Any rule mentioning a WebSocket/Pro port, or opening more than the two ranges, is wrong.
-    if printf '%s\n' "$status" | grep -E 'ALLOW' | grep -E '\b2111[489]\b|21115:2111[89]|2111[0-9]:2112'; then
-      echo "FAIL: a rule exposes 21114, 21118 or 21119"; fail=1
-    fi
+    # No ALLOW rule may cover 21114 (Pro), 21118 or 21119 (WebSocket), whatever its
+    # shape: single ports, lists, ranges, or port-less rules that allow everything.
+    while IFS= read -r line; do
+      to=${line%%ALLOW*}
+      to=${to//(v6)/}
+      to=$(printf '%s' "$to" | sed 's/[[:space:]]*$//')
+      if [[ $to == Anywhere* ]]; then
+        echo "FAIL: '$line' allows every port (including 21114/21118/21119)"; fail=1; continue
+      fi
+      spec=${to%%/*}
+      spec=${spec%% *}
+      if [[ ! $spec =~ ^[0-9,:]+$ ]]; then
+        echo "WARN: can't evaluate '$line' (application profile?); check it by hand"; continue
+      fi
+      IFS=, read -r -a items <<< "$spec"
+      for item in "${items[@]}"; do
+        lo=${item%%:*}; hi=${item##*:}
+        for bad in 21114 21118 21119; do
+          if (( lo <= bad && bad <= hi )); then
+            echo "FAIL: '$line' exposes $bad"; fail=1
+          fi
+        done
+      done
+    done < <(printf '%s\n' "$status" | grep -E '[[:space:]]ALLOW[[:space:]]' || true)
     if [[ $fail == 0 ]]; then echo "firewall OK"; else exit 1; fi
     ;;
 esac

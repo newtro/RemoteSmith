@@ -18,14 +18,23 @@ StartLimitBurst=10
 Type=simple
 User=remotesmith
 Group=remotesmith
-# hbbs reads and writes id_ed25519, id_ed25519.pub and db_v2.sqlite3 in its cwd.
+# hbbs reads id_ed25519 and reads/writes db_v2.sqlite3 in its cwd.
 WorkingDirectory=/opt/remotesmith-server/data
-# -k _ : load (first start: create) the keypair in data/ and refuse clients whose key
-#        differs. This is hbbs's default ("-"); it is spelled out so it can't drift.
+# install.sh creates the keypair before the first start (rustdesk-utils genkeypair).
+# hbbs 1.1.16 fails OPEN when it can't read or create its key: it runs with an empty
+# key and accepts every client. So hbbs never starts without a valid, readable key,
+# and never gets to mint one itself (an unreadable id_ed25519 would also make it
+# overwrite id_ed25519.pub with a fresh, mismatched key).
+ExecStartPre=/opt/remotesmith-server/libexec/keycheck.sh /opt/remotesmith-server/data
+# hbbs resolves the -r name once at startup and silently drops it if DNS fails, after
+# which it hands clients no relay until restarted. Give DNS up to 60 s at boot; start
+# anyway if it never answers (the "-" prefix), and install.sh --status flags it.
+ExecStartPre=-/opt/remotesmith-server/libexec/wait-resolve.sh rs.johnnycode.ai 60
+# -k _ : load the keypair from data/ and refuse clients whose key differs. This is
+#        hbbs's default ("-"); it is spelled out so it can't drift.
 # -r   : the relay that hbbs hands to clients.
 ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.johnnycode.ai:21117 --key _
-# hbbs fails open if it can't load or create the key. Fail the unit instead.
-ExecStartPost=/opt/remotesmith-server/libexec/keycheck.sh --wait 20 /opt/remotesmith-server/data
+TimeoutStartSec=120
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

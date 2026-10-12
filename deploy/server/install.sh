@@ -18,9 +18,11 @@
 #   previous -> releases/<ver>                   the version --rollback returns to
 #   data/                                        keys + peer DB (remotesmith:remotesmith 0700)
 #   backups/data-<UTC>-<ver>.tar.gz              taken before every change (root 0700)
-#   libexec/keycheck.sh                          key validation used by the units
+#   libexec/{keycheck,wait-resolve}.sh           helpers the units run before start
 #   kit/                                         copy of this deploy kit, so --status and
 #                                                --rollback work without the repo checkout
+#   kits/<ver>/                                  the kit (units, helpers) last installed with
+#                                                each version; rollback reinstalls it
 #   id_ed25519.pub                               public copy of the server key (0644)
 #
 # It touches nothing outside that tree except: the remotesmith system user, the two
@@ -35,6 +37,9 @@ SVC_USER=remotesmith
 HBBS=remotesmith-hbbs.service
 HBBR=remotesmith-hbbr.service
 RELEASE_URL=https://github.com/rustdesk/rustdesk-server/releases/download
+# Must match --relay-servers in remotesmith-hbbs.service.
+RS_HOST=rs.johnnycode.ai
+RELAY=$RS_HOST:21117
 
 # Pinned release assets: <version>/<asset arch> -> SHA-256 of
 # rustdesk-server-linux-<asset arch>.zip, as published on the GitHub release (asset
@@ -255,15 +260,20 @@ point_link() {
 }
 
 UNITS_CHANGED=0
+# install_support_files [KITDIR]: install the helpers and unit files from KITDIR
+# (default: this script's directory).
 install_support_files() {
-  local f src dst
-  if ! cmp -s "$SCRIPT_DIR/keycheck.sh" "$PREFIX/libexec/keycheck.sh" 2>/dev/null; then
-    log "installing libexec/keycheck.sh"
-    run install -m 0755 -o root -g root "$SCRIPT_DIR/keycheck.sh" "$PREFIX/libexec/keycheck.sh"
-    UNITS_CHANGED=1
-  fi
+  local kit=${1:-$SCRIPT_DIR} f src dst
+  for f in keycheck.sh wait-resolve.sh; do
+    [[ -f $kit/$f ]] || die "missing $kit/$f"
+    if ! cmp -s "$kit/$f" "$PREFIX/libexec/$f" 2>/dev/null; then
+      log "installing libexec/$f"
+      run install -m 0755 -o root -g root "$kit/$f" "$PREFIX/libexec/$f"
+      UNITS_CHANGED=1
+    fi
+  done
   for f in "$HBBS" "$HBBR"; do
-    src="$SCRIPT_DIR/$f"
+    src="$kit/$f"
     dst="$UNIT_DIR/$f"
     [[ -f $src ]] || die "missing $src"
     if cmp -s "$src" "$dst" 2>/dev/null; then
@@ -284,17 +294,68 @@ install_support_files() {
 }
 
 # Keep a copy of the kit on the box: sudo /opt/remotesmith-server/kit/install.sh --status
-KIT_FILES=(install.sh keycheck.sh firewall.sh probe.py remotesmith-hbbs.service remotesmith-hbbr.service README.md)
-install_kit() {
-  local f
-  [[ $SCRIPT_DIR == "$PREFIX/kit" ]] && return 0
-  run install -d -m 0755 -o root -g root "$PREFIX/kit"
+KIT_FILES=(install.sh keycheck.sh wait-resolve.sh firewall.sh probe.py
+  remotesmith-hbbs.service remotesmith-hbbr.service README.md firewall.md dns.md)
+# copy_kit DEST: copy this kit to DEST (skipped when DEST is where we run from).
+copy_kit() {
+  local dest=$1 f
+  [[ $SCRIPT_DIR == "$dest" ]] && return 0
+  run install -d -m 0755 -o root -g root "$dest"
   for f in "${KIT_FILES[@]}"; do
     [[ -f $SCRIPT_DIR/$f ]] || continue
-    cmp -s "$SCRIPT_DIR/$f" "$PREFIX/kit/$f" 2>/dev/null && continue
-    case "$f" in *.sh|*.py) run install -m 0755 -o root -g root "$SCRIPT_DIR/$f" "$PREFIX/kit/$f" ;;
-      *) run install -m 0644 -o root -g root "$SCRIPT_DIR/$f" "$PREFIX/kit/$f" ;; esac
+    cmp -s "$SCRIPT_DIR/$f" "$dest/$f" 2>/dev/null && continue
+    case "$f" in *.sh|*.py) run install -m 0755 -o root -g root "$SCRIPT_DIR/$f" "$dest/$f" ;;
+      *) run install -m 0644 -o root -g root "$SCRIPT_DIR/$f" "$dest/$f" ;; esac
   done
+}
+
+# Going back to a version also means going back to the units and helpers it ran with.
+restore_kit_for() {
+  local ver=$1
+  if [[ -f $PREFIX/kits/$ver/$HBBS ]]; then
+    log "reinstalling the units and helpers last used with $ver (kits/$ver)"
+    install_support_files "$PREFIX/kits/$ver"
+  else
+    warn "no kits/$ver snapshot; keeping the current units and helpers"
+  fi
+}
+
+# The server key. hbbs could create it on first start, but 1.1.16 fails open while
+# doing so (see keycheck.sh), so it is made here, before any daemon runs. An existing
+# key is never replaced: a new key means re-keying every client.
+KEY_CREATED=0
+ensure_key() {
+  local d=$PREFIX/data utils=$PREFIX/releases/$VERSION/rustdesk-utils out pk sk
+  if [[ -e $d/id_ed25519 || -e $d/id_ed25519.pub ]]; then
+    if [[ $DRY_RUN == 1 ]]; then log "data/ has a keypair (would validate it)"; return 0; fi
+    "$PREFIX/libexec/keycheck.sh" "$d" \
+      || die "data/ holds an invalid or mismatched keypair. Not generating a new one (that re-keys every client); restore it with --restore-data (README, Keys)"
+    log "existing keypair is valid"
+    return 0
+  fi
+  log "no keypair yet: generating one with rustdesk-utils genkeypair"
+  if [[ $DRY_RUN == 1 ]]; then
+    printf 'DRY-RUN: %s genkeypair -> data/id_ed25519 (0600), data/id_ed25519.pub\n' "$utils"
+    return 0
+  fi
+  pk=
+  for _ in $(seq 1 100); do
+    out=$("$utils" genkeypair)
+    pk=$(printf '%s\n' "$out" | awk '/^Public Key:/ {print $3}')
+    sk=$(printf '%s\n' "$out" | awk '/^Secret Key:/ {print $3}')
+    # hbbs only hands out public keys without '/' or ':'; keep to that.
+    if [[ -n $pk && -n $sk && $pk != */* && $pk != *:* ]]; then break; fi
+    pk=
+  done
+  [[ -n $pk ]] || die "could not generate a keypair with $utils"
+  (umask 077; printf '%s' "$sk" > "$d/.id_ed25519.new"; printf '%s' "$pk" > "$d/.id_ed25519.pub.new")
+  sk=; out=
+  chown "$SVC_USER:$SVC_USER" "$d/.id_ed25519.new" "$d/.id_ed25519.pub.new"
+  mv "$d/.id_ed25519.pub.new" "$d/id_ed25519.pub"
+  mv "$d/.id_ed25519.new" "$d/id_ed25519"
+  "$PREFIX/libexec/keycheck.sh" "$d" || die "the generated keypair failed validation"
+  log "generated server key $pk"
+  KEY_CREATED=1
 }
 
 publish_pubkey() {
@@ -303,8 +364,7 @@ publish_pubkey() {
   install -m 0644 -o root -g root "$PREFIX/data/id_ed25519.pub" "$PREFIX/id_ed25519.pub"
 }
 
-# hbbs first: on a fresh install it creates the keypair, and its ExecStartPost waits
-# for a valid key before systemd counts it as started. Only then hbbr.
+# hbbs first, then hbbr (hbbr is also ordered After= hbbs).
 restart_services() {
   log "restarting $HBBS then $HBBR"
   # A deliberate restart shouldn't trip the crash-loop start limit left by earlier ones.
@@ -317,7 +377,7 @@ restart_services() {
 
 # Prints problems and returns non-zero if the install is unhealthy.
 health() {
-  local ok=0 pk unit p proto line inv
+  local ok=0 pk unit p proto line
   for unit in "$HBBS" "$HBBR"; do
     if is_active "$unit"; then log "$unit active"; else warn "$unit is not active"; ok=1; fi
   done
@@ -339,11 +399,7 @@ health() {
   # key (fail-open) prints no such line. Only the current run's log counts.
   if [[ -n ${pk:-} ]]; then
     for unit in "$HBBS" "$HBBR"; do
-      inv=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || true)
-      line=
-      if [[ -n $inv ]]; then
-        line=$(journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null | grep -E 'Key: ' | tail -1 || true)
-      fi
+      line=$(current_log "$unit" | grep -E 'Key: ' | tail -1 || true)
       if [[ $line == *"Key: $pk"* ]]; then
         log "$unit enforces the server key"
       else
@@ -351,7 +407,24 @@ health() {
       fi
     done
   fi
+  # hbbs resolves --relay-servers once at start and drops the name if DNS fails;
+  # clients then get no relay from it until hbbs restarts.
+  line=$(current_log "$HBBS" | grep -E 'relay-servers=' | tail -1 || true)
+  if [[ $line == *"relay-servers=[\"$RELAY\"]"* ]]; then
+    log "hbbs hands out relay $RELAY"
+  else
+    warn "hbbs is not handing out relay $RELAY (log: ${line:-none}); does $RS_HOST resolve? Fix DNS, then: sudo systemctl restart $HBBS"
+    ok=1
+  fi
   return $ok
+}
+
+# The journal of the unit's current run only.
+current_log() {
+  local inv
+  inv=$(systemctl show -p InvocationID --value "$1" 2>/dev/null || true)
+  [[ -n $inv ]] || return 0
+  journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null || true
 }
 
 # Retry health for a few seconds: the daemons log asynchronously.
@@ -372,6 +445,10 @@ do_install() {
   prev=$(link_version previous)
   log "target version $VERSION; installed: ${cur:-none}; previous: ${prev:-none}"
   if [[ -z $cur ]]; then check_ports; fi
+  if ! getent ahosts "$RS_HOST" >/dev/null 2>&1; then
+    if [[ $DRY_RUN == 1 ]]; then warn "$RS_HOST does not resolve here"
+    else die "$RS_HOST does not resolve. Create the DNS records first (dns.md): hbbs resolves its relay name only at start."; fi
+  fi
   check_memory
   fetch_release
   ensure_user
@@ -379,6 +456,7 @@ do_install() {
   backup_data "pre-install-$VERSION"
   install_release
   install_support_files
+  ensure_key
   local switched=0
   if [[ $cur != "$VERSION" ]]; then
     if [[ -n $cur ]]; then
@@ -400,14 +478,17 @@ do_install() {
       warn "unhealthy after switching to $VERSION; rolling back to $cur"
       point_link bin "$cur"
       if [[ -n $prev ]]; then point_link previous "$prev"; else run rm -f "$PREFIX/previous"; fi
+      restore_kit_for "$cur"
       restart_services
       wait_healthy || die "rollback to $cur is unhealthy too; see journalctl -u $HBBS -u $HBBR"
       die "upgrade to $VERSION failed and was rolled back to $cur"
     fi
     die "install is unhealthy; see journalctl -u $HBBS -u $HBBR"
   fi
+  if [[ $KEY_CREATED == 1 ]]; then backup_data "new-key"; fi
   publish_pubkey
-  install_kit
+  copy_kit "$PREFIX/kit"
+  copy_kit "$PREFIX/kits/$VERSION"
   summary
 }
 
@@ -423,8 +504,9 @@ do_rollback() {
   backup_data "pre-rollback-to-$prev"
   point_link bin "$prev"
   if [[ -n $cur ]]; then point_link previous "$cur"; fi
+  restore_kit_for "$prev"
   restart_services
-  wait_healthy || die "unhealthy after rollback to $prev; run '$0' to return to $cur"
+  wait_healthy || die "unhealthy after rollback to $prev; run '$0 --rollback' again to return to $cur"
   publish_pubkey
   summary
 }
@@ -441,13 +523,17 @@ do_restore() {
       *) die "refusing $RESTORE_FILE: it contains a non-regular entry: $kind" ;;
     esac
   done < <(tar -tvzf "$RESTORE_FILE")
+  # Only the files hbbs/hbbr keep in data/. In particular no .env: both daemons load
+  # one from their working directory and would take settings from it.
   while IFS= read -r entry; do
     case "$entry" in
-      data|data/|data/*) ;;
-      *) die "refusing $RESTORE_FILE: entry '$entry' is outside data/" ;;
+      data|data/|data/id_ed25519|data/id_ed25519.pub|data/db_v2.sqlite3|data/db_v2.sqlite3-wal|data/db_v2.sqlite3-shm|data/blacklist.txt|data/blocklist.txt) ;;
+      *) die "refusing $RESTORE_FILE: unexpected entry '$entry' (only the key, peer DB and block lists are restored)" ;;
     esac
-    case "$entry" in *..*) die "refusing $RESTORE_FILE: entry '$entry' contains '..'" ;; esac
   done < <(tar -tzf "$RESTORE_FILE")
+  local total
+  total=$(tar -tvzf "$RESTORE_FILE" | awk '{s += $3} END {print s + 0}')
+  [[ $total -le 268435456 ]] || die "refusing $RESTORE_FILE: it unpacks to $total bytes"
   TMP=$(mktemp -d)
   tar -C "$TMP" -xzf "$RESTORE_FILE" --no-same-owner
   "$SCRIPT_DIR/keycheck.sh" "$TMP/data" || die "$RESTORE_FILE does not hold a valid keypair"

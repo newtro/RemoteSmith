@@ -16,6 +16,8 @@ Facts verified 2026-10-12:
 
 Per the `aws-vm` skill, this is a DNS change, so it is made only with Scott's approval, and it touches **only** these two records.
 
+**Create the records before the first `install.sh`.** hbbs resolves its `--relay-servers` name once, at start. If the name doesn't resolve then, hbbs drops it and hands clients no relay until it restarts. `install.sh` refuses to run while `rs.johnnycode.ai` doesn't resolve on the VM.
+
 ## Procedure (Cloudflare API)
 
 The Cloudflare token lives in `~/.config/cloudflare/credentials.env` on the Mac (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`). Don't echo it. The script below sources it into the environment.
@@ -31,13 +33,14 @@ ZONE_ID=$(curl -fsS "${AUTH[@]}" "$CF/zones?name=johnnycode.ai" | python3 -c 'im
 curl -fsS "${AUTH[@]}" "$CF/zones/$ZONE_ID/dns_records?name=rs.johnnycode.ai" \
   | python3 -c 'import json,sys; print([(r["type"], r["content"]) for r in json.load(sys.stdin)["result"]])'
 
-# 2. Create the two records, DNS-only.
-for rec in 'A 98.93.243.79' 'AAAA 2600:1f18:72b8:5500:81e8:9091:9439:f3ef'; do
-  set -- $rec
+# 2. Create the two records, DNS-only. (Explicit calls, no loops: works in bash and zsh.)
+add_record() {
   curl -fsS "${AUTH[@]}" -X POST "$CF/zones/$ZONE_ID/dns_records" \
     --data "{\"type\":\"$1\",\"name\":\"rs.johnnycode.ai\",\"content\":\"$2\",\"proxied\":false,\"ttl\":1,\"comment\":\"RemoteSmith hbbs/hbbr (DNS-only: raw TCP/UDP 21115-21117)\"}" \
     | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["success"], r["result"]["type"], r["result"]["content"], "proxied=", r["result"]["proxied"])'
-done
+}
+add_record A 98.93.243.79
+add_record AAAA 2600:1f18:72b8:5500:81e8:9091:9439:f3ef
 ```
 
 If step 1 lists anything, stop and ask: the name is taken.

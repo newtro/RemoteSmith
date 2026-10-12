@@ -19,7 +19,7 @@ These stay **closed**:
 The VM has two firewall layers, and both must allow the ports: the Lightsail instance firewall, then ufw on the host. Facts verified 2026-10-12:
 
 - **Lightsail:** instance `Ubuntu-1`, region `us-east-1`, dual-stack. Open today: TCP 22, 80 and 443, each with `0.0.0.0/0` and `::/0`.
-- **Host:** ufw is active with `Default: deny (incoming)`. It allows only 22, 80 and 443, over v4 and v6, through the iptables-nft backend. There is no separate nftables ruleset to edit.
+- **Host:** ufw is active with `Default: deny (incoming)`. It allows only 22, 80 and 443, over v4 and v6, through the iptables-nft backend. The two other nftables tables on the VM don't affect inbound 2111x and stay untouched: `inet f2b-table` (fail2ban sshd bans) and `inet tradesmith_ai_egress` (output, for one uid).
 
 ## 1. Lightsail instance firewall
 

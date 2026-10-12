@@ -3,12 +3,13 @@
 #
 #   deploy/server/verify-server.sh                 full check against rs.johnnycode.ai
 #   deploy/server/verify-server.sh --key KEY       use KEY instead of fetching it over ssh
-#   deploy/server/verify-server.sh --ipv6          also check the ports over IPv6
+#   deploy/server/verify-server.sh --ipv6          require the IPv6 port checks (by default
+#                                                  they run when this host has IPv6 to the VM)
 #   deploy/server/verify-server.sh --no-server-status   skip the ssh health report
 #   deploy/server/verify-server.sh --host H --no-dns --key K --no-server-status
 #                                                  probe any server (e.g. a test container)
 #
-# Checks: DNS (A, and AAAA when --ip6 is set, DNS-only so it is the VM's own address),
+# Checks: DNS (A and AAAA must be the VM's own addresses, i.e. DNS-only; --ip6 "" skips AAAA),
 # TCP 21115-21117 reachable, UDP 21116 answers a registration, TCP 21114/21118/21119
 # NOT reachable, and AC-5: hbbs and hbbr refuse a wrong key and a missing key, and
 # accept the right one (positive control). Prints the client configuration at the end.
@@ -80,8 +81,12 @@ check_ports() {
   else fail "udp/21116: $r"; fi
 }
 check_ports "$HOST" "IPv4/DNS"
-if [[ $CHECK_V6 == 1 ]]; then
-  check_ports "$IP6" "IPv6"
+if [[ -n $IP6 ]]; then
+  if [[ $CHECK_V6 == 1 || $(probe tcp "$IP6" 22) == open ]]; then
+    check_ports "$IP6" "IPv6"
+  else
+    echo "SKIP  IPv6 port checks: no IPv6 path from this host to $IP6 (use --ipv6 to require them)"
+  fi
 fi
 
 echo "== server key"
