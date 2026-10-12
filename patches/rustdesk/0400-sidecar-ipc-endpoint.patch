@@ -30,19 +30,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/core_main.rs             |    5 +
  src/ipc.rs                   |   12 +
  src/lib.rs                   |    4 +
- src/remotesmith/collect.rs   |  392 +++++++++++++
- src/remotesmith/host.rs      |   97 ++++
+ src/remotesmith/collect.rs   |  428 ++++++++++++++
+ src/remotesmith/host.rs      |   98 ++++
  src/remotesmith/mod.rs       |  203 +++++++
  src/remotesmith/presence.rs  |  186 ++++++
  src/remotesmith/protocol.rs  | 1026 ++++++++++++++++++++++++++++++++++
- src/remotesmith/readiness.rs |  356 ++++++++++++
+ src/remotesmith/readiness.rs |  411 ++++++++++++++
  src/remotesmith/relay.rs     |  119 ++++
  src/remotesmith/server.rs    |  551 ++++++++++++++++++
- src/remotesmith/sessions.rs  |  340 +++++++++++
- src/remotesmith/tests.rs     |  904 ++++++++++++++++++++++++++++++
+ src/remotesmith/sessions.rs  |  380 +++++++++++++
+ src/remotesmith/tests.rs     |  975 ++++++++++++++++++++++++++++++++
  src/remotesmith/winsec.rs    |   44 ++
  src/server.rs                |    3 +
- 15 files changed, 4242 insertions(+)
+ 15 files changed, 4445 insertions(+)
  create mode 100644 src/remotesmith/collect.rs
  create mode 100644 src/remotesmith/host.rs
  create mode 100644 src/remotesmith/mod.rs
@@ -116,10 +116,10 @@ index 649f3ef955b0..34d90d90213c 100644
 +pub mod remotesmith;
 diff --git a/src/remotesmith/collect.rs b/src/remotesmith/collect.rs
 new file mode 100644
-index 000000000000..16d77bec6d17
+index 000000000000..e8da058cb149
 --- /dev/null
 +++ b/src/remotesmith/collect.rs
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,428 @@
 +//! Builds the endpoint's snapshot (Status + Peers, docs/IPC.md §7-8) on threads of its own and
 +//! publishes it through a `watch` channel; the server only ever reads the latest snapshot.
 +//!
@@ -287,31 +287,67 @@ index 000000000000..16d77bec6d17
 +    }
 +}
 +
++/// Prerequisites (other than the cold-boot record) that do not positively pass. Anything
++/// unknown counts as failing (fail closed).
++pub fn failing_checks(s: &Status) -> Vec<&'static str> {
++    let mut out = Vec::new();
++    if !s.service.running {
++        out.push("service");
++    }
++    match s.platform {
++        Platform::Macos => {
++            for (n, label) in [
++                (Permission::Accessibility, "accessibility"),
++                (Permission::ScreenRecording, "screen_recording"),
++                (Permission::InputMonitoring, "input_monitoring"),
++                (Permission::SystemAudioRecording, "system_audio_recording"),
++            ] {
++                if !s
++                    .permissions
++                    .iter()
++                    .any(|p| p.name == n && p.state == PermState::Granted)
++                {
++                    out.push(label);
++                }
++            }
++        }
++        Platform::Windows => {}
++        Platform::Other => out.push("platform"),
++    }
++    if s.power.sleep_disabled != Some(true) {
++        out.push("power");
++    }
++    if s.preboot_unlock.detected != Some(false) {
++        out.push("preboot_unlock");
++    }
++    if s.server.state != RegState::Registered {
++        out.push("server");
++    }
++    out
++}
++
 +/// The fork's "Unattended ready" flag (docs/IPC.md §7): a recorded cold-boot login-screen
-+/// connection, and every prerequisite passing now. The sidecar re-derives the same checks.
++/// connection (made with every prerequisite passing, see `sessions::ledger`), and every
++/// prerequisite passing now. The sidecar re-derives the same checks.
 +pub fn unattended_ready(s: &Status) -> bool {
-+    let perms_ok = match s.platform {
-+        Platform::Macos => [
-+            Permission::Accessibility,
-+            Permission::ScreenRecording,
-+            Permission::InputMonitoring,
-+            Permission::SystemAudioRecording,
-+        ]
-+        .iter()
-+        .all(|n| {
-+            s.permissions
-+                .iter()
-+                .any(|p| &p.name == n && p.state == PermState::Granted)
-+        }),
-+        Platform::Windows => true,
-+        Platform::Other => false,
-+    };
-+    s.unattended.cold_boot_verified_at.is_some()
-+        && s.service.running
-+        && perms_ok
-+        && s.power.sleep_disabled == Some(true)
-+        && s.preboot_unlock.detected == Some(false)
-+        && s.server.state == RegState::Registered
++    s.unattended.cold_boot_verified_at.is_some() && failing_checks(s).is_empty()
++}
++
++/// The prerequisites as this process sees them right now (used when recording the cold-boot
++/// connection, in the process that served it). Blocking: runs the readiness checks.
++pub fn prerequisites_now() -> Status {
++    Status {
++        platform: this_platform(),
++        service: readiness::service(),
++        permissions: readiness::permissions(),
++        power: readiness::power(),
++        preboot_unlock: readiness::preboot(),
++        server: server_status(
++            &hbb_common::config::Config::get_rendezvous_servers(),
++            hbb_common::config::get_online_state(),
++        ),
++        ..Default::default()
++    }
 +}
 +
 +fn this_platform() -> Platform {
@@ -514,10 +550,10 @@ index 000000000000..16d77bec6d17
 +}
 diff --git a/src/remotesmith/host.rs b/src/remotesmith/host.rs
 new file mode 100644
-index 000000000000..cea34006d641
+index 000000000000..e2e8dc97ca97
 --- /dev/null
 +++ b/src/remotesmith/host.rs
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,98 @@
 +//! Facts only the process hosting the RustDesk server knows. On macOS that is the same process
 +//! as the endpoint; on Windows the SYSTEM `--server` answers `ipc::Data::RemoteSmithHost` with
 +//! them and the user's `--tray` relays them to the sidecar.
@@ -574,7 +610,8 @@ index 000000000000..cea34006d641
 +            return rec.clone();
 +        }
 +    }
-+    let rec = sessions::ledger::read();
++    // A record without captured prerequisites (an older build) does not count: fail closed.
++    let rec = sessions::ledger::read().filter(|r| !r.prerequisites_passed.is_empty());
 +    *c = Some((Instant::now(), rec.clone()));
 +    rec
 +}
@@ -2050,10 +2087,10 @@ index 000000000000..e07dc0e7b6c2
 +}
 diff --git a/src/remotesmith/readiness.rs b/src/remotesmith/readiness.rs
 new file mode 100644
-index 000000000000..159a8cc47b43
+index 000000000000..11ad439d9166
 --- /dev/null
 +++ b/src/remotesmith/readiness.rs
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,411 @@
 +//! Readiness checks (§6.3, AC-55): each one only reads state; none changes a setting.
 +//! All of them may block (subprocesses, TCC queries) and run on the collector's readiness thread.
 +
@@ -2204,31 +2241,55 @@ index 000000000000..159a8cc47b43
 +            }
 +            parse_powercfg_ac(&String::from_utf8_lossy(&out.stdout))
 +        };
-+        return match (q("STANDBYIDLE"), q("HIBERNATEIDLE")) {
-+            (Some(0), Some(0)) | (Some(0), None) => PowerStatus {
-+                sleep_disabled: Some(true),
-+                detail: None,
-+            },
-+            (Some(s), h) => PowerStatus {
-+                sleep_disabled: Some(false),
-+                detail: Some(match h {
-+                    Some(h) if s == 0 => format!("on AC the PC hibernates after {} min", h / 60),
-+                    Some(h) if h > 0 => format!(
-+                        "on AC the PC sleeps after {} min and hibernates after {} min",
-+                        s / 60,
-+                        h / 60
-+                    ),
-+                    _ => format!("on AC the PC sleeps after {} min", s / 60),
-+                }),
-+            },
-+            (None, _) => PowerStatus {
-+                sleep_disabled: None,
-+                detail: Some("could not read the power plan (powercfg)".into()),
-+            },
++        // HibernateEnabled = 0 means hibernation is off system-wide, so the hibernate timer
++        // cannot fire. Missing or unreadable: unknown.
++        let hibernate_enabled = {
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            RegKey::predef(HKEY_LOCAL_MACHINE)
++                .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Power")
++                .and_then(|k| k.get_value::<u32, _>("HibernateEnabled"))
++                .ok()
++                .map(|v| v != 0)
 +        };
++        return windows_power(q("STANDBYIDLE"), q("HIBERNATEIDLE"), hibernate_enabled);
 +    }
 +    #[allow(unreachable_code)]
 +    PowerStatus::default()
++}
++
++/// Windows AC power: "never sleeps" only when the sleep timer is positively 0 **and** the
++/// hibernate timer is positively 0 or hibernation is positively disabled. Anything unread is
++/// unknown (fail closed).
++#[cfg_attr(not(windows), allow(dead_code))]
++pub fn windows_power(
++    standby: Option<u64>,
++    hibernate: Option<u64>,
++    hibernate_enabled: Option<bool>,
++) -> PowerStatus {
++    let unknown = |d: &str| PowerStatus {
++        sleep_disabled: None,
++        detail: Some(d.into()),
++    };
++    let Some(s) = standby else {
++        return unknown("could not read the sleep timer (powercfg)");
++    };
++    if s > 0 {
++        return PowerStatus {
++            sleep_disabled: Some(false),
++            detail: Some(format!("on AC the PC sleeps after {} min", s / 60)),
++        };
++    }
++    match (hibernate, hibernate_enabled) {
++        (Some(0), _) | (_, Some(false)) => PowerStatus {
++            sleep_disabled: Some(true),
++            detail: None,
++        },
++        (Some(h), _) => PowerStatus {
++            sleep_disabled: Some(false),
++            detail: Some(format!("on AC the PC hibernates after {} min", h / 60)),
++        },
++        (None, _) => unknown("could not read the hibernate timer (powercfg)"),
++    }
 +}
 +
 +#[cfg(windows)]
@@ -2315,15 +2376,24 @@ index 000000000000..159a8cc47b43
 +} catch [System.Management.Automation.CommandNotFoundException] {
 +  try {
 +    $w = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'"
-+  } catch { "status=Absent"; exit 0 }
-+  if (-not $w) { "status=Absent"; exit 0 }
-+  $p = (Invoke-CimMethod -InputObject $w -MethodName GetProtectionStatus).ProtectionStatus
-+  if ($p -eq 1) { "status=On" } else { "status=Off" }
++  } catch {
++    # Only a missing namespace/class proves BitLocker is absent; anything else is a failure.
++    $c = "$($_.Exception.NativeErrorCode)"
++    if ($c -eq 'InvalidNamespace' -or $c -eq 'InvalidClass') { "status=Absent" } else { "status=Error" }
++    exit 0
++  }
++  if (-not $w) { "status=Error"; exit 0 }
++  $r = Invoke-CimMethod -InputObject $w -MethodName GetProtectionStatus
++  if ($r.ReturnValue -ne 0) { "status=Error"; exit 0 }
++  switch ([int]$r.ProtectionStatus) { 0 { "status=Off" } 1 { "status=On" } default { "status=Unknown" } }
 +  $names = @{1='Tpm';2='ExternalKey';3='RecoveryPassword';4='TpmPin';5='TpmStartupKey';6='TpmPinStartupKey';7='PublicKey';8='Password';9='TpmNetworkKey';10='AdAccountOrGroup'}
-+  $ids = (Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectors -Arguments @{KeyProtectorType=[uint32]0}).VolumeKeyProtectorID
-+  foreach ($i in $ids) {
-+    $t = (Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectorType -Arguments @{VolumeKeyProtectorID=$i}).KeyProtectorType
-+    "protector=$($names[[int]$t])"
++  $k = Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectors -Arguments @{KeyProtectorType=[uint32]0}
++  if ($k.ReturnValue -ne 0) { "protector=QueryFailed"; exit 0 }
++  foreach ($i in $k.VolumeKeyProtectorID) {
++    $t = Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectorType -Arguments @{VolumeKeyProtectorID=$i}
++    if ($t.ReturnValue -ne 0) { "protector=QueryFailed"; continue }
++    $n = $names[[int]$t.KeyProtectorType]
++    if ($n) { "protector=$n" } else { "protector=Type$($t.KeyProtectorType)" }
 +  }
 +}"#;
 +        return match Command::new("powershell")
@@ -2367,23 +2437,29 @@ index 000000000000..159a8cc47b43
 +}
 +
 +#[cfg_attr(not(windows), allow(dead_code))]
-+/// Output of the PowerShell above: `status=On|Off` and one `protector=<KeyProtectorType>` per
-+/// protector (enum names, not localized).
++/// Output of the PowerShell above: `status=On|Off|Absent|Unknown|Error` and one
++/// `protector=<KeyProtectorType>` per protector (enum names, not localized).
++///
++/// Fail closed: "no pre-boot unlock" needs positive evidence. BitLocker off or absent, or
++/// protection on with a TPM-only protector and no protector that prompts before boot. A volume
++/// with only recovery/network/unrecognised protectors, a failed query or an unknown status is
++/// unknown.
 +pub fn parse_bitlocker(text: &str) -> PrebootStatus {
++    const BLOCKING: [&str; 5] = ["TpmPin", "TpmPinStartupKey", "TpmStartupKey", "Password", "ExternalKey"];
++    const AUXILIARY: [&str; 4] = ["RecoveryPassword", "PublicKey", "AdAccountOrGroup", "TpmNetworkKey"];
 +    let mut status = None;
-+    let mut blocking = Vec::new();
++    let mut protectors: Vec<String> = Vec::new();
 +    for line in text.lines().map(str::trim) {
 +        if let Some(s) = line.strip_prefix("status=") {
 +            status = Some(s.to_owned());
 +        } else if let Some(p) = line.strip_prefix("protector=") {
-+            if matches!(
-+                p,
-+                "TpmPin" | "TpmPinStartupKey" | "TpmStartupKey" | "Password" | "ExternalKey"
-+            ) {
-+                blocking.push(p.to_owned());
-+            }
++            protectors.push(p.to_owned());
 +        }
 +    }
++    let unknown = |d: String| PrebootStatus {
++        detected: None,
++        detail: Some(d),
++    };
 +    match status.as_deref() {
 +        Some("Absent") => PrebootStatus {
 +            detected: Some(false),
@@ -2393,21 +2469,37 @@ index 000000000000..159a8cc47b43
 +            detected: Some(false),
 +            detail: None,
 +        },
-+        Some("On") if blocking.is_empty() => PrebootStatus {
-+            detected: Some(false),
-+            detail: Some("BitLocker unlocks with the TPM alone".into()),
-+        },
-+        Some("On") => PrebootStatus {
-+            detected: Some(true),
-+            detail: Some(format!(
-+                "BitLocker asks for {} before Windows starts",
-+                blocking.join(" + ")
-+            )),
-+        },
-+        _ => PrebootStatus {
-+            detected: None,
-+            detail: Some("unrecognised BitLocker state".into()),
-+        },
++        Some("On") => {
++            let blocking: Vec<&str> = protectors
++                .iter()
++                .map(String::as_str)
++                .filter(|p| BLOCKING.contains(p))
++                .collect();
++            if !blocking.is_empty() {
++                return PrebootStatus {
++                    detected: Some(true),
++                    detail: Some(format!(
++                        "BitLocker asks for {} before Windows starts",
++                        blocking.join(" + ")
++                    )),
++                };
++            }
++            if let Some(odd) = protectors
++                .iter()
++                .find(|p| *p != "Tpm" && !AUXILIARY.contains(&p.as_str()))
++            {
++                return unknown(format!("unrecognised BitLocker protector ({odd})"));
++            }
++            if protectors.iter().any(|p| p == "Tpm") {
++                PrebootStatus {
++                    detected: Some(false),
++                    detail: Some("BitLocker unlocks with the TPM alone".into()),
++                }
++            } else {
++                unknown("BitLocker has no TPM-only protector: a restart may need a recovery key".into())
++            }
++        }
++        _ => unknown("could not read the BitLocker state".into()),
 +    }
 +}
 diff --git a/src/remotesmith/relay.rs b/src/remotesmith/relay.rs
@@ -3094,10 +3186,10 @@ index 000000000000..9ad63a500f76
 +}
 diff --git a/src/remotesmith/sessions.rs b/src/remotesmith/sessions.rs
 new file mode 100644
-index 000000000000..f6848b3b6113
+index 000000000000..a7498aff1785
 --- /dev/null
 +++ b/src/remotesmith/sessions.rs
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,380 @@
 +//! Inbound-session registry (§6.2a, AC-60) and the cold-boot ledger (§6.3, AC-55).
 +//!
 +//! `server::connection` calls [`opened`] when a connection is authorized and [`closed`] when it
@@ -3232,6 +3324,9 @@ index 000000000000..f6848b3b6113
 +        /// Seconds from boot to the connection.
 +        pub after_boot_secs: u64,
 +        pub peer_id: String,
++        /// Prerequisites checked (and passing) in the serving process when it was recorded.
++        #[serde(default)]
++        pub prerequisites_passed: Vec<String>,
 +    }
 +
 +    /// Pure decision, separated for tests: is a connection at `now` a cold-boot login-screen one?
@@ -3284,11 +3379,24 @@ index 000000000000..f6848b3b6113
 +            log::info!("remotesmith: session {} soon after boot, but not at the login screen", e.conn_id);
 +            return;
 +        };
++        // docs/IPC.md §7: the connection only counts with every other prerequisite passing at
++        // that moment, as seen by the process that served it. Fail closed.
++        let passed = match prerequisites_at_recording() {
++            Ok(p) => p,
++            Err(failing) => {
++                log::warn!(
++                    "remotesmith: cold-boot login-screen connection NOT recorded; failing prerequisites: {}",
++                    failing.join(", ")
++                );
++                return;
++            }
++        };
 +        let rec = Record {
 +            verified_at: now,
 +            boot_time: boot.unwrap_or_default(),
 +            after_boot_secs: after,
 +            peer_id: e.peer_id.clone(),
++            prerequisites_passed: passed,
 +        };
 +        match write(&rec) {
 +            Ok(path) => log::info!(
@@ -3296,6 +3404,30 @@ index 000000000000..f6848b3b6113
 +            ),
 +            Err(err) => log::error!("remotesmith: cannot record the cold-boot connection: {err}"),
 +        }
++    }
++
++    /// `Ok(names checked)` when every prerequisite positively passes, else `Err(failing)`.
++    fn prerequisites_at_recording() -> Result<Vec<String>, Vec<String>> {
++        #[cfg(any(target_os = "macos", windows))]
++        {
++            let s = crate::remotesmith::collect::prerequisites_now();
++            let failing = crate::remotesmith::collect::failing_checks(&s);
++            if failing.is_empty() {
++                let mut names = vec!["service", "power", "preboot_unlock", "server"];
++                if cfg!(target_os = "macos") {
++                    names.extend([
++                        "accessibility",
++                        "screen_recording",
++                        "input_monitoring",
++                        "system_audio_recording",
++                    ]);
++                }
++                return Ok(names.into_iter().map(String::from).collect());
++            }
++            return Err(failing.into_iter().map(String::from).collect());
++        }
++        #[allow(unreachable_code)]
++        Err(vec!["platform".into()])
 +    }
 +
 +    /// Where the record lives: written only by the privileged process that sees the login
@@ -3440,10 +3572,10 @@ index 000000000000..f6848b3b6113
 +}
 diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
 new file mode 100644
-index 000000000000..334a4fd5065e
+index 000000000000..62af7abbe337
 --- /dev/null
 +++ b/src/remotesmith/tests.rs
-@@ -0,0 +1,904 @@
+@@ -0,0 +1,975 @@
 +//! Tests for the RemoteSmith endpoint: the shared protocol fixture, the server against a raw
 +//! client (handshake, malformed input, limits, pushes, connect), the listener's permission
 +//! rules, and the pure readiness/presence/ledger logic.
@@ -3653,6 +3785,7 @@ index 000000000000..334a4fd5065e
 +            boot_time: 8,
 +            after_boot_secs: 1,
 +            peer_id: "2".into(),
++            prerequisites_passed: vec!["service".into()],
 +        }),
 +    };
 +    assert_eq!(super::host::HostFacts::from_json(&f.to_json()), Some(f));
@@ -3683,6 +3816,11 @@ index 000000000000..334a4fd5065e
 +        let odd = "AC Power:\n Sleep On Power Button 0\n";
 +        assert_eq!(readiness::parse_pmset_ac_sleep(odd).sleep_disabled, None);
 +        assert_eq!(readiness::parse_pmset_ac_sleep("").sleep_disabled, None);
++        // Only the battery section says "never": AC is unknown, not passing.
++        let batt = "Battery Power:\n sleep                0\nAC Power:\n displaysleep         10\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(batt).sleep_disabled, None);
++        let garbled = "AC Power:\n sleep                never\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(garbled).sleep_disabled, None);
 +    }
 +
 +    #[test]
@@ -3714,6 +3852,30 @@ index 000000000000..334a4fd5065e
 +        assert!(pin.detail.unwrap().contains("TpmPin"));
 +        assert_eq!(readiness::parse_bitlocker("").detected, None);
 +        assert_eq!(readiness::parse_bitlocker("status=Absent\n").detected, Some(false));
++        // Fail closed: no positive evidence of a TPM-only unlock.
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=RecoveryPassword\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=TpmNetworkKey\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=QueryFailed\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=Type42\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Unknown\nprotector=Tpm\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Error\n").detected, None);
++        // A blocking protector wins even next to a TPM one.
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=ExternalKey\n").detected, Some(true));
++    }
++
++    #[test]
++    fn windows_power_fails_closed() {
++        let p = readiness::windows_power;
++        assert_eq!(p(Some(0), Some(0), None).sleep_disabled, Some(true));
++        assert_eq!(p(Some(0), None, Some(false)).sleep_disabled, Some(true), "hibernation off");
++        assert_eq!(p(Some(0), Some(3600), Some(false)).sleep_disabled, Some(true), "hibernation off");
++        assert_eq!(p(Some(0), None, None).sleep_disabled, None, "hibernate timer unread");
++        assert_eq!(p(Some(0), None, Some(true)).sleep_disabled, None, "hibernate timer unread");
++        assert_eq!(p(Some(0), Some(3600), Some(true)).sleep_disabled, Some(false));
++        assert_eq!(p(Some(0), Some(3600), None).sleep_disabled, Some(false));
++        assert_eq!(p(Some(600), Some(0), Some(false)).sleep_disabled, Some(false));
++        assert_eq!(p(None, Some(0), Some(false)).sleep_disabled, None);
 +    }
 +
 +    #[test]
@@ -3814,6 +3976,29 @@ index 000000000000..334a4fd5065e
 +        let mut s = ready_status();
 +        s.server.state = RegState::Registering;
 +        assert!(!collect::unattended_ready(&s), "not registered");
++    }
++
++    #[test]
++    fn failing_checks_name_each_prerequisite() {
++        assert!(collect::failing_checks(&ready_status()).is_empty());
++        let none = Status {
++            platform: Platform::Macos,
++            ..Default::default()
++        };
++        let f = collect::failing_checks(&none);
++        for n in ["service", "accessibility", "screen_recording", "input_monitoring", "system_audio_recording", "power", "preboot_unlock", "server"] {
++            assert!(f.contains(&n), "{n} missing from {f:?}");
++        }
++        let win = Status {
++            platform: Platform::Windows,
++            ..ready_status()
++        };
++        assert!(collect::failing_checks(&win).is_empty(), "no TCC on Windows");
++        let other = Status {
++            platform: Platform::Other,
++            ..ready_status()
++        };
++        assert_eq!(collect::failing_checks(&other), ["platform"]);
 +    }
 +
 +    #[test]
@@ -3944,6 +4129,24 @@ index 000000000000..334a4fd5065e
 +        // Small messages are untouched.
 +        let small = encode_bounded(1, None, ServerMessage::Pong);
 +        assert_eq!(small, encode(1, None, ServerMessage::Pong));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn endpoint_path_with_the_remotesmith_app_name() {
++        // Nothing is hardcoded: the path follows APP_NAME, so after the branding rename it is
++        // exactly docs/IPC.md's /tmp/RemoteSmith-<uid>/remotesmith-ipc.sock.
++        let app = hbb_common::config::APP_NAME.read().unwrap().clone();
++        *hbb_common::config::APP_NAME.write().unwrap() = "RemoteSmith".to_owned();
++        let got = if std::env::var(super::super::ENV_IPC_PATH).is_ok() {
++            None
++        } else {
++            Some(super::super::endpoint())
++        };
++        *hbb_common::config::APP_NAME.write().unwrap() = app;
++        if let Some(got) = got {
++            assert_eq!(got, format!("/tmp/RemoteSmith-{}/remotesmith-ipc.sock", unsafe { hbb_common::libc::geteuid() }));
++        }
 +    }
 +
 +    #[test]
