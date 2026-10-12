@@ -1,0 +1,928 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:32:13 -0400
+Subject: remotesmith(0302): bounded auto-reconnect, Cancel, and one session
+ per connect
+
+Reconnect (DEF-7, AC-24, AC-46):
+- The policy lives in Rust (src/remotesmith_trust/reconnect.rs) and is
+  applied in Session::msgbox. After a session was up, transient failures
+  are retried even where upstream gives up ("Failed to connect...",
+  "offline" while the host reboots); auth failures, refusals and identity
+  problems never are. Delays 1, 2, 4, 8, 8... s, and the streak ends 60 s
+  after its first failure. Upstream retried a narrower set forever.
+- Cancel (retry dialog or the Connecting overlay) stops retrying, aborts
+  the attempt in flight and shows "Disconnected - Reconnect" with the
+  window kept open; only Reconnect there starts a new streak.
+- A session the user closed is never reopened: Session::close marks it,
+  and reconnect() and a late connect both honour the mark.
+- The saved password is re-sent on reconnect as upstream does, so no
+  re-entry is needed (AC-24).
+
+Cancel and late results (AC-58): io_loop raced nothing against the UI
+before; Client::start was awaited and a Close seen only afterwards, so a
+late connect could still log in. The connect is now raced against Close
+(dropping the future drops every LAN/ID attempt), and a connect that
+completes after a lost Close is dropped. Input queued while connecting
+is discarded; the host ignores anything sent before login, so nothing is
+replayed.
+
+A Cancel holds until the manual Reconnect: a round that completes late
+is not processed at all (no login sent, no PeerInfo accepted, even ahead
+of a queued Close), a late success never clears it, and automatic
+reconnects (any window's leftover retry timer, multi-monitor sessions
+included) are refused while it holds; every window drops its timer on
+"Disconnected".
+
+Coalescing (AC-58): rapid Connect clicks while the first window is still
+being created share that request instead of opening more windows; Rust
+already keeps one connection per peer and type.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/common.dart                       |  12 +-
+ .../widgets/remotesmith_trust_dialogs.dart    |  46 ++-
+ flutter/lib/models/model.dart                 |  52 ++-
+ flutter/lib/utils/multi_window_manager.dart   |  35 ++
+ src/client.rs                                 |   4 +
+ src/client/io_loop.rs                         |  58 ++-
+ src/flutter_ffi.rs                            |  13 +
+ src/lang/en.rs                                |   2 +
+ src/remotesmith_trust/mod.rs                  |   1 +
+ src/remotesmith_trust/reconnect.rs            | 368 ++++++++++++++++++
+ src/ui_session_interface.rs                   |  72 +++-
+ 11 files changed, 646 insertions(+), 17 deletions(-)
+ create mode 100644 src/remotesmith_trust/reconnect.rs
+
+diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
+index b80e0b5f9580..f9956fb31810 100644
+--- a/flutter/lib/common.dart
++++ b/flutter/lib/common.dart
+@@ -1181,7 +1181,8 @@ void msgBox(SessionID sessionId, String type, String title, String text,
+     ReconnectHandle? reconnect,
+     int? reconnectTimeout,
+     VoidCallback? onSubmit,
+-    int? submitTimeout}) {
++    int? submitTimeout,
++    VoidCallback? onCancelReconnect}) {
+   dialogManager.dismissAll();
+   if (type.contains('insecure-connection')) {
+     Future<void> closeSession() async {
+@@ -1295,6 +1296,15 @@ void msgBox(SessionID sessionId, String type, String title, String text,
+               : null,
+         ));
+     buttons.insert(0, button);
++    // RemoteSmith (AC-46): stop the automatic reconnect without closing the window.
++    if (onCancelReconnect != null) {
++      buttons.insert(
++          0,
++          dialogButton('Cancel', onPressed: () {
++            dialogManager.dismissAll();
++            onCancelReconnect();
++          }, isOutline: true));
++    }
+   }
+   if (link.isNotEmpty) {
+     buttons.insert(0, dialogButton('JumpLink', onPressed: jumplink));
+diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
+index cdf73fa7e791..f2f852b63a62 100644
+--- a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
++++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
+@@ -1,4 +1,4 @@
+-// RemoteSmith unit B3: peer identity (trust on first use) dialogs.
++// RemoteSmith unit B3: peer identity (trust on first use) and reconnect dialogs.
+ // Rust side: src/remotesmith_trust/{identity,reconnect}.rs. Kept in its own file so
+ // upstream's common.dart carries only the hook in msgBox().
+ import 'dart:async';
+@@ -10,12 +10,19 @@ import 'package:flutter_hbb/models/platform_model.dart';
+ 
+ /// Whether [type] is one of the msgbox types rendered here.
+ bool isRemoteSmithTrustMsgbox(String type) =>
+-    type.startsWith('remotesmith-identity');
++    type.startsWith('remotesmith-identity') ||
++    type.startsWith('remotesmith-disconnected');
+ 
+ void showRemoteSmithTrustMsgbox(SessionID sessionId, String type, String title,
+-    String text, OverlayDialogManager dialogManager) {
++    String text, OverlayDialogManager dialogManager,
++    {VoidCallback? onReconnect}) {
+   dialogManager.dismissAll();
+-  _identityDialog(sessionId, type, title, text, dialogManager);
++  if (type.startsWith('remotesmith-disconnected')) {
++    _disconnectedDialog(sessionId, type, title, text, dialogManager,
++        onReconnect: onReconnect);
++  } else {
++    _identityDialog(sessionId, type, title, text, dialogManager);
++  }
+ }
+ 
+ Widget _row(String label, String value) {
+@@ -140,3 +147,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
+     tag: '$sessionId-$type',
+   );
+ }
++
++void _disconnectedDialog(SessionID sessionId, String type, String title,
++    String text, OverlayDialogManager dialogManager,
++    {VoidCallback? onReconnect}) {
++  void reconnect() {
++    dialogManager.dismissAll();
++    // Rust clears the cancel mark and starts the round in one call.
++    unawaited(bind.sessionSetCommon(
++        sessionId: sessionId, key: 'remotesmith-reconnect', value: 'manual'));
++    onReconnect?.call();
++  }
++
++  void close() {
++    dialogManager.dismissAll();
++    closeConnection();
++  }
++
++  dialogManager.show(
++    (setState, dismiss, context) => CustomAlertDialog(
++      title: Text(translate(title)),
++      content: Text(translate(text)),
++      actions: [
++        dialogButton('Close', onPressed: close, isOutline: true),
++        dialogButton('Reconnect', onPressed: reconnect),
++      ],
++      onSubmit: reconnect,
++      onCancel: close,
++    ),
++    tag: '$sessionId-$type',
++  );
++}
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index fe9aa2a82fd3..9553600eb012 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -910,8 +910,14 @@ class FfiModel with ChangeNotifier {
+     }
+ 
+     if (isRemoteSmithTrustMsgbox(type)) {
+-      // RemoteSmith: identity confirm and mismatch dialogs.
+-      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager);
++      if (type.startsWith('remotesmith-disconnected')) {
++        // Every window of the session gets this; none may keep a retry timer.
++        _timer?.cancel();
++        _timer = null;
++      }
++      // RemoteSmith: identity confirm/mismatch and "Disconnected — Reconnect".
++      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager,
++          onReconnect: () => showReconnecting(dialogManager, sessionId));
+     } else if (type == 're-input-password') {
+       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+     } else if (type == 'input-2fa') {
+@@ -1085,12 +1091,15 @@ class FfiModel with ChangeNotifier {
+       msgBox(sessionId, type, title, text, link, dialogManager,
+           hasCancel: hasCancel,
+           reconnect: hasRetry ? reconnect : null,
+-          reconnectTimeout: hasRetry ? _reconnects : null,
+-          onSubmit: onSubmit);
++          reconnectTimeout: hasRetry ? _retryDelaySecs(sessionId) : null,
++          onSubmit: onSubmit,
++          onCancelReconnect: hasRetry
++              ? () => cancelReconnect(dialogManager, sessionId)
++              : null);
+     }
+     _timer?.cancel();
+     if (hasRetry) {
+-      _timer = Timer(Duration(seconds: _reconnects), () {
++      _timer = Timer(Duration(seconds: _retryDelaySecs(sessionId)), () {
+         reconnect(dialogManager, sessionId, false);
+       });
+       _reconnects *= 2;
+@@ -1111,16 +1120,45 @@ class FfiModel with ChangeNotifier {
+     _pendingRestoreTimer = null;
+   }
+ 
++  /// RemoteSmith (DEF-7): the delay the Rust reconnect policy picked for the
++  /// pending retry (bounded to the 60 s window); upstream's doubling otherwise.
++  int _retryDelaySecs(SessionID sessionId) {
++    final ms = int.tryParse(bind.sessionGetCommonSync(
++            sessionId: sessionId,
++            key: 'remotesmith-retry-delay-ms',
++            param: '') ??
++        '');
++    if (ms == null || ms <= 0) return min(_reconnects, 8);
++    return max(1, (ms + 999) ~/ 1000);
++  }
++
++  /// RemoteSmith (AC-46): Cancel during a reconnect stops retrying and aborts
++  /// the attempt in flight; Rust then shows "Disconnected — Reconnect" and the
++  /// window stays open.
++  void cancelReconnect(OverlayDialogManager dialogManager, SessionID sessionId) {
++    _timer?.cancel();
++    _timer = null;
++    dialogManager.dismissAll();
++    bind.sessionSetCommon(
++        sessionId: sessionId, key: 'remotesmith-reconnect', value: 'cancel');
++  }
++
+   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
+       bool forceRelay) {
++    bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
++    showReconnecting(dialogManager, sessionId);
++  }
++
++  /// The UI side of a reconnect; RemoteSmith's manual Reconnect starts the
++  /// round itself in Rust (with its cancel mark cleared in the same call).
++  void showReconnecting(OverlayDialogManager dialogManager, SessionID sessionId) {
+     // Disable relative mouse mode before reconnecting to ensure cursor is released.
+     parent.target?.inputModel.setRelativeMouseMode(false);
+     _cancelPendingMonitorRestore();
+-    bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
+     clearPermissions();
+     dialogManager.dismissAll();
+     dialogManager.showLoading(translate('Connecting...'),
+-        onCancel: closeConnection);
++        onCancel: () => cancelReconnect(dialogManager, sessionId));
+   }
+ 
+   Future<void> showRelayHintDialog(
+diff --git a/flutter/lib/utils/multi_window_manager.dart b/flutter/lib/utils/multi_window_manager.dart
+index 9e26f8cf9a61..793736ab308a 100644
+--- a/flutter/lib/utils/multi_window_manager.dart
++++ b/flutter/lib/utils/multi_window_manager.dart
+@@ -219,6 +219,12 @@ class RustDeskMultiWindowManager {
+     }
+   }
+ 
++  /// RemoteSmith (AC-58, DEF-9): open requests for a peer still being opened.
++  /// Until the first request's window exists, nothing else can find and focus
++  /// it, so rapid repeated Connect clicks would each create a window; they
++  /// share the first request instead.
++  final Map<String, Future<MultiWindowCallResult>> _pendingSessions = {};
++
+   Future<MultiWindowCallResult> newSession(
+     WindowType type,
+     String methodName,
+@@ -230,6 +236,35 @@ class RustDeskMultiWindowManager {
+     bool? isRDP,
+     bool? isSharedPassword,
+     String? connToken,
++  }) {
++    final key = '${type.index}/$methodName/$remoteId/${forceRelay == true}';
++    final pending = _pendingSessions[key];
++    if (pending != null) {
++      return pending;
++    }
++    final f = _newSessionOnce(type, methodName, remoteId, windows,
++        password: password,
++        forceRelay: forceRelay,
++        switchUuid: switchUuid,
++        isRDP: isRDP,
++        isSharedPassword: isSharedPassword,
++        connToken: connToken);
++    _pendingSessions[key] = f;
++    f.whenComplete(() => _pendingSessions.remove(key)).ignore();
++    return f;
++  }
++
++  Future<MultiWindowCallResult> _newSessionOnce(
++    WindowType type,
++    String methodName,
++    String remoteId,
++    List<int> windows, {
++    String? password,
++    bool? forceRelay,
++    String? switchUuid,
++    bool? isRDP,
++    bool? isSharedPassword,
++    String? connToken,
+   }) async {
+     var params = {
+       "type": type.index,
+diff --git a/src/client.rs b/src/client.rs
+index 7367b9e5e898..c95e6465f674 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -2848,6 +2848,8 @@ pub struct LoginConfigHandler {
+     id: String,
+     /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
+     pub remotesmith_signed_id: String,
++    /// RemoteSmith: automatic reconnect policy, kept across rounds (DEF-7).
++    pub remotesmith_retry: crate::remotesmith_trust::reconnect::RetryPolicy,
+     pub conn_type: ConnType,
+     pub is_terminal_admin: bool,
+     hash: Hash,
+@@ -3676,6 +3678,8 @@ impl LoginConfigHandler {
+     /// * `username` - The name of the peer.
+     /// * `pi` - The peer info.
+     pub fn handle_peer_info(&mut self, pi: &PeerInfo) {
++        // RemoteSmith: logged in, so the session is up and any reconnect streak is over.
++        self.remotesmith_retry.on_connected();
+         if !pi.version.is_empty() {
+             self.version = hbb_common::get_version_number(&pi.version);
+         }
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index 631b96a8dd58..8e3473dbb5cd 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -191,15 +191,57 @@ impl<T: InvokeUiSession> Remote<T> {
+             ConnType::default()
+         };
+ 
+-        match Client::start(
+-            &self.handler.get_id(),
++        // RemoteSmith (AC-58, AC-46): race the connect against the UI's Close, so Cancel aborts
++        // every attempt in flight (dropping the future drops them) and a late result opens
++        // nothing. Upstream awaited the connect and saw the Close only afterwards. Input the UI
++        // queued meanwhile is stale and dropped; nothing is replayed once connected.
++        let peer_id = self.handler.get_id();
++        let start = Client::start(
++            &peer_id,
+             key,
+             token,
+             conn_type,
+             self.handler.clone(),
+-        )
+-        .await
++        );
++        hbb_common::tokio::pin!(start);
++        let start_result = loop {
++            tokio::select! {
++                biased;
++                d = self.receiver.recv() => match d {
++                    Some(Data::Close) | None => {
++                        log::info!("connect cancelled before the session opened");
++                        self.handle_disconnected(round);
++                        return;
++                    }
++                    Some(_) => {}
++                },
++                r = &mut start => break r,
++            }
++        };
++        match start_result
+         {
++            Ok(((mut peer, _, _, kcp, _), _))
++                if self.handler.lc.read().unwrap().remotesmith_retry.should_abort() =>
++            {
++                // Cancelled or closed while connecting, the Close itself lost: open nothing.
++                log::info!("connect completed after cancel; dropping it");
++                self.send_close_reason(&mut peer, "").await;
++                if kcp.is_some() {
++                    tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
++                }
++                self.handle_disconnected(round);
++                if !self.handler.lc.read().unwrap().remotesmith_retry.is_closed() {
++                    // The window is still open: leave it on "Disconnected - Reconnect".
++                    use crate::remotesmith_trust::reconnect as rs;
++                    self.handler.msgbox(
++                        rs::MSGBOX_DISCONNECTED,
++                        rs::DISCONNECTED_TITLE,
++                        rs::DISCONNECTED_TEXT,
++                        "",
++                    );
++                }
++                return;
++            }
+             Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
+                 self.handler
+                     .connection_round_state
+@@ -300,6 +342,14 @@ impl<T: InvokeUiSession> Remote<T> {
+                                         self.handler.on_establish_connection_error(err.to_string());
+                                         break;
+                                     }
++                                    Ok(_) if self.handler.lc.read().unwrap().remotesmith_retry.should_abort() => {
++                                        // RemoteSmith (AC-46, AC-58): cancelled or closed while this
++                                        // round connected; nothing from it is processed (no login
++                                        // sent, no PeerInfo accepted), even ahead of a queued Close.
++                                        log::info!("round cancelled; dropping it");
++                                        self.send_close_reason(&mut peer, "").await;
++                                        break;
++                                    }
+                                     Ok(ref bytes) => {
+                                         last_recv_time = Instant::now();
+                                         if !received {
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index d6943f3d63b7..f0d8ea1d9a1e 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+             s.continue_insecure_connection(value == "Y");
+             return;
+         }
++        // RemoteSmith: reconnect Cancel / manual Reconnect (AC-46).
++        if key == "remotesmith-reconnect" {
++            s.remotesmith_reconnect(&value);
++            return;
++        }
+         // RemoteSmith: the answer to the first-use identity prompt (AC-43).
+         if key == "remotesmith-identity" {
+             crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value));
+@@ -2933,6 +2938,14 @@ pub fn session_get_common(
+     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
+         let v = if key == "is_screenshot_supported" {
+             s.is_screenshot_supported().to_string()
++        } else if key == "remotesmith-retry-delay-ms" {
++            // RemoteSmith (DEF-7): the delay the reconnect policy chose for the pending retry.
++            s.lc.read()
++                .unwrap()
++                .remotesmith_retry
++                .last_delay()
++                .map(|d| d.as_millis().to_string())
++                .unwrap_or_default()
+         } else {
+             "".to_owned()
+         };
+diff --git a/src/lang/en.rs b/src/lang/en.rs
+index f6fb59c0206f..d65f3cc93194 100644
+--- a/src/lang/en.rs
++++ b/src/lang/en.rs
+@@ -288,5 +288,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("remotesmith-trust-and-connect", "Trust and connect"),
+         ("remotesmith-forget-peer", "Forget peer"),
+         ("remotesmith-peer-forgotten", "Peer forgotten. Connect again to enroll it."),
++        // RemoteSmith unit B3: reconnect (DEF-7, AC-46).
++        ("remotesmith-disconnected-tip", "The connection was lost and automatic reconnecting has stopped. Input made while disconnected was discarded and will not be replayed."),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index c88df312b182..5192a36b1158 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -1,3 +1,4 @@
+ //! RemoteSmith unit B3: peer identity (trust on first use), LAN-first routing, reconnect policy
+ //! and relay pinning. Kept in its own module so the upstream files carry only call sites.
+ pub mod identity;
++pub mod reconnect;
+diff --git a/src/remotesmith_trust/reconnect.rs b/src/remotesmith_trust/reconnect.rs
+new file mode 100644
+index 000000000000..d62aa4a255c5
+--- /dev/null
++++ b/src/remotesmith_trust/reconnect.rs
+@@ -0,0 +1,368 @@
++//! Controller reconnect policy (RemoteSmith DEF-7, AC-24, AC-46).
++//!
++//! Upstream retries a retryable "Connection Error" forever, doubling the delay, and only for a
++//! narrow set of texts: once a session has dropped, the very next attempt usually fails with
++//! "Failed to connect ..." or "offline" (the network is still down, the host is rebooting), which
++//! upstream treats as final. RemoteSmith's rule:
++//!
++//! - Before the first successful login, upstream's classification decides, but the streak is
++//!   bounded like any other.
++//! - After a session was up, any transient failure is retried; auth failures, refusals and
++//!   identity problems never are.
++//! - Retries stop 60 s after the first failure of the streak, or at once on Cancel. The UI then
++//!   shows "Disconnected — Reconnect"; only a manual Reconnect starts a new streak.
++//! - Upstream never reopens a session the user closed (closing removes the session, and with it
++//!   this state); nothing here changes that.
++
++use std::time::{Duration, Instant};
++
++/// How long a streak of failed attempts is retried (DEF-7).
++pub const RETRY_WINDOW: Duration = Duration::from_secs(60);
++/// Delay before the first retry; doubles per attempt up to [`MAX_DELAY`].
++pub const FIRST_DELAY: Duration = Duration::from_secs(1);
++pub const MAX_DELAY: Duration = Duration::from_secs(8);
++
++/// Msgbox the UI renders as "Disconnected — Reconnect".
++pub const MSGBOX_DISCONNECTED: &str = "remotesmith-disconnected-nocancel";
++pub const DISCONNECTED_TITLE: &str = "Disconnected";
++pub const DISCONNECTED_TEXT: &str = "remotesmith-disconnected-tip";
++
++/// Close reason the host sends when its password changed (AC-39). Never retried: the saved
++/// credential no longer works.
++pub const CLOSE_REASON_PASSWORD_CHANGED: &str = "Session closed by the peer: its password changed";
++
++/// Failures that are never worth another attempt, whatever came before.
++const PERMANENT: &[&str] = &[
++    "manually",
++    "restricted",
++    "incoming only",
++    "not allowed",
++    "mismatch",
++    "not exist",
++    "password",
++    "identity",
++];
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Decision {
++    /// Not a retryable connection failure: show it as upstream does.
++    NoRetry,
++    /// Retry after this delay.
++    RetryIn(Duration),
++    /// The streak is over (window spent or cancelled): show "Disconnected — Reconnect".
++    GiveUp,
++}
++
++#[derive(Debug, Default, Clone)]
++pub struct RetryPolicy {
++    /// A login succeeded at least once in this session.
++    established: bool,
++    first_failure: Option<Instant>,
++    attempts: u32,
++    cancelled: bool,
++    /// The user closed the session. Sticky: nothing reopens it.
++    closed: bool,
++    last_delay: Option<Duration>,
++}
++
++/// Whether `text` describes a connection failure (as opposed to any other msgbox).
++pub fn is_connection_failure(msgtype: &str, title: &str) -> bool {
++    msgtype == "error" && title == "Connection Error"
++}
++
++fn is_permanent(text: &str) -> bool {
++    let t = text.to_lowercase();
++    PERMANENT.iter().any(|p| t.contains(p))
++}
++
++impl RetryPolicy {
++    /// A login succeeded: the session is up and any streak is over. A late success never clears
++    /// a Cancel or a close: only [`Self::on_manual_reconnect`] does (io_loop also refuses to
++    /// process peer messages, PeerInfo included, while [`Self::should_abort`] holds).
++    pub fn on_connected(&mut self) {
++        self.established = true;
++        self.first_failure = None;
++        self.attempts = 0;
++        self.last_delay = None;
++    }
++
++    /// Whether an automatic (non-manual) reconnect may start a new round now.
++    pub fn may_auto_reconnect(&self) -> bool {
++        !self.closed && !self.cancelled
++    }
++
++    /// The user pressed Reconnect on "Disconnected": a fresh streak.
++    pub fn on_manual_reconnect(&mut self) {
++        if self.closed {
++            return;
++        }
++        self.first_failure = None;
++        self.attempts = 0;
++        self.cancelled = false;
++        self.last_delay = None;
++    }
++
++    /// The user pressed Cancel during a reconnect: no more automatic attempts.
++    pub fn cancel(&mut self) {
++        self.cancelled = true;
++        self.last_delay = None;
++    }
++
++    /// A login succeeded at least once in this session.
++    pub fn is_established(&self) -> bool {
++        self.established
++    }
++
++    pub fn is_cancelled(&self) -> bool {
++        self.cancelled
++    }
++
++    /// The user closed the session (tab or window): it must never be reopened (AC-24).
++    pub fn on_user_closed(&mut self) {
++        self.closed = true;
++        self.cancelled = true;
++        self.last_delay = None;
++    }
++
++    pub fn is_closed(&self) -> bool {
++        self.closed
++    }
++
++    /// Whether a connect that just completed must be dropped instead of logged in: the user
++    /// cancelled the reconnect or closed the session while it was in flight.
++    pub fn should_abort(&self) -> bool {
++        self.closed || self.cancelled
++    }
++
++    /// Whether automatic reconnecting is in progress (a streak has started and not ended).
++    pub fn in_streak(&self) -> bool {
++        self.first_failure.is_some() && !self.cancelled
++    }
++
++    /// The delay chosen by the last [`Decision::RetryIn`], for the UI's countdown.
++    pub fn last_delay(&self) -> Option<Duration> {
++        self.last_delay
++    }
++
++    /// Decide what follows a msgbox. `upstream_retry` is upstream's `check_if_retry` verdict.
++    pub fn on_msgbox(
++        &mut self,
++        now: Instant,
++        msgtype: &str,
++        title: &str,
++        text: &str,
++        upstream_retry: bool,
++    ) -> Decision {
++        if self.closed {
++            return Decision::NoRetry;
++        }
++        if !is_connection_failure(msgtype, title) {
++            return if upstream_retry {
++                // Not a shape this policy knows; leave upstream's behaviour alone.
++                Decision::RetryIn(FIRST_DELAY)
++            } else {
++                Decision::NoRetry
++            };
++        }
++        let retryable = !is_permanent(text) && (self.established || upstream_retry);
++        if !retryable {
++            self.first_failure = None;
++            self.attempts = 0;
++            self.last_delay = None;
++            return Decision::NoRetry;
++        }
++        if self.cancelled {
++            return Decision::GiveUp;
++        }
++        let first = *self.first_failure.get_or_insert(now);
++        let elapsed = now.saturating_duration_since(first);
++        if elapsed >= RETRY_WINDOW {
++            self.last_delay = None;
++            return Decision::GiveUp;
++        }
++        let delay = FIRST_DELAY
++            .checked_mul(1u32 << self.attempts.min(16))
++            .unwrap_or(MAX_DELAY)
++            .min(MAX_DELAY)
++            // The last attempt starts inside the window, not after it.
++            .min(RETRY_WINDOW - elapsed);
++        self.attempts += 1;
++        self.last_delay = Some(delay);
++        Decision::RetryIn(delay)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const CE: &str = "Connection Error";
++
++    fn secs(s: u64) -> Duration {
++        Duration::from_secs(s)
++    }
++
++    #[test]
++    fn delays_double_up_to_the_cap() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        let delays: Vec<_> = (0..6)
++            .map(|i| p.on_msgbox(t0 + secs(i), "error", CE, "Reset by the peer", true))
++            .collect();
++        assert_eq!(
++            delays,
++            [1, 2, 4, 8, 8, 8].map(|s| Decision::RetryIn(secs(s))).to_vec()
++        );
++    }
++
++    #[test]
++    fn transient_failures_after_a_drop_are_retried_even_when_upstream_would_not() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        assert!(matches!(
++            p.on_msgbox(t0, "error", CE, "Reset by the peer", true),
++            Decision::RetryIn(_)
++        ));
++        // The network is still down / the host is rebooting.
++        for text in [
++            "Failed to connect to rendezvous server: Please try later",
++            "Remote desktop is offline",
++            "Timeout",
++        ] {
++            assert!(
++                matches!(p.on_msgbox(t0 + secs(5), "error", CE, text, false), Decision::RetryIn(_)),
++                "{text}"
++            );
++        }
++    }
++
++    #[test]
++    fn before_the_first_login_upstream_classification_decides() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        assert_eq!(
++            p.on_msgbox(t0, "error", CE, "Remote desktop is offline", false),
++            Decision::NoRetry
++        );
++        assert!(matches!(
++            p.on_msgbox(t0, "error", CE, "Reset by the peer", true),
++            Decision::RetryIn(_)
++        ));
++    }
++
++    #[test]
++    fn auth_refusals_and_identity_problems_are_never_retried() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        for text in [
++            "Wrong Password",
++            CLOSE_REASON_PASSWORD_CHANGED,
++            "Closed manually by the peer",
++            "Key mismatch",
++            "ID does not exist",
++            "Peer identity mismatch",
++            "Connection not allowed",
++        ] {
++            assert_eq!(p.on_msgbox(t0, "error", CE, text, true), Decision::NoRetry, "{text}");
++        }
++    }
++
++    #[test]
++    fn the_streak_ends_sixty_seconds_after_its_first_failure() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        for _ in 0..4 {
++            assert!(matches!(p.on_msgbox(t0, "error", CE, "Timeout", true), Decision::RetryIn(_)));
++        }
++        // The delay is at its 8 s cap now, but the last one never runs past the window.
++        assert_eq!(
++            p.on_msgbox(t0 + secs(57), "error", CE, "Timeout", true),
++            Decision::RetryIn(secs(3))
++        );
++        assert_eq!(
++            p.on_msgbox(t0 + secs(60), "error", CE, "Timeout", true),
++            Decision::GiveUp
++        );
++        assert!(p.last_delay().is_none());
++    }
++
++    #[test]
++    fn cancel_stops_retrying_until_a_manual_reconnect() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        assert!(matches!(p.on_msgbox(t0, "error", CE, "Timeout", true), Decision::RetryIn(_)));
++        assert!(p.in_streak());
++        p.cancel();
++        assert!(!p.in_streak());
++        assert_eq!(p.on_msgbox(t0 + secs(1), "error", CE, "Timeout", true), Decision::GiveUp);
++        p.on_manual_reconnect();
++        assert_eq!(
++            p.on_msgbox(t0 + secs(2), "error", CE, "Timeout", true),
++            Decision::RetryIn(secs(1))
++        );
++    }
++
++    #[test]
++    fn a_closed_session_is_never_reopened() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        assert!(matches!(p.on_msgbox(t0, "error", CE, "Timeout", true), Decision::RetryIn(_)));
++        p.on_user_closed();
++        assert!(p.should_abort());
++        assert_eq!(p.on_msgbox(t0, "error", CE, "Timeout", true), Decision::NoRetry);
++        p.on_manual_reconnect();
++        assert!(p.should_abort() && p.is_closed());
++    }
++
++    #[test]
++    fn a_cancelled_streak_aborts_a_late_connect_until_reconnect() {
++        let mut p = RetryPolicy::default();
++        assert!(!p.should_abort());
++        p.cancel();
++        assert!(p.should_abort());
++        p.on_manual_reconnect();
++        assert!(!p.should_abort());
++    }
++
++    #[test]
++    fn a_late_success_never_clears_a_cancel() {
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        p.cancel();
++        // PeerInfo of a round that completed after the Cancel.
++        p.on_connected();
++        assert!(p.should_abort() && !p.may_auto_reconnect());
++        p.on_manual_reconnect();
++        assert!(!p.should_abort() && p.may_auto_reconnect());
++    }
++
++    #[test]
++    fn a_successful_login_resets_the_window() {
++        let t0 = Instant::now();
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        p.on_msgbox(t0, "error", CE, "Timeout", true);
++        p.on_connected();
++        assert!(!p.in_streak());
++        assert_eq!(
++            p.on_msgbox(t0 + secs(100), "error", CE, "Timeout", true),
++            Decision::RetryIn(secs(1))
++        );
++    }
++
++    #[test]
++    fn other_msgboxes_pass_through() {
++        let mut p = RetryPolicy::default();
++        assert_eq!(
++            p.on_msgbox(Instant::now(), "input-password", "Password Required", "", false),
++            Decision::NoRetry
++        );
++        assert!(!p.in_streak());
++    }
++}
+diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
+index f28752e77d7e..0dccff5190fb 100644
+--- a/src/ui_session_interface.rs
++++ b/src/ui_session_interface.rs
+@@ -1290,6 +1290,12 @@ impl<T: InvokeUiSession> Session<T> {
+     }
+ 
+     pub fn reconnect(&self, force_relay: bool) {
++        if !self.lc.read().unwrap().remotesmith_retry.may_auto_reconnect() {
++            // Closed by the user, or reconnecting cancelled (any window's leftover retry timer
++            // lands here); only the manual Reconnect clears the mark, then calls us.
++            log::info!("not reconnecting: the session was closed or reconnecting cancelled");
++            return;
++        }
+         // 1. If current session is connecting, do not reconnect.
+         // 2. If the connection is established, send `Data::Close`.
+         // 3. If the connection is disconnected, do nothing.
+@@ -1415,9 +1421,40 @@ impl<T: InvokeUiSession> Session<T> {
+     }
+ 
+     pub fn close(&self) {
++        // RemoteSmith (AC-24, AC-58): a closed session is never reopened, and a connect still in
++        // flight when the Close is lost (sent before the round's sender existed) is dropped.
++        self.lc.write().unwrap().remotesmith_retry.on_user_closed();
+         self.send(Data::Close);
+     }
+ 
++    /// RemoteSmith (AC-46): Cancel during a reconnect stops it, aborts the attempt in flight
++    /// and shows "Disconnected — Reconnect"; Reconnect there starts a fresh streak.
++    pub fn remotesmith_reconnect(&self, action: &str) {
++        use crate::remotesmith_trust::reconnect as rs;
++        match action {
++            "cancel" => {
++                self.lc.write().unwrap().remotesmith_retry.cancel();
++                // Aborts a connect in flight (io_loop races it against Close); a round that is
++                // already disconnected ignores it.
++                self.send(Data::Close);
++                log::info!("reconnect: cancelled by the user");
++                self.ui_handler.msgbox(
++                    rs::MSGBOX_DISCONNECTED,
++                    rs::DISCONNECTED_TITLE,
++                    rs::DISCONNECTED_TEXT,
++                    "",
++                    false,
++                );
++            }
++            "manual" => {
++                // One call, so the cancel mark is cleared before the new round can finish.
++                self.lc.write().unwrap().remotesmith_retry.on_manual_reconnect();
++                self.reconnect(false);
++            }
++            _ => {}
++        }
++    }
++
+     pub fn continue_insecure_connection(&self, continue_insecure: bool) {
+         let data = if continue_insecure {
+             Data::ContinueInsecureConnection
+@@ -1787,11 +1824,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+     }
+ 
+     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
++        use crate::remotesmith_trust::reconnect as rs_reconnect;
+         let direct = self.lc.read().unwrap().direct;
+         let received = self.lc.read().unwrap().received;
+         let retry_for_relay = direct == Some(true) && !received;
++        // RemoteSmith (DEF-7): once a session was up, a dropped direct (LAN/P2P) link is a
++        // transient failure like any other, not upstream's manual "try relay" prompt.
++        let msgtype = if msgtype.starts_with("relay-hint")
++            && rs_reconnect::is_connection_failure("error", title)
++            && self.lc.read().unwrap().remotesmith_retry.is_established()
++        {
++            "error"
++        } else {
++            msgtype
++        };
+         let retry = check_if_retry(msgtype, title, text, retry_for_relay);
+-        self.ui_handler.msgbox(msgtype, title, text, link, retry);
++        // RemoteSmith (DEF-7): bounded retries, transient failures after a drop included.
++        use crate::remotesmith_trust::reconnect::{self as rs, Decision};
++        let decision = self.lc.write().unwrap().remotesmith_retry.on_msgbox(
++            std::time::Instant::now(),
++            msgtype,
++            title,
++            text,
++            retry,
++        );
++        match decision {
++            Decision::NoRetry => self.ui_handler.msgbox(msgtype, title, text, link, false),
++            Decision::RetryIn(_) => self.ui_handler.msgbox(msgtype, title, text, link, true),
++            Decision::GiveUp => {
++                log::info!("reconnect: giving up ({})", text);
++                self.ui_handler.msgbox(
++                    rs::MSGBOX_DISCONNECTED,
++                    rs::DISCONNECTED_TITLE,
++                    rs::DISCONNECTED_TEXT,
++                    "",
++                    false,
++                );
++            }
++        }
+     }
+ 
+     fn handle_login_error(&self, err: &str) -> bool {

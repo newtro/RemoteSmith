@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:57:29 -0400
+Subject: remotesmith(0307): treat a silent peer as lost while it holds input
+
+AC-41, follow-up to 0304. 0304 releases held keys and buttons when the
+connection ends, but on a pulled cable the host only ends it at its
+30 s receive timeout, so a held key or a drag stayed down that long.
+The controller answers the host's TestDelay every second. When the
+connection holds input down and the peer has missed ten heartbeats
+(10 s), the host now treats the connection as lost: it ends it, and the
+teardown releases everything. Shorter stalls (relay hiccups) change
+nothing, so a drag or held modifier survives them; and since the session
+ends rather than carrying on after a host-side release, the controller
+reconnects with its real key and button state. Without held input
+upstream's 30 s timeout applies unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/remotesmith_trust/held_input.rs | 37 ++++++++++++++
+ src/server/connection.rs            | 77 +++++++++++++++++++++--------
+ 2 files changed, 94 insertions(+), 20 deletions(-)
+
+diff --git a/src/remotesmith_trust/held_input.rs b/src/remotesmith_trust/held_input.rs
+index d6aaa510b159..4a9c9d559980 100644
+--- a/src/remotesmith_trust/held_input.rs
++++ b/src/remotesmith_trust/held_input.rs
+@@ -16,6 +16,19 @@ use base::message_proto::{key_event, KeyEvent, KeyboardMode, MouseEvent};
+ use hbb_common::protobuf::EnumOrUnknown;
+ use std::collections::{BTreeMap, BTreeSet};
+ 
++/// Peer silence after which a connection that holds input down is treated as lost. The
++/// controller answers the host's TestDelay every second, so this is ten missed heartbeats:
++/// ordinary relay or Wi-Fi stalls stay well under it, and a drag or held modifier survives them.
++/// Without held input upstream's 30 s timeout applies unchanged.
++pub const HOLDING_LOSS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
++
++/// Whether the host should end the connection now: it holds input down and the peer has been
++/// silent past [`HOLDING_LOSS_TIMEOUT`]. Ending it (rather than releasing and carrying on) keeps
++/// both sides consistent: the controller reconnects and sends its real key and button state.
++pub fn treat_as_lost(silence: std::time::Duration, holding: bool) -> bool {
++    holding && silence >= HOLDING_LOSS_TIMEOUT
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+ enum KeyId {
+     Control(i32, i32),
+@@ -187,6 +200,30 @@ mod tests {
+         assert_eq!(h.take_releases().1.len(), 1);
+     }
+ 
++    #[test]
++    fn delayed_heartbeats_with_a_held_modifier_and_a_drag_keep_the_session() {
++        use std::time::Duration;
++        let mut h = HeldInput::default();
++        h.on_key(&ck(ControlKey::Shift, true), false);
++        h.on_mouse(&mouse(MOUSE_TYPE_DOWN, MOUSE_BUTTON_LEFT, 5, 5));
++        let holding = !h.is_empty();
++        // A relay stall: heartbeats arrive late, but within the loss threshold.
++        for late_ms in [1_500u64, 3_000, 5_000, 9_900] {
++            assert!(!treat_as_lost(Duration::from_millis(late_ms), holding), "{late_ms}");
++        }
++        // Nothing has been released meanwhile: the drag and the modifier are still held.
++        assert!(!h.is_empty());
++        // Ten missed heartbeats: lost; the teardown then releases both.
++        assert!(treat_as_lost(HOLDING_LOSS_TIMEOUT, holding));
++        let (m, k) = h.take_releases();
++        assert_eq!((m.len(), k.len()), (1, 1));
++    }
++
++    #[test]
++    fn without_held_input_silence_is_left_to_upstream() {
++        assert!(!treat_as_lost(std::time::Duration::from_secs(25), false));
++    }
++
+     #[test]
+     fn unicode_and_sequences_hold_nothing() {
+         let mut h = HeldInput::default();
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index e96e85273ae4..e5c9c13928d7 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -711,8 +711,14 @@ impl Connection {
+         // `on_message` picks the type-specific timeout then.
+         conn.stream.set_send_timeout(SEND_TIMEOUT_VIDEO);
+ 
++        // RemoteSmith (AC-41): whether this connection holds keys or buttons down on the host.
+         #[cfg(not(any(target_os = "android", target_os = "ios")))]
+-        std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
++        let rs_holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        #[cfg(not(any(target_os = "android", target_os = "ios")))]
++        {
++            let holding = rs_holding.clone();
++            std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned, holding));
++        }
+         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
+ 
+         #[cfg(feature = "unix-file-copy-paste")]
+@@ -1163,6 +1169,21 @@ impl Connection {
+                     }
+                 }
+                 _ = second_timer.tick() => {
++                    // RemoteSmith (AC-41): a peer silent this long while this connection holds
++                    // input down is treated as lost, sooner than upstream's 30 s: the session ends
++                    // (releasing everything on teardown) and the controller reconnects with its
++                    // real key and button state. Shorter stalls change nothing.
++                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++                    if conn.authorized
++                        && crate::remotesmith_trust::held_input::treat_as_lost(
++                            last_recv_time.elapsed(),
++                            rs_holding.load(std::sync::atomic::Ordering::SeqCst),
++                        )
++                    {
++                        log::info!("peer silent while input is held; treating the connection as lost");
++                        conn.on_close("peer silent while holding input", true).await;
++                        break;
++                    }
+                     if conn.authorized
+                         && crate::remotesmith_trust::password_epoch::is_stale(
+                             conn.remotesmith_password_epoch,
+@@ -1257,7 +1278,11 @@ impl Connection {
+     }
+ 
+     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+-    fn handle_input(receiver: std_mpsc::Receiver<MessageInput>, tx: Sender) {
++    fn handle_input(
++        receiver: std_mpsc::Receiver<MessageInput>,
++        tx: Sender,
++        holding: Arc<std::sync::atomic::AtomicBool>,
++    ) {
+         let mut block_input_mode = false;
+         #[cfg(any(target_os = "windows", target_os = "macos"))]
+         {
+@@ -1275,6 +1300,7 @@ impl Connection {
+                     MessageInput::Mouse(mouse_input) => {
+                         if mouse_input.simulate {
+                             held.on_mouse(&mouse_input.msg);
++                            holding.store(!held.is_empty(), std::sync::atomic::Ordering::SeqCst);
+                             last_mouse_conn = Some((
+                                 mouse_input.conn_id,
+                                 mouse_input.username.clone(),
+@@ -1292,6 +1318,7 @@ impl Connection {
+                     }
+                     MessageInput::Key((mut msg, press)) => {
+                         held.on_key(&msg, press);
++                        holding.store(!held.is_empty(), std::sync::atomic::Ordering::SeqCst);
+                         // Set the press state to false, use `down` only in `handle_key()`.
+                         msg.press = false;
+                         if press {
+@@ -1341,29 +1368,39 @@ impl Connection {
+                 }
+             }
+         }
+-        // RemoteSmith (AC-41): the connection is gone; let go of everything it still holds,
+-        // through the same injection path the downs took.
+-        if !held.is_empty() {
+-            let (mouse_ups, key_ups) = held.take_releases();
+-            log::info!(
+-                "connection ended holding {} button(s) and {} key(s); releasing",
+-                mouse_ups.len(),
+-                key_ups.len()
+-            );
+-            if let Some((conn_id, username, argb)) = last_mouse_conn {
+-                for m in mouse_ups.iter() {
+-                    handle_mouse(m, conn_id, username.clone(), argb, true, false);
+-                }
+-            }
+-            for k in key_ups.iter() {
+-                handle_key(k);
+-            }
+-        }
++        // RemoteSmith (AC-41): the connection is gone; let go of everything it still holds.
++        Self::release_held(&mut held, &last_mouse_conn);
+         #[cfg(target_os = "linux")]
+         clear_remapped_keycode();
+         log::debug!("Input thread exited");
+     }
+ 
++    /// RemoteSmith (AC-41): inject the up events for whatever `held` still holds, through the
++    /// same path the downs took (main-thread queue on macOS, portable service on Windows).
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn release_held(
++        held: &mut crate::remotesmith_trust::held_input::HeldInput,
++        last_mouse_conn: &Option<(i32, String, u32)>,
++    ) {
++        if held.is_empty() {
++            return;
++        }
++        let (mouse_ups, key_ups) = held.take_releases();
++        log::info!(
++            "connection ended holding {} button(s) and {} key(s); releasing",
++            mouse_ups.len(),
++            key_ups.len()
++        );
++        if let Some((conn_id, username, argb)) = last_mouse_conn {
++            for m in mouse_ups.iter() {
++                handle_mouse(m, *conn_id, username.clone(), *argb, true, false);
++            }
++        }
++        for k in key_ups.iter() {
++            handle_key(k);
++        }
++    }
++
+     async fn post_seq_loop(mut rx: mpsc::UnboundedReceiver<(String, Value)>) {
+         while let Some((url, v)) = rx.recv().await {
+             allow_err!(Self::post_audit_async(url, v).await);
