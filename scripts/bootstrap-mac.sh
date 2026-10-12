@@ -14,6 +14,10 @@ source "$(dirname "$0")/lib/mac-env.sh"
 
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || die "this script targets Apple Silicon macOS"
 [[ -f "$RUSTDESK_DIR/vcpkg.json" ]] || die "vendor/rustdesk is not checked out; run: git submodule update --init --recursive --depth 1"
+# Every step below writes the shared cache (SDK dirs, downloads, vcpkg), which other worktrees'
+# builds read, so all of it runs under the same lock as build-mac.sh.
+trap release_cache_lock EXIT
+acquire_cache_lock bootstrap
 mkdir -p "$RS_CACHE" "$TOOLS_DIR/bin" "$VCPKG_DEFAULT_BINARY_CACHE"
 
 # --- Xcode -------------------------------------------------------------------------------------
@@ -176,6 +180,6 @@ fi
 if [[ ! -x "$VCPKG_ROOT/vcpkg" ]]; then
   "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 fi
-"$(dirname "$0")/lib/vcpkg-install.sh"
+vcpkg_install
 
 log "bootstrap complete: $RS_CACHE ($(du -sh "$RS_CACHE" | cut -f1))"

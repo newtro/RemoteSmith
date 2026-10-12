@@ -23,9 +23,16 @@ for arg in "$@"; do
   esac
 done
 
+# Initialise only submodules that are missing; an existing checkout is never touched before the
+# guard below has looked at it (a recursive update would move its HEAD).
 if [[ ! -e "$RUSTDESK_DIR/.git" || ! -e "$HBB_DIR/.git" ]]; then
   [[ $mode == apply ]] || die "submodules are not checked out; run: git submodule update --init --recursive --depth 1"
-  git -C "$REPO_ROOT" submodule update --init --recursive --depth 1
+  if [[ ! -e "$RUSTDESK_DIR/.git" ]]; then
+    git -C "$REPO_ROOT" submodule update --init --depth 1 -- vendor/rustdesk
+  fi
+  if [[ ! -e "$HBB_DIR/.git" ]]; then
+    git -C "$RUSTDESK_DIR" submodule update --init --depth 1 -- libs/hbb_common
+  fi
 fi
 
 RD_PIN="$(rustdesk_pin)"
@@ -93,10 +100,11 @@ if [[ $mode == check ]]; then
 fi
 
 # --- apply -------------------------------------------------------------------------------------
-# Refuse to throw away work unless --force: local edits, or commits on `remotesmith` above the pin
-# whose content is not in patches/ (compared by stable patch-id, so re-exported patches match).
+# Refuse to throw away work unless --force: local edits, merge commits above the pin, or commits
+# above the pin whose exact patch text (export-patches.sh output, message included) is not a file
+# in patches/.
 guard() { # repo-dir pin label
-  local dir="$1" pin="$2" label="$3" c id ids missing=() tips=() head
+  local dir="$1" pin="$2" label="$3" c id ids merges missing=() tips=() head
   local dirty
   dirty="$(git -C "$dir" status --porcelain --untracked-files=no --ignore-submodules=all)"
   [[ -z "$dirty" ]] || { ((force)) || die "$label has uncommitted changes (use --force to discard):
@@ -108,10 +116,13 @@ $dirty"; }
   if git -C "$dir" rev-parse --verify --quiet "refs/heads/$PATCH_BRANCH" >/dev/null; then
     tips+=("refs/heads/$PATCH_BRANCH")
   fi
-  ids="$(patch_file_ids)"
+  merges="$(git -C "$dir" rev-list --merges "${tips[@]}" "^$pin")"
+  if [[ -n "$merges" ]] && ((force == 0)); then
+    die "$label has merge commits above the pin ($(echo $merges | cut -c1-12)...); linearize the branch, or --force to drop them"
+  fi
+  ids="$(patch_file_hashes)"
   for c in $(git -C "$dir" rev-list --no-merges "${tips[@]}" "^$pin"); do
-    id="$(commit_patch_id "$dir" "$c")"
-    [[ -z "$id" ]] && continue                 # empty commit
+    id="$(commit_hash "$dir" "$c")"
     grep -qx "$id" <<<"$ids" || missing+=("$(git -C "$dir" log -1 --format='%h %s' "$c")")
   done
   if ((${#missing[@]})) && ((force == 0)); then
@@ -142,7 +153,7 @@ am_all "$HBB_DIR" hbb_common ${HBB_PATCHES[@]+"${HBB_PATCHES[@]}"} || die "libs/
 
 write_manifest() { # repo-dir patches...
   local dir="$1" f; shift
-  for f in "$@"; do echo "$(basename "$f") $(file_patch_id "$f")"; done >"$(manifest_path "$dir")"
+  for f in "$@"; do echo "$(basename "$f") $(file_hash "$f")"; done >"$(manifest_path "$dir")"
 }
 write_manifest "$RUSTDESK_DIR" ${RD_PATCHES[@]+"${RD_PATCHES[@]}"}
 write_manifest "$HBB_DIR" ${HBB_PATCHES[@]+"${HBB_PATCHES[@]}"}

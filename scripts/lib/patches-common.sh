@@ -53,22 +53,29 @@ load_patches() { # patches-subdir
 # depend on whoever runs the scripts (diff.context, format.*, apply.whitespace, am.threeWay...).
 git_clean() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git "$@"; }
 
-# Stable patch-id of one commit, computed the same way export-patches.sh writes the patch.
-commit_patch_id() { # repo-dir commit
-  git_clean -C "$1" diff-tree -p --no-renames --binary --full-index -U3 --diff-algorithm=myers "$2" \
-    | git patch-id --stable | awk '{print $1}'
+# The exact patch text export-patches.sh writes for one commit. Fixed options and an empty
+# global/system config make it byte-stable across machines and re-exports.
+format_commit() { # repo-dir commit
+  git_clean -C "$1" -c core.abbrev=12 -c diff.noprefix=false -c diff.mnemonicPrefix=false \
+    -c format.signOff=false -c format.useAutoBase=false -c diff.suppressBlankEmpty=false \
+    format-patch -1 "$2" --stdout -k --zero-commit --no-signature --no-numbered --no-renames --binary \
+    -U3 --inter-hunk-context=0 --diff-algorithm=myers --no-relative --no-notes --no-thread --no-attach \
+    --no-to --no-cc --no-from
 }
 
-# Stable patch-ids of the patch files for one target, one per line (after load_patches).
-patch_file_ids() {
+# Exact identity of a patch: sha256 of its bytes (message, metadata and diff, whitespace
+# included). Deliberately not `git patch-id`, which ignores whitespace and the message.
+file_hash() { shasum -a 256 <"$1" | cut -d' ' -f1; }
+commit_hash() { format_commit "$1" "$2" | shasum -a 256 | cut -d' ' -f1; }
+
+# Hashes of the patch files for one target, one per line (after load_patches).
+patch_file_hashes() {
   local f
-  for f in ${PATCHES[@]+"${PATCHES[@]}"}; do
-    git patch-id --stable <"$f" | awk '{print $1}'
-  done
+  for f in ${PATCHES[@]+"${PATCHES[@]}"}; do file_hash "$f"; done
 }
 
-# Manifest of the patch files the last apply-patches.sh run applied, one "<file> <patch-id>" line
-# each, kept in the submodule's git dir. export-patches.sh uses it to tell a patch file that changed
-# or appeared since then (another unit's work, pulled from main) from one this branch owns.
+# Manifest of the patch files the last apply-patches.sh (or export-patches.sh) run left the branch
+# matching, one "<file> <sha256>" line each, kept in the submodule's git dir. export-patches.sh
+# uses it to tell a patch file that changed or appeared since then (another unit's work, pulled
+# from main) from one this branch owns.
 manifest_path() { echo "$(git -C "$1" rev-parse --absolute-git-dir)/remotesmith-applied"; }
-file_patch_id() { git patch-id --stable <"$1" | awk '{print $1}'; }

@@ -64,11 +64,7 @@ generate() { # target repo-dir pin  -> $SCRATCH/<target>/*.patch
     fi
     # -k keeps the subject verbatim; --zero-commit, --no-signature and a fixed abbrev keep the file
     # byte-stable across re-exports and machines.
-    git_clean -C "$dir" -c core.abbrev=12 -c diff.noprefix=false -c diff.mnemonicPrefix=false \
-      -c format.signOff=false -c format.useAutoBase=false -c diff.suppressBlankEmpty=false \
-      format-patch -1 "$c" --stdout -k --zero-commit --no-signature --no-numbered --no-renames --binary \
-      -U3 --inter-hunk-context=0 --diff-algorithm=myers --no-relative --no-notes --no-thread --no-attach \
-      --no-to --no-cc --no-from >"$out/$num-$(slug "$topic").patch"
+    format_commit "$dir" "$c" >"$out/$num-$(slug "$topic").patch"
     count=$((count + 1))
   done
   echo "== $target: $count commit(s) above ${pin:0:12}"
@@ -94,7 +90,7 @@ for target in rustdesk hbb_common; do
     base="$(basename "$f")" num="$(basename "$f" | cut -c1-4)"
     applied_line="$(grep "^$num-" "$manifest" 2>/dev/null || true)"
     same_as_applied=0
-    [[ -n "$applied_line" && "${applied_line##* }" == "$(file_patch_id "$f")" ]] && same_as_applied=1
+    [[ -n "$applied_line" && "${applied_line##* }" == "$(file_hash "$f")" ]] && same_as_applied=1
     if compgen -G "$SCRATCH/$target/$num-*.patch" >/dev/null; then
       if ((same_as_applied == 0)) && ! cmp -s "$f" "$SCRATCH/$target/$num-"*.patch; then
         stale+=("patches/$target/$base")
@@ -142,7 +138,7 @@ for target in rustdesk hbb_common; do
     for f in "$SCRATCH/$target"/*.patch; do
       [[ -e "$f" ]] || continue
       [[ " ${kept[*]+${kept[*]}} " == *" patches/$target/$(basename "$f") "* ]] && continue
-      echo "$(basename "$f") $(file_patch_id "$f")"
+      echo "$(basename "$f") $(file_hash "$f")"
     done >"$(manifest_path "$repo")"
   fi
 done
