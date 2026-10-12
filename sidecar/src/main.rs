@@ -1,4 +1,7 @@
 //! `remotesmith-tray` — RemoteSmith presence tray / menu-bar app.
+// GUI subsystem on Windows so a login (Run key) launch opens no console window. CLI modes
+// re-attach to the console of the shell that started them; see `attach_parent_console`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::time::Duration;
 
@@ -62,6 +65,9 @@ fn main() {
             other => die(&format!("unknown argument {other}\n\n{USAGE}")),
         }
     }
+    if mode != "run" {
+        attach_parent_console();
+    }
     match mode {
         "help" => print!("{USAGE}"),
         "version" => println!(
@@ -122,7 +128,21 @@ fn main() {
     }
 }
 
+/// On Windows (GUI subsystem) borrow the parent shell's console so CLI output is visible.
+/// No-op when there is no parent console (e.g. launched from Explorer) and on other OSes.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        // SAFETY: plain FFI call; failure (no parent console, already attached) is harmless.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn die(msg: &str) -> ! {
+    attach_parent_console();
     eprintln!("remotesmith-tray: {msg}");
     std::process::exit(2);
 }

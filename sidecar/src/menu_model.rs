@@ -304,30 +304,30 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
                     format!("Readiness: {} to fix", failing.len())
                 }
             };
-            let mut sub: Vec<Item> = failing
+            // Every capability with its outcome (§6.3), not just the failing ones.
+            let mut sub: Vec<Item> = checks
                 .iter()
                 .map(|c| {
-                    let (mark, why) = match &c.outcome {
-                        Outcome::Fail(w) => ("✗", w.as_str()),
-                        Outcome::Unknown(w) => ("?", w.as_str()),
-                        Outcome::Pass => ("✓", ""),
-                    };
-                    Item::Label(format!("{mark} {} — {why}", c.label))
+                    Item::Label(match &c.outcome {
+                        Outcome::Pass => format!("✓ {}", c.label),
+                        Outcome::Fail(w) => format!("✗ {} — {w}", c.label),
+                        Outcome::Unknown(w) => format!("? {} — {w}", c.label),
+                    })
                 })
                 .collect();
-            if !failing.is_empty() {
-                sub.push(Item::Separator);
-            }
+            sub.push(Item::Separator);
+            sub.push(Item::Label(if r.unattended_ready {
+                "✓ Unattended ready".to_string()
+            } else if failing.is_empty() {
+                "✗ Unattended ready — waiting for RemoteSmith to confirm".to_string()
+            } else {
+                "✗ Unattended ready — prerequisites above must pass".to_string()
+            }));
             let passing = checks.iter().filter(|c| c.outcome == Outcome::Pass).count();
             sub.push(Item::Label(format!(
                 "{passing} of {} checks pass",
                 checks.len()
             )));
-            if !r.unattended_ready && failing.is_empty() {
-                sub.push(Item::Label(
-                    "Waiting for RemoteSmith to confirm unattended readiness".into(),
-                ));
-            }
             (title, sub)
         }
     };
@@ -629,7 +629,73 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts.contains(&"✗ Never sleeps — sleep is enabled".to_string()));
-        assert!(!has(&m, "Unattended ready"));
+        assert!(!has(&m, "✓ Unattended ready") && !has(&m, "Readiness: Unattended ready"));
+    }
+
+    fn readiness_rows(m: &MenuModel) -> (String, Vec<String>) {
+        m.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Submenu {
+                    key: "readiness",
+                    text,
+                    items,
+                } => Some((
+                    text.clone(),
+                    items
+                        .iter()
+                        .filter_map(|i| {
+                            if let Item::Label(t) = i {
+                                Some(t.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn readiness_submenu_lists_every_capability_when_all_pass() {
+        let m = build(&up_state(), 0);
+        let (title, rows) = readiness_rows(&m);
+        assert_eq!(title, "Readiness: Unattended ready");
+        assert_eq!(
+            rows,
+            vec![
+                "✓ Service running",
+                "✓ Accessibility permission",
+                "✓ Screen Recording permission",
+                "✓ Input Monitoring permission",
+                "✓ Screen & System Audio Recording permission",
+                "✓ Never sleeps",
+                "✓ No pre-boot unlock",
+                "✓ Server registration",
+                "✓ Cold-boot connection verified",
+                "✓ Unattended ready",
+                "9 of 9 checks pass",
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_submenu_marks_unknown_and_failures_inline() {
+        let mut s = up_state();
+        let mut st = passing_status();
+        st.permissions[2].state = PermState::Unknown;
+        st.unattended.ready = false;
+        s.apply(StateEvent::Status(Box::new(st)), 0);
+        let (title, rows) = readiness_rows(&build(&s, 0));
+        assert_eq!(title, "Readiness: 1 to fix");
+        assert!(
+            rows.contains(&"? Input Monitoring permission — not determined".to_string()),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&"✓ Service running".to_string()));
+        assert!(rows.contains(&"✗ Unattended ready — prerequisites above must pass".to_string()));
     }
 
     #[test]
