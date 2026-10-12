@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:30:39 -0400
+Subject: remotesmith(0202): session toggle, send-win-key, escape release in
+ flutter
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DEC-22, PLAN §6.1; AC-12, AC-13, AC-59.
+
+- Keyboard toggles: "Translate Mac/Windows shortcuts" (Mac controller
+  on a Windows peer, or Windows controller on a Mac peer; default on).
+  Writes the peer option through the session so Rust releases held keys
+  on the change. Upstream's Cmd/Ctrl swap toggle is hidden while it is on.
+- Control menu: "Send Win key" for Windows peers (a Mac's Cmd now sends
+  Ctrl).
+- remotesmith_release_capture session event: leaves relative mouse
+  mode, resets modifiers and unfocuses the remote view; on macOS the
+  local-focus-lost latch keeps it released until the pointer re-enters
+  or clicks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/common/widgets/toolbar.dart    | 47 +++++++++++++++++++++-
+ flutter/lib/desktop/pages/remote_page.dart | 14 +++++++
+ flutter/lib/models/input_model.dart        | 10 +++++
+ flutter/lib/models/model.dart              |  3 ++
+ 4 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/flutter/lib/common/widgets/toolbar.dart b/flutter/lib/common/widgets/toolbar.dart
+index c3896b0972c3..8a171b05ccf6 100644
+--- a/flutter/lib/common/widgets/toolbar.dart
++++ b/flutter/lib/common/widgets/toolbar.dart
+@@ -16,6 +16,9 @@ import 'package:get/get.dart';
+ import 'package:url_launcher/url_launcher.dart';
+ 
+ bool isEditOsPassword = false;
++// RemoteSmith (DEC-22): peer option; empty or 'Y' translates Mac/Windows shortcuts, 'N' sends raw keys.
++const String kOptionRemoteSmithTranslateShortcuts =
++    'remotesmith-translate-shortcuts';
+ const String kPeerOptionAllowWaylandKeyboard = 'allow-wayland-keyboard';
+ const String kWaylandKeyboardIssueUrl =
+     'https://github.com/rustdesk/rustdesk/issues/14586';
+@@ -507,6 +510,25 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
+   if (isDefaultConn && (isDesktop || isWebDesktop)) {
+     v.add(TTextMenu(child: Offstage(), onPressed: () {}, divider: true));
+   }
++  // RemoteSmith (DEC-22): Cmd is sent as Ctrl, so a Mac reaches the Windows key from here.
++  if (isDefaultConn &&
++      !ffiModel.viewOnly &&
++      ffiModel.keyboard &&
++      pi.platform == kPeerPlatformWindows) {
++    v.add(
++      TTextMenu(
++          child: Text(translate('Send Win key')),
++          onPressed: () => bind.sessionInputKey(
++              sessionId: sessionId,
++              name: 'Meta',
++              down: false,
++              press: true,
++              alt: false,
++              ctrl: false,
++              shift: false,
++              command: false)),
++    );
++  }
+   // ctrlAltDel
+   if (isDefaultConn &&
+       !ffiModel.viewOnly &&
+@@ -1151,8 +1173,31 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
+   final isDefaultConn = ffi.connType == ConnType.defaultConn;
+   List<TToggleMenu> v = [];
+ 
+-  // swap key
++  // RemoteSmith (DEC-22, PLAN §6.1): Mac/Windows shortcut translation, on by default; off = raw.
++  final translatable = (isMacOS && pi.platform == kPeerPlatformWindows) ||
++      (isWindows && pi.platform == kPeerPlatformMacOS);
++  final translating = translatable &&
++      bind.mainGetPeerOptionSync(
++              id: ffi.id, key: kOptionRemoteSmithTranslateShortcuts) !=
++          'N';
++  if (ffiModel.keyboard && translatable) {
++    onChanged(bool? value) {
++      if (value == null) return;
++      bind.sessionPeerOption(
++          sessionId: sessionId,
++          name: kOptionRemoteSmithTranslateShortcuts,
++          value: value ? 'Y' : 'N');
++    }
++
++    v.add(TToggleMenu(
++        value: translating,
++        onChanged: !ffi.ffiModel.viewOnly ? onChanged : null,
++        child: Text(translate('Translate Mac/Windows shortcuts'))));
++  }
++
++  // swap key (never applies on a Mac/Windows pair: translated or raw is the choice there)
+   if (ffiModel.keyboard &&
++      !translatable &&
+       ((isMacOS && pi.platform != kPeerPlatformMacOS) ||
+           (!isMacOS && pi.platform == kPeerPlatformMacOS))) {
+     final option = 'allow_swap_key';
+diff --git a/flutter/lib/desktop/pages/remote_page.dart b/flutter/lib/desktop/pages/remote_page.dart
+index 55277caa057e..33371281d65c 100644
+--- a/flutter/lib/desktop/pages/remote_page.dart
++++ b/flutter/lib/desktop/pages/remote_page.dart
+@@ -211,6 +211,7 @@ class _RemotePageState extends State<RemotePage>
+     });
+ 
+     // Register callback to cancel debounce timer when relative mouse mode is disabled
++    _ffi.inputModel.onRemoteSmithReleaseCapture = _remoteSmithReleaseCapture;
+     _ffi.inputModel.onRelativeMouseModeDisabled =
+         _cancelPointerLockCenterDebounceTimer;
+ 
+@@ -307,6 +308,18 @@ class _RemotePageState extends State<RemotePage>
+     _rawKeyFocusNode.unfocus();
+   }
+ 
++  // RemoteSmith (AC-13): drop keyboard focus after the escape chord. The same latches as a local
++  // focus loss keep it released until the pointer re-enters or clicks the remote image.
++  void _remoteSmithReleaseCapture() {
++    if (isMacOS) {
++      _macOSLocalFocusLost = true;
++      _syncMacOSKeyboardGrab();
++    } else {
++      _rawKeyFocusNode.unfocus();
++      if (!isWindows) _ffi.inputModel.enterOrLeave(false);
++    }
++  }
++
+   void _onMacOSFocusChange() {
+     // requestFocus() notifies later; only a recorded explicit request may clear
+     // the local-focus-loss latch.
+@@ -659,6 +672,7 @@ class _RemotePageState extends State<RemotePage>
+     _waylandKeyboardModeWorker?.dispose();
+     // Clear callback reference to prevent memory leaks and stale references
+     _ffi.inputModel.onRelativeMouseModeDisabled = null;
++    _ffi.inputModel.onRemoteSmithReleaseCapture = null;
+     // Relative mouse mode cleanup is centralized in FFI.close(closeSession: ...).
+     _ffi.textureModel.onRemotePageDispose(closeSession);
+     if (closeSession && !isMacOS) {
+diff --git a/flutter/lib/models/input_model.dart b/flutter/lib/models/input_model.dart
+index 6ea23c2c985a..6c66a4d5b83e 100644
+--- a/flutter/lib/models/input_model.dart
++++ b/flutter/lib/models/input_model.dart
+@@ -465,6 +465,8 @@ class InputModel {
+   late final RelativeMouseModel _relativeMouse;
+   // Callback to cancel external throttle timer when relative mouse mode is disabled.
+   VoidCallback? onRelativeMouseModeDisabled;
++  // RemoteSmith (DEC-22): set by the remote page to give up keyboard focus after the escape chord.
++  VoidCallback? onRemoteSmithReleaseCapture;
+   // Disposer for the relativeMouseMode observer (to prevent memory leaks).
+   Worker? _relativeMouseModeDisposer;
+ 
+@@ -1263,6 +1265,14 @@ class InputModel {
+     _relativeMouse.setRelativeMouseMode(false);
+   }
+ 
++  /// RemoteSmith (AC-13): the escape chord (Ctrl+Option+Cmd+Esc / Ctrl+Alt+Win+Esc) releases
++  /// local input capture. The session stays connected; a click or pointer re-entry recaptures.
++  void remoteSmithReleaseCapture() {
++    exitRelativeMouseModeWithKeyRelease(); // no-op unless relative mouse mode is on
++    resetModifiers();
++    onRemoteSmithReleaseCapture?.call();
++  }
++
+   void disposeRelativeMouseMode() {
+     _relativeMouse.dispose();
+     onRelativeMouseModeDisabled = null;
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index f1abb8e36623..12f96ffa05d5 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -469,6 +469,9 @@ class FfiModel with ChangeNotifier {
+       } else if (name == 'exit_relative_mouse_mode') {
+         // Handle exit shortcut from rdev grab loop (Ctrl+Alt on Win/Linux, Cmd+G on macOS)
+         parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
++      } else if (name == 'remotesmith_release_capture') {
++        // RemoteSmith (DEC-22): escape chord; Rust has already released the host's keys.
++        parent.target?.inputModel.remoteSmithReleaseCapture();
+       } else {
+         debugPrint('Event is not handled in the fixed branch: $name');
+       }
