@@ -14,6 +14,10 @@ has a route and, if it accepts incoming connections, a permanent password:
   upstream's stop-service option (no rendezvous registration, no direct-IP
   listener), and needs no password. Settings > General > Start service
   turns hosting on, and the dialog then asks for the password.
+  Setup closes only once the service confirms it: stop-service=Y is
+  acknowledged and nothing listens on the direct-IP port (a cancelled
+  administrator prompt or macOS's asynchronous stop keeps the dialog open
+  with the reason, even if a password already exists).
 - otherwise a permanent password of at least 12 characters, with a
   generator (20 chars from the OS CSPRNG, no look-alikes, always a digit,
   lower and upper case).
@@ -30,7 +34,8 @@ only (dialog, CLI) clears the stored servers.
 Headless: --option custom-rendezvous-server/key/remotesmith-lan-only/
 stop-service and --password apply the same validation before anything is
 written; --config and --import-config refuse a malformed or key-less
-server. The Settings password dialog minimum goes from 8 to 12. Logic and
+server; --import-config loads and validates both files before writing
+either, so a rejected import changes nothing. The Settings password dialog minimum goes from 8 to 12. Logic and
 tests live in src/remotesmith.rs; four small FFI functions expose it.
 
 Plan: FLOW-2, DEC-10, DEF-2, AC-40, AC-10.
@@ -39,13 +44,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  flutter/lib/common.dart                       |   4 +
  .../lib/desktop/pages/desktop_home_page.dart  |  10 +-
- .../desktop/widgets/remotesmith_setup.dart    | 319 ++++++++++++
+ .../desktop/widgets/remotesmith_setup.dart    | 331 +++++++++
  src/client.rs                                 |   4 +
  src/common.rs                                 |  16 +-
- src/core_main.rs                              |  61 ++-
- src/flutter_ffi.rs                            |  31 ++
- src/remotesmith.rs                            | 481 ++++++++++++++++++
- 8 files changed, 914 insertions(+), 12 deletions(-)
+ src/core_main.rs                              |  87 ++-
+ src/flutter_ffi.rs                            |  43 ++
+ src/remotesmith.rs                            | 665 ++++++++++++++++++
+ 8 files changed, 1128 insertions(+), 32 deletions(-)
  create mode 100644 flutter/lib/desktop/widgets/remotesmith_setup.dart
 
 diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
@@ -109,10 +114,10 @@ index 97178a4ae548..3e5461046a67 100644
    final statusTip = localPasswordSet
 diff --git a/flutter/lib/desktop/widgets/remotesmith_setup.dart b/flutter/lib/desktop/widgets/remotesmith_setup.dart
 new file mode 100644
-index 000000000000..0b9854ea5191
+index 000000000000..02eb8d118941
 --- /dev/null
 +++ b/flutter/lib/desktop/widgets/remotesmith_setup.dart
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,331 @@
 +// RemoteSmith first-run setup (FLOW-2, AC-40).
 +//
 +// A fresh build has no rendezvous server. On first launch this asks for the ID server host and
@@ -270,9 +275,21 @@ index 000000000000..0b9854ea5191
 +              key: kRemoteSmithOptionStopService,
 +              value: controllerOnly ? 'Y' : '');
 +        }
-+        if (await bind.mainRemotesmithNeedsProvisioning()) {
-+          setState(() => serverErr =
-+              'Settings were not saved. Is the RemoteSmith service running?');
++        // Close only once the service confirms the result. For Controller only that means
++        // stop-service=Y is acknowledged AND nothing listens on the direct port: a cancelled
++        // administrator prompt, or macOS stopping the service asynchronously, must not leave
++        // hosting on behind a closed dialog. Bounded wait for the prompt and the stop.
++        var err = await bind.mainRemotesmithCheckSetup(
++            controllerOnly: controllerOnly);
++        if (controllerOnly && err.isNotEmpty) {
++          setState(() => serverErr = 'Waiting for the service to stop...');
++          for (var i = 0; i < 60 && err.isNotEmpty; i++) {
++            await Future.delayed(const Duration(seconds: 1));
++            err = await bind.mainRemotesmithCheckSetup(controllerOnly: true);
++          }
++        }
++        if (err.isNotEmpty) {
++          setState(() => serverErr = err);
 +          return;
 +        }
 +        closed = true;
@@ -489,7 +506,7 @@ index eba227fcf8a1..f1b4847979ca 100644
      if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
          if !lic.api.is_empty() {
 diff --git a/src/core_main.rs b/src/core_main.rs
-index b5a451ed842a..cf5fc7feaf0f 100644
+index b5a451ed842a..5fca8120a689 100644
 --- a/src/core_main.rs
 +++ b/src/core_main.rs
 @@ -444,6 +444,11 @@ pub fn core_main() -> Option<Vec<String>> {
@@ -581,24 +598,52 @@ index b5a451ed842a..cf5fc7feaf0f 100644
                  }
              } else {
                  println!("Installation and administrative privileges required!");
-@@ -755,6 +794,12 @@ fn import_config(path: &str) {
-         }
-     }
-     let config2: Config2 = load_path(path2.into());
-+    // RemoteSmith: don't import a malformed or key-less server (FLOW-2).
-+    if let Err(err) = crate::remotesmith::validate_imported_options(&config2.options) {
-+        log::error!("import config: {err}; skipped {:?}", path2);
+@@ -737,28 +776,20 @@ pub fn core_main() -> Option<Vec<String>> {
+ }
+ 
+ fn import_config(path: &str) {
+-    use hbb_common::{config::*, get_exe_time, get_modified_time};
++    use hbb_common::config::*;
+     let path2 = path.replace(".toml", "2.toml");
+-    let path2 = std::path::Path::new(&path2);
+-    let path = std::path::Path::new(path);
+     log::info!("import config from {:?} and {:?}", path, path2);
+-    let config: Config = load_path(path.into());
+-    if config.is_empty() {
+-        log::info!("Empty source config, skipped");
+-        return;
+-    }
+-    if get_modified_time(&path) > get_modified_time(&Config::file())
+-        && get_modified_time(&path) < get_exe_time()
+-    {
+-        if store_path(Config::file(), config).is_err() {
+-            log::info!("config written");
+-        }
+-    }
+-    let config2: Config2 = load_path(path2.into());
+-    if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
+-        if store_path(Config2::file(), config2).is_err() {
+-            log::info!("config2 written");
+-        }
++    // RemoteSmith: both files are loaded and validated before either is written, so a rejected
++    // import (malformed or key-less server) leaves the current config untouched (FLOW-2).
++    if let Err(err) = crate::remotesmith::import_config_files(
++        std::path::Path::new(path),
++        std::path::Path::new(&path2),
++        &Config::file(),
++        &Config2::file(),
++        hbb_common::get_exe_time(),
++    ) {
++        log::error!("import config: {err}");
 +        println!("{err}");
-+        return;
-+    }
-     if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
-         if store_path(Config2::file(), config2).is_err() {
-             log::info!("config2 written");
+     }
+ }
+ 
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index f9cc2d66c251..90347cff8330 100644
+index f9cc2d66c251..a376363b8fbb 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
-@@ -2516,6 +2516,37 @@ pub fn is_custom_client() -> SyncReturn<bool> {
+@@ -2516,6 +2516,49 @@ pub fn is_custom_client() -> SyncReturn<bool> {
      SyncReturn(crate::common::is_custom_client())
  }
  
@@ -629,6 +674,18 @@ index f9cc2d66c251..90347cff8330 100644
 +    )
 +}
 +
++/// "" when the setup dialog may close, otherwise the reason. With `controller_only`, also
++/// requires incoming connections to be confirmed off.
++pub fn main_remotesmith_check_setup(controller_only: bool) -> String {
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    return crate::remotesmith::check_setup(controller_only);
++    #[cfg(any(target_os = "android", target_os = "ios"))]
++    return {
++        let _ = controller_only;
++        String::new()
++    };
++}
++
 +pub fn main_remotesmith_generate_password() -> SyncReturn<String> {
 +    SyncReturn(crate::remotesmith::generate_password())
 +}
@@ -637,10 +694,10 @@ index f9cc2d66c251..90347cff8330 100644
      SyncReturn(config::is_disable_settings())
  }
 diff --git a/src/remotesmith.rs b/src/remotesmith.rs
-index 59b87a4c887a..a1a8db2255fd 100644
+index 59b87a4c887a..54c9a18b81f9 100644
 --- a/src/remotesmith.rs
 +++ b/src/remotesmith.rs
-@@ -9,3 +9,484 @@ pub const UPDATE_CHECK_DISABLED: bool = true;
+@@ -9,3 +9,668 @@ pub const UPDATE_CHECK_DISABLED: bool = true;
  
  /// Public source repository (AGPL-3.0 corresponding source).
  pub const SOURCE_URL: &str = "https://github.com/newtro/RemoteSmith";
@@ -861,6 +918,102 @@ index 59b87a4c887a..a1a8db2255fd 100644
 +    validate_option(OPTION_LAN_ONLY, get(OPTION_LAN_ONLY))
 +}
 +
++/// `--import-config` (upstream's logic, reordered): load both source files and validate the
++/// server options **before** writing either destination, so a rejected import changes nothing.
++/// Upstream's freshness rules are kept: the primary file is copied only when it is newer than
++/// the destination and older than the running exe, the `2` file only when it is newer.
++/// Returns which destinations were written.
++pub fn import_config_files(
++    src: &std::path::Path,
++    src2: &std::path::Path,
++    dst: &std::path::Path,
++    dst2: &std::path::Path,
++    exe_time: std::time::SystemTime,
++) -> Result<(bool, bool), String> {
++    use hbb_common::{
++        config::{load_path, store_path, Config, Config2},
++        get_modified_time,
++    };
++    let config: Config = load_path(src.into());
++    if config.is_empty() {
++        hbb_common::log::info!("Empty source config, skipped");
++        return Ok((false, false));
++    }
++    let config2: Config2 = load_path(src2.into());
++    validate_imported_options(&config2.options)?;
++    let write1 = get_modified_time(src) > get_modified_time(dst) && get_modified_time(src) < exe_time;
++    let write2 = get_modified_time(src2) > get_modified_time(dst2);
++    if write1 {
++        store_path(dst.into(), config).map_err(|e| format!("Could not write {dst:?}: {e}"))?;
++    }
++    if write2 {
++        store_path(dst2.into(), config2).map_err(|e| format!("Could not write {dst2:?}: {e}"))?;
++    }
++    Ok((write1, write2))
++}
++
++/// Whether incoming connections are really off for "Controller only": the service reports
++/// `stop-service=Y` **and** nothing is listening on the direct-IP port any more. A cancelled
++/// privilege prompt leaves (Windows) or never sets (macOS) the flag, and macOS stops the
++/// service asynchronously, so the flag alone is not proof.
++pub fn incoming_stopped(stop_service: &str, direct_port_listening: bool) -> bool {
++    hbb_common::config::option2bool(OPTION_STOP_SERVICE, stop_service) && !direct_port_listening
++}
++
++/// Decides whether the setup dialog may close. With "Controller only" chosen, incoming
++/// connections must be confirmed off, even when a password already makes the general
++/// provisioning check pass.
++pub fn setup_result(
++    state: &ProvisioningState,
++    wants_controller_only: bool,
++    incoming_is_stopped: bool,
++) -> Result<(), String> {
++    if wants_controller_only && !incoming_is_stopped {
++        return Err("Incoming connections are still on: the service was not stopped. Approve the \
++                    administrator prompt and Save again, or untick Controller only and set a \
++                    password."
++            .to_owned());
++    }
++    if needs_provisioning(state) {
++        return Err("Settings were not saved. Is the RemoteSmith service running?".to_owned());
++    }
++    Ok(())
++}
++
++/// True when something is bound to the direct-IP port (the host side still accepts direct
++/// connections). Checked by trying to bind it ourselves; nothing is connected or sent.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn direct_port_listening(port: u16) -> bool {
++    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
++    let v6 = TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_err();
++    let v4 = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_err();
++    v6 || v4
++}
++
++/// The live check behind the dialog's Save: "" when setup may close, otherwise the reason.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn check_setup(wants_controller_only: bool) -> String {
++    let options = crate::ipc::get_options();
++    let stop = options.get(OPTION_STOP_SERVICE).cloned().unwrap_or_default();
++    let port = options
++        .get("direct-access-port")
++        .and_then(|p| p.parse::<u16>().ok())
++        .filter(|p| *p > 0)
++        .unwrap_or((hbb_common::config::RENDEZVOUS_PORT + 2) as u16);
++    let stopped = incoming_stopped(&stop, direct_port_listening(port));
++    if wants_controller_only && !stopped {
++        return setup_result(&ProvisioningState::default(), true, false)
++            .err()
++            .unwrap_or_default();
++    }
++    if provisioning_needed() {
++        return setup_result(&ProvisioningState::default(), false, true)
++            .err()
++            .unwrap_or_default();
++    }
++    String::new()
++}
++
 +/// Builds the provisioning state from an options map (as the service reports it).
 +pub fn state_from_options(
 +    options: &std::collections::HashMap<String, String>,
@@ -893,6 +1046,15 @@ index 59b87a4c887a..a1a8db2255fd 100644
 +    };
 +    #[allow(unused_mut)]
 +    let mut state = state_from_options(&options, has_password);
++    if state.controller_only {
++        // Only counts while nothing listens on the direct port any more.
++        let port = options
++            .get("direct-access-port")
++            .and_then(|p| p.parse::<u16>().ok())
++            .filter(|p| *p > 0)
++            .unwrap_or((hbb_common::config::RENDEZVOUS_PORT + 2) as u16);
++        state.controller_only = !direct_port_listening(port);
++    }
 +    #[cfg(windows)]
 +    if state.id_server.is_empty() {
 +        // A server baked into the exe name (upstream's custom-server naming) counts as set.
@@ -1116,6 +1278,85 @@ index 59b87a4c887a..a1a8db2255fd 100644
 +            crate::common::get_custom_rendezvous_server("rs.example.com".to_owned()),
 +            "rs.example.com"
 +        );
++    }
++
++    /// Round-2 gate: a cancelled privilege prompt with an existing password must not close
++    /// setup as "Controller only" while hosting stays on.
++    #[test]
++    fn controller_only_requires_confirmed_stop() {
++        let with_password = |stop: &str| {
++            state_from_options(
++                &opts(&[(OPTION_LAN_ONLY, "Y"), (OPTION_STOP_SERVICE, stop)]),
++                true,
++            )
++        };
++        // Cancelled on Windows (flag restored) or macOS (flag never set): refused.
++        assert!(!incoming_stopped("", false));
++        assert!(setup_result(&with_password(""), true, incoming_stopped("", false)).is_err());
++        // macOS: flag set but the service is still listening (async stop): refused.
++        assert!(!incoming_stopped("Y", true));
++        assert!(setup_result(&with_password("Y"), true, incoming_stopped("Y", true)).is_err());
++        // Confirmed: flag set and nothing listening.
++        assert!(incoming_stopped("Y", false));
++        assert!(setup_result(&with_password("Y"), true, incoming_stopped("Y", false)).is_ok());
++        // Without Controller only, the existing password is enough.
++        assert!(setup_result(&with_password(""), false, false).is_ok());
++    }
++
++    #[test]
++    fn direct_port_probe() {
++        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
++        let port = l.local_addr().unwrap().port();
++        assert!(direct_port_listening(port));
++        drop(l);
++        assert!(!direct_port_listening(port));
++    }
++
++    /// Round-2 gate: a rejected --import-config leaves both destination files byte-identical,
++    /// even when the primary file alone would have been accepted.
++    #[test]
++    fn rejected_import_writes_nothing() {
++        let dir = std::env::temp_dir().join(format!(
++            "remotesmith-import-test-{}-{}",
++            std::process::id(),
++            hbb_common::rand::random::<u32>()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let (dst, dst2) = (dir.join("dst.toml"), dir.join("dst2.toml"));
++        std::fs::write(&dst, "id = '111111111'\npassword = 'old'\n").unwrap();
++        std::fs::write(&dst2, "[options]\ncustom-rendezvous-server = 'old.example.com'\n").unwrap();
++        let before = (std::fs::read(&dst).unwrap(), std::fs::read(&dst2).unwrap());
++        std::thread::sleep(std::time::Duration::from_millis(1100));
++        let (src, src2) = (dir.join("src.toml"), dir.join("src2.toml"));
++        // A non-empty source: an id and a key pair (an empty one is skipped by upstream).
++        std::fs::write(
++            &src,
++            "id = '999999999'\npassword = 'new'\nkey_pair = [[1, 2, 3], [4, 5, 6]]\n",
++        )
++        .unwrap();
++        let far_future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
++        // Server without a key: rejected, nothing written.
++        std::fs::write(&src2, "[options]\ncustom-rendezvous-server = 'rs.example.com'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        assert_eq!(std::fs::read(&dst).unwrap(), before.0);
++        assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        // Malformed key and bad lan-only value: rejected too.
++        std::fs::write(&src2, "[options]\ncustom-rendezvous-server = 'rs.example.com'\nkey = 'nope'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        std::fs::write(&src2, "[options]\nremotesmith-lan-only = 'yes'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        assert_eq!(std::fs::read(&dst).unwrap(), before.0);
++        assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        // A valid pair is imported (both files newer than the destinations).
++        std::fs::write(&src2, format!("[options]\ncustom-rendezvous-server = 'rs.example.com'\nkey = '{KEY}'\n")).unwrap();
++        assert_eq!(
++            import_config_files(&src, &src2, &dst, &dst2, far_future),
++            Ok((true, true))
++        );
++        assert_ne!(std::fs::read(&dst).unwrap(), before.0);
++        let imported: hbb_common::config::Config2 = hbb_common::config::load_path(dst2.clone());
++        assert_eq!(imported.options.get(OPTION_KEY).map(String::as_str), Some(KEY));
++        std::fs::remove_dir_all(&dir).ok();
 +    }
 +
 +    #[test]
