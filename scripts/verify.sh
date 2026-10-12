@@ -34,6 +34,15 @@ if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
 else
   echo "== fork: RemoteSmith unit tests skipped (needs scripts/apply-patches.sh + scripts/build-mac.sh first)"
 fi
+# The fork's RemoteSmith Flutter tests (patch 0502), with the pinned Flutter from bootstrap-mac.sh.
+if compgen -G "vendor/rustdesk/flutter/test/remotesmith_*_test.dart" >/dev/null \
+   && [[ -x "${REMOTESMITH_CACHE:-$HOME/.cache/remotesmith}/flutter-3.24.5/bin/flutter" ]]; then
+  echo "== fork: RemoteSmith Flutter tests"
+  (cd vendor/rustdesk/flutter && "${REMOTESMITH_CACHE:-$HOME/.cache/remotesmith}/flutter-3.24.5/bin/flutter" \
+     --suppress-analytics test test/remotesmith_*_test.dart)
+else
+  echo "== fork: RemoteSmith Flutter tests skipped (needs the patched checkout and scripts/bootstrap-mac.sh)"
+fi
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done

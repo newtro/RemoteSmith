@@ -15,7 +15,8 @@ it exists with PowerShell `[System.IO.Directory]::GetFiles("\\.\pipe\") | sls Re
 
 ### B4-1 (AC-20) Reachable with route, one-click connect
 1. Both machines on the same LAN. Within 20 s of starting the tray, the other machine shows
-   "reachable · LAN".
+   "reachable · LAN" (the fork sends one discovery broadcast per interface every 15 s and listens
+   at most 2.5 s; only saved peers count).
 2. Click it: a normal RemoteSmith session window opens to that peer using the saved password
    (no password prompt), exactly as if started from the RemoteSmith window.
 3. Click it again while that session is open: the existing session is focused, no second session.
@@ -34,12 +35,15 @@ it exists with PowerShell `[System.IO.Directory]::GetFiles("\\.\pipe\") | sls Re
 ### B4-3 (AC-60) Host session badge and connection window
 1. From the PC, connect to the Mac. On the Mac: RemoteSmith's connection window appears, and the
    Mac's tray shows the badge naming the PC (alias or ID), with no "agent".
-2. Disconnect from the PC. Badge and window are gone within 2 s.
-3. Open two sessions (remote + file transfer) from the PC, close one: the badge stays; close
+2. **Quit the RemoteSmith tray on the Mac first**, then connect from the PC and keep the session
+   open for at least 30 s: the connection window stays visible (small, top-right, on top) the
+   whole time; it is not minimized after 3 s. Then restart the tray: the badge appears.
+3. Disconnect from the PC. Badge and window are gone within 2 s.
+4. Open two sessions (remote + file transfer) from the PC, close one: the badge stays; close
    the other: it clears within 2 s.
-4. Repeat 1-3 with the Mac controlling the PC (Windows host: badge in the PC's tray tooltip and
+5. Repeat 1-4 with the Mac controlling the PC (Windows host: badge in the PC's tray tooltip and
    first menu rows; connection window shown).
-5. In RemoteSmith settings on the host, try to enable "hide connection management window" if
+6. In RemoteSmith settings on the host, try to enable "hide connection management window" if
    offered: the connection window must still appear on the next inbound session.
 
 ### B4-4 (AC-55) Readiness and "Unattended ready"

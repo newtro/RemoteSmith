@@ -33,16 +33,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/remotesmith/collect.rs   |  428 ++++++++++++++
  src/remotesmith/host.rs      |   98 ++++
  src/remotesmith/mod.rs       |  203 +++++++
- src/remotesmith/presence.rs  |  186 ++++++
+ src/remotesmith/presence.rs  |  265 +++++++++
  src/remotesmith/protocol.rs  | 1026 ++++++++++++++++++++++++++++++++++
  src/remotesmith/readiness.rs |  411 ++++++++++++++
  src/remotesmith/relay.rs     |  119 ++++
  src/remotesmith/server.rs    |  551 ++++++++++++++++++
  src/remotesmith/sessions.rs  |  380 +++++++++++++
- src/remotesmith/tests.rs     |  975 ++++++++++++++++++++++++++++++++
+ src/remotesmith/tests.rs     | 1008 +++++++++++++++++++++++++++++++++
  src/remotesmith/winsec.rs    |   44 ++
  src/server.rs                |    3 +
- 15 files changed, 4445 insertions(+)
+ 15 files changed, 4557 insertions(+)
  create mode 100644 src/remotesmith/collect.rs
  create mode 100644 src/remotesmith/host.rs
  create mode 100644 src/remotesmith/mod.rs
@@ -863,22 +863,22 @@ index 000000000000..5628f57d2f3c
 +}
 diff --git a/src/remotesmith/presence.rs b/src/remotesmith/presence.rs
 new file mode 100644
-index 000000000000..7f9cc93d3c5b
+index 000000000000..380aa669046f
 --- /dev/null
 +++ b/src/remotesmith/presence.rs
-@@ -0,0 +1,186 @@
-+//! Peer presence (DEF-17, §6.2): LAN discovery (upstream `lan::discover`) and the rendezvous
+@@ -0,0 +1,265 @@
++//! Peer presence (DEF-17, §6.2): a bounded LAN discovery round (upstream's discovery packets) and the rendezvous
 +//! server's online-state query (upstream `peer_online::query_online_states`), combined into the
 +//! IPC's `checking` / `reachable{route}` / `unavailable{reason, last_seen}`.
 +
 +use super::protocol::{Presence, Reason, Route};
 +use super::sessions::now_secs;
-+use hbb_common::{config::LanPeers, log, tokio};
++use hbb_common::{log, tokio};
 +use std::collections::{HashMap, HashSet};
 +use std::sync::{Arc, Mutex};
 +use std::time::{Duration, Instant};
 +
-+/// Full probe interval (LAN broadcast + server query).
++/// Full probe interval: one LAN broadcast round (at most [`LAN_ROUND`]) plus one server query.
 +pub const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 +const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 +
@@ -991,18 +991,99 @@ index 000000000000..7f9cc93d3c5b
 +    out
 +}
 +
-+/// LAN peers that answered the most recent discovery round.
-+fn lan_online() -> HashSet<String> {
-+    LanPeers::load()
-+        .peers
-+        .into_iter()
-+        .filter(|p| p.online)
-+        .map(|p| p.id)
-+        .collect()
++/// LAN discovery round limits. Upstream's `lan::discover` keeps listening while packets keep
++/// arriving and stores every responder, which a LAN host could abuse to keep it running and grow
++/// the stored list without bound. Ours has an absolute deadline, a packet budget, and only
++/// remembers saved peers; it stores nothing on disk.
++pub const LAN_ROUND: Duration = Duration::from_millis(2500);
++pub const LAN_MAX_PACKETS: usize = 512;
++const LAN_MAX_SOCKETS: usize = 16;
++
++fn lan_port() -> u16 {
++    (hbb_common::config::RENDEZVOUS_PORT + 3) as u16
 +}
 +
-+/// Probe forever on the calling thread (which must not be inside a tokio runtime: upstream's
-+/// `lan::discover` starts its own). `ids` lists the enrolled peers; `registered` says whether
++/// The id of a valid discovery `pong` from a saved peer, else `None`.
++pub fn accept_pong(packet: &[u8], saved: &HashSet<String>) -> Option<String> {
++    use hbb_common::protobuf::Message as _;
++    use hbb_common::rendezvous_proto::{rendezvous_message, RendezvousMessage};
++    let msg = RendezvousMessage::parse_from_bytes(packet).ok()?;
++    match msg.union {
++        Some(rendezvous_message::Union::PeerDiscovery(p)) if p.cmd == "pong" => {
++            saved.contains(&p.id).then(|| p.id.clone())
++        }
++        _ => None,
++    }
++}
++
++fn ping_packet() -> Option<Vec<u8>> {
++    use hbb_common::protobuf::Message as _;
++    use hbb_common::rendezvous_proto::{PeerDiscovery, RendezvousMessage};
++    let mut m = RendezvousMessage::new();
++    m.set_peer_discovery(PeerDiscovery {
++        cmd: "ping".to_owned(),
++        ..Default::default()
++    });
++    m.write_to_bytes().ok()
++}
++
++/// One bounded discovery round: broadcast upstream's discovery ping on every IPv4 interface and
++/// collect pongs until [`LAN_ROUND`] has passed (absolute) or [`LAN_MAX_PACKETS`] arrived.
++/// Returns the saved peers that answered.
++pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
++    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
++    let mut found = HashSet::new();
++    if saved.is_empty() {
++        return found;
++    }
++    let Some(ping) = ping_packet() else {
++        return found;
++    };
++    let mut addrs: Vec<Ipv4Addr> = default_net::get_interfaces()
++        .into_iter()
++        .flat_map(|i| i.ipv4.into_iter().map(|v| v.addr))
++        .collect();
++    addrs.push(Ipv4Addr::UNSPECIFIED);
++    addrs.dedup();
++    let sockets: Vec<UdpSocket> = addrs
++        .into_iter()
++        .filter_map(|a| UdpSocket::bind(SocketAddr::from((a, 0))).ok())
++        .filter(|s| {
++            s.set_broadcast(true).is_ok()
++                && s.set_nonblocking(true).is_ok()
++        })
++        .take(LAN_MAX_SOCKETS)
++        .collect();
++    let dest = SocketAddr::from((Ipv4Addr::BROADCAST, lan_port()));
++    for s in &sockets {
++        s.send_to(&ping, dest).ok();
++    }
++    let deadline = Instant::now() + LAN_ROUND;
++    let mut packets = 0usize;
++    let mut buf = [0u8; 2048];
++    while Instant::now() < deadline && packets < LAN_MAX_PACKETS && found.len() < saved.len() {
++        let mut got_any = false;
++        for s in &sockets {
++            while let Ok((n, _)) = s.recv_from(&mut buf) {
++                got_any = true;
++                packets += 1;
++                if let Some(id) = accept_pong(&buf[..n], saved) {
++                    found.insert(id);
++                }
++                if packets >= LAN_MAX_PACKETS {
++                    break;
++                }
++            }
++        }
++        if !got_any {
++            std::thread::sleep(Duration::from_millis(20));
++        }
++    }
++    found
++}
++
++/// Probe forever on the calling thread (its own runtime is built here; the caller must not be
++/// inside one). `ids` lists the enrolled peers; `registered` says whether
 +/// this host is registered with the rendezvous server (an offline answer is only trusted then).
 +pub fn run(
 +    table: Table,
@@ -1035,10 +1116,8 @@ index 000000000000..7f9cc93d3c5b
 +            continue;
 +        }
 +        last_probe = Some(Instant::now());
-+        if let Err(e) = crate::lan::discover() {
-+            log::debug!("remotesmith presence: LAN discovery failed: {e}");
-+        }
-+        let lan = lan_online();
++        let saved: HashSet<String> = cur.iter().cloned().collect();
++        let lan = discover_lan(&saved);
 +        let online = if registered() {
 +            rt.block_on(query_server(cur.clone()))
 +        } else {
@@ -3572,10 +3651,10 @@ index 000000000000..a7498aff1785
 +}
 diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
 new file mode 100644
-index 000000000000..62af7abbe337
+index 000000000000..be24f643574d
 --- /dev/null
 +++ b/src/remotesmith/tests.rs
-@@ -0,0 +1,975 @@
+@@ -0,0 +1,1008 @@
 +//! Tests for the RemoteSmith endpoint: the shared protocol fixture, the server against a raw
 +//! client (handshake, malformed input, limits, pushes, connect), the listener's permission
 +//! rules, and the pure readiness/presence/ledger logic.
@@ -3999,6 +4078,39 @@ index 000000000000..62af7abbe337
 +            ..ready_status()
 +        };
 +        assert_eq!(collect::failing_checks(&other), ["platform"]);
++    }
++
++    #[test]
++    fn lan_pongs_only_from_saved_peers() {
++        use hbb_common::protobuf::Message as _;
++        use hbb_common::rendezvous_proto::{PeerDiscovery, RendezvousMessage};
++        let pkt = |cmd: &str, id: &str| {
++            let mut m = RendezvousMessage::new();
++            m.set_peer_discovery(PeerDiscovery {
++                cmd: cmd.into(),
++                id: id.into(),
++                ..Default::default()
++            });
++            m.write_to_bytes().unwrap()
++        };
++        let saved: std::collections::HashSet<String> = ["222".to_string()].into_iter().collect();
++        assert_eq!(presence::accept_pong(&pkt("pong", "222"), &saved), Some("222".into()));
++        assert_eq!(presence::accept_pong(&pkt("pong", "999"), &saved), None, "not a saved peer");
++        assert_eq!(presence::accept_pong(&pkt("ping", "222"), &saved), None);
++        assert_eq!(presence::accept_pong(b"garbage", &saved), None);
++    }
++
++    #[test]
++    fn lan_round_has_an_absolute_deadline() {
++        let none = std::collections::HashSet::new();
++        let t = std::time::Instant::now();
++        assert!(presence::discover_lan(&none).is_empty());
++        assert!(t.elapsed() < Duration::from_millis(100), "no saved peers: no round");
++        let saved: std::collections::HashSet<String> = ["no-such-peer".to_string()].into_iter().collect();
++        let t = std::time::Instant::now();
++        assert!(presence::discover_lan(&saved).is_empty());
++        let took = t.elapsed();
++        assert!(took >= presence::LAN_ROUND && took < presence::LAN_ROUND + Duration::from_millis(500), "{took:?}");
 +    }
 +
 +    #[test]

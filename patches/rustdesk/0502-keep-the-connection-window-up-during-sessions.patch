@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 19:35:16 -0400
+Subject: remotesmith(0502): keep the connection window up during sessions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream minimizes the connection-manager window 3 s after a client is
+authorized, and on macOS the connection manager has no Dock icon, so an
+unattended inbound session left no visible native indicator when the
+RemoteSmith tray was not running. RemoteSmith keeps the window (small,
+always on top) visible for as long as any inbound session lasts; the person
+at the host can still minimize it (§6.2a, AC-60).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/models/server_model.dart         |  5 ++++-
+ flutter/lib/remotesmith/cm_policy.dart       | 13 +++++++++++++
+ flutter/test/remotesmith_cm_policy_test.dart | 17 +++++++++++++++++
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+ create mode 100644 flutter/lib/remotesmith/cm_policy.dart
+ create mode 100644 flutter/test/remotesmith_cm_policy_test.dart
+
+diff --git a/flutter/lib/models/server_model.dart b/flutter/lib/models/server_model.dart
+index 031a6250942b..457a8467da7f 100644
+--- a/flutter/lib/models/server_model.dart
++++ b/flutter/lib/models/server_model.dart
+@@ -4,6 +4,7 @@ import 'dart:convert';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hbb/consts.dart';
+ import 'package:flutter_hbb/main.dart';
++import 'package:flutter_hbb/remotesmith/cm_policy.dart';
+ import 'package:flutter_hbb/mobile/pages/settings_page.dart';
+ import 'package:flutter_hbb/models/chat_model.dart';
+ import 'package:flutter_hbb/models/platform_model.dart';
+@@ -579,7 +580,9 @@ class ServerModel with ChangeNotifier {
+       if (!hideCm) windowOnTop(null);
+     });
+     // Only do the hidden task when on Desktop.
+-    if (client.authorized && isDesktop) {
++    // RemoteSmith: never, so the window stays as the host-side session indicator (AC-60).
++    if (shouldAutoMinimizeCm(
++        authorized: client.authorized, isDesktop: isDesktop, hideCm: hideCm)) {
+       cmHiddenTimer = Timer(const Duration(seconds: 3), () {
+         if (!hideCm) windowManager.minimize();
+         cmHiddenTimer = null;
+diff --git a/flutter/lib/remotesmith/cm_policy.dart b/flutter/lib/remotesmith/cm_policy.dart
+new file mode 100644
+index 000000000000..b1c2da397ea7
+--- /dev/null
++++ b/flutter/lib/remotesmith/cm_policy.dart
+@@ -0,0 +1,13 @@
++/// RemoteSmith host-side session indicator (§6.2a, AC-60).
++///
++/// Upstream minimizes the connection window 3 s after a client is authorized, and on macOS the
++/// connection manager has no Dock icon, so an unattended inbound session would leave no visible
++/// native indicator when the RemoteSmith tray is not running. RemoteSmith keeps the window up
++/// (always on top, top-right, small) for as long as any inbound session lasts. The person at the
++/// host can still minimize it by hand.
++bool shouldAutoMinimizeCm({
++  required bool authorized,
++  required bool isDesktop,
++  required bool hideCm,
++}) =>
++    false;
+diff --git a/flutter/test/remotesmith_cm_policy_test.dart b/flutter/test/remotesmith_cm_policy_test.dart
+new file mode 100644
+index 000000000000..63838a296a6d
+--- /dev/null
++++ b/flutter/test/remotesmith_cm_policy_test.dart
+@@ -0,0 +1,17 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:flutter_hbb/remotesmith/cm_policy.dart';
++
++void main() {
++  test('the connection window is never auto-minimized during an inbound session', () {
++    for (final authorized in [true, false]) {
++      for (final isDesktop in [true, false]) {
++        for (final hideCm in [true, false]) {
++          expect(
++              shouldAutoMinimizeCm(
++                  authorized: authorized, isDesktop: isDesktop, hideCm: hideCm),
++              isFalse);
++        }
++      }
++    }
++  });
++}
