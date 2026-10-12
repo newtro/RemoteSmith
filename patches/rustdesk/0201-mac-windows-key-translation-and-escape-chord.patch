@@ -32,9 +32,9 @@ src/remotesmith_keymap.rs (declared from keyboard.rs):
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/keyboard.rs             |   91 ++-
- src/remotesmith_keymap.rs   | 1101 +++++++++++++++++++++++++++++++++++
+ src/remotesmith_keymap.rs   | 1120 +++++++++++++++++++++++++++++++++++
  src/ui_session_interface.rs |   17 +-
- 3 files changed, 1207 insertions(+), 2 deletions(-)
+ 3 files changed, 1226 insertions(+), 2 deletions(-)
  create mode 100644 src/remotesmith_keymap.rs
 
 diff --git a/src/keyboard.rs b/src/keyboard.rs
@@ -178,10 +178,10 @@ index e7bdce9b5439..a10e7d8f827f 100644
          "map" => KeyboardMode::Map,
 diff --git a/src/remotesmith_keymap.rs b/src/remotesmith_keymap.rs
 new file mode 100644
-index 000000000000..d064773061e0
+index 000000000000..c3a0729e9782
 --- /dev/null
 +++ b/src/remotesmith_keymap.rs
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1120 @@
 +//! RemoteSmith key-mapping contract (DEC-6 / DEC-22, PLAN §6.1).
 +//!
 +//! Translation happens on the controller, on the key events upstream has already built for the
@@ -480,7 +480,7 @@ index 000000000000..d064773061e0
 +pub enum ChordAction {
 +    /// Not part of the escape chord: handle normally.
 +    Pass,
-+    /// The chord's Esc (repeat or release): drop it.
++    /// The release of the chord's Esc: drop it.
 +    Consume,
 +    /// The chord completed: drop the Esc, release capture.
 +    Release,
@@ -535,10 +535,12 @@ index 000000000000..d064773061e0
 +    pub fn on_escape(&mut self, down: bool) -> ChordAction {
 +        if down {
 +            if self.chord_held() {
-+                if self.esc_consumed {
-+                    return ChordAction::Consume;
-+                }
++                // `held` is cleared below, so a held chord here was pressed afresh since the last
++                // release: always a new chord.
 +                self.esc_consumed = true;
++                // Capture is about to go, so the modifiers' releases may never be seen (always
++                // so without the grab loop). A new chord needs fresh presses anyway.
++                self.held.clear();
 +                return ChordAction::Release;
 +            }
 +            // A fresh Esc: forget a consumed Esc whose release never arrived (capture was gone).
@@ -975,8 +977,8 @@ index 000000000000..d064773061e0
 +            assert_eq!(c.on_key(k, true), ChordAction::Pass);
 +        }
 +        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Release);
-+        // Auto-repeat and the release of that Esc never reach the host.
-+        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Consume);
++        // The release of that Esc, if it still arrives, never reaches the host. (Auto-repeat
++        // cannot arrive: the grab is dropped and the view unfocused before the repeat delay.)
 +        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Consume);
 +        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
 +            assert_eq!(c.on_key(k, false), ChordAction::Pass);
@@ -1010,6 +1012,23 @@ index 000000000000..d064773061e0
 +                c.track(k, false);
 +            }
 +        }
++    }
++
++    #[test]
++    fn escape_chord_without_grab_loop_releases() {
++        // Flutter input only (no Input Monitoring): no key-ups arrive after the release.
++        let mut c = ChordTracker::default();
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            c.track(k, true);
++        }
++        assert_eq!(c.on_escape(true), ChordAction::Release);
++        // Recaptured: a plain Esc reaches the host, and a fresh chord works again.
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Pass);
++        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Pass);
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            c.track(k, true);
++        }
++        assert_eq!(c.on_escape(true), ChordAction::Release);
 +    }
 +
 +    #[test]
