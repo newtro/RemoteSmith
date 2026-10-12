@@ -59,7 +59,7 @@ fn demo_status(inbound: Vec<InboundSession>, cold_boot: bool) -> Status {
         },
         server: ServerStatus {
             state: RegState::Registered,
-            host: Some("rs.johnnycode.ai".into()),
+            host: Some("rs.example.com".into()),
             detail: None,
         },
         unattended: UnattendedStatus {

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # RemoteSmith server: install, upgrade, roll back and inspect rustdesk-server OSS
-# (hbbs + hbbr) under systemd on the shared Lightsail VM. Run ON the VM as root:
+# (hbbs + hbbr) under systemd on the server. Run ON the server as root:
 #
 #   sudo ./install.sh                     install, or upgrade to the pinned version
 #   sudo ./install.sh --status            health report (changes nothing)
 #   sudo ./install.sh --rollback          swap back to the previous release
 #   sudo ./install.sh --restore-data F    restore data/ (the keys) from a backup tarball
 #        ./install.sh --dry-run [...]     print every action without changing anything
+#        ./install.sh --render-units DIR  write the two units, as they would be installed
 #
-# Options: --version V (must be in the pinned table below), --asset FILE (use a local
-# copy of the release zip; it is still checksum-verified), --arch amd64|arm64v8
-# (override uname -m; useful for a dry run on a Mac).
+# The server's public name (RS_HOST) comes from site.env next to this script (copy
+# site.env.example), or --host NAME, which wins. --status and --rollback fall back to
+# the name in the installed hbbs unit. Options: --version V (must be in the pinned
+# table below), --asset FILE (use a local copy of the release zip; it is still
+# checksum-verified), --arch amd64|arm64v8 (override uname -m; for a dry run on a Mac).
 #
 # Layout under /opt/remotesmith-server:
 #   releases/<ver>/{hbbs,hbbr,rustdesk-utils}   one dir per installed version (root-owned)
@@ -37,9 +40,10 @@ SVC_USER=remotesmith
 HBBS=remotesmith-hbbs.service
 HBBR=remotesmith-hbbr.service
 RELEASE_URL=https://github.com/rustdesk/rustdesk-server/releases/download
-# Must match --relay-servers in remotesmith-hbbs.service.
-RS_HOST=rs.johnnycode.ai
-RELAY=$RS_HOST:21117
+RELAY_PORT=21117
+# Set by load_site (site.env / --host); RELAY is what hbbs must hand out.
+RS_HOST=
+RELAY=
 
 # Pinned release assets: <version>/<asset arch> -> SHA-256 of
 # rustdesk-server-linux-<asset arch>.zip, as published on the GitHub release (asset
@@ -63,6 +67,9 @@ VERSION=$DEFAULT_VERSION
 ASSET_FILE=
 ARCH=
 RESTORE_FILE=
+HOST_FLAG=
+RENDER_DIR=
+STAGE=
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 TMP=
 
@@ -79,7 +86,7 @@ run() {
   fi
 }
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -91,6 +98,8 @@ parse_args() {
       --version) VERSION=${2:?--version needs a value}; shift ;;
       --asset) ASSET_FILE=${2:?--asset needs a file}; shift ;;
       --arch) ARCH=${2:?--arch needs amd64 or arm64v8}; shift ;;
+      --host) HOST_FLAG=${2:?--host needs a name}; shift ;;
+      --render-units) MODE=render; RENDER_DIR=${2:?--render-units needs a directory}; shift ;;
       -h|--help) usage 0 ;;
       *) printf 'unknown argument: %s\n' "$1" >&2; usage 2 ;;
     esac
@@ -98,7 +107,63 @@ parse_args() {
   done
 }
 
-cleanup() { if [[ -n $TMP && -d $TMP ]]; then rm -rf "$TMP"; fi; }
+cleanup() {
+  if [[ -n $TMP && -d $TMP ]]; then rm -rf "$TMP"; fi
+  if [[ -n $STAGE && -d $STAGE ]]; then rm -rf "$STAGE"; fi
+}
+
+# shellcheck disable=SC1091  # site-env.sh is beside this script; shellchecked on its own
+. "$SCRIPT_DIR/site-env.sh" || { printf 'ERROR: %s/site-env.sh is missing; copy the whole kit\n' "$SCRIPT_DIR" >&2; exit 1; }
+
+# The host the installed hbbs unit hands out as its relay, or empty.
+installed_host() {
+  sed -n "s/^ExecStart=.* --relay-servers \([^ :]*\):$RELAY_PORT .*/\1/p" "$UNIT_DIR/$HBBS" 2>/dev/null | head -1
+}
+
+# Decide RS_HOST: --host, else site.env beside this script, else (only for modes that
+# act on an existing install) the name in the installed unit.
+load_site() {
+  local from
+  if [[ -f $SCRIPT_DIR/site.env ]]; then
+    site_env_load "$SCRIPT_DIR/site.env" || die "fix $SCRIPT_DIR/site.env (see site.env.example)"
+  fi
+  if [[ -n $HOST_FLAG ]]; then RS_HOST=$HOST_FLAG; from="--host"
+  elif [[ -n $RS_HOST ]]; then from="$SCRIPT_DIR/site.env"
+  elif [[ $MODE == status || $MODE == rollback || $MODE == restore ]]; then
+    RS_HOST=$(installed_host); from="the installed $HBBS"
+  fi
+  [[ -n $RS_HOST ]] || die "no server name: set RS_HOST in $SCRIPT_DIR/site.env (copy site.env.example) or pass --host NAME"
+  valid_hostname "$RS_HOST" || die "RS_HOST '$RS_HOST' (from $from) is not a valid DNS name"
+  RELAY=$RS_HOST:$RELAY_PORT
+  log "server name $RS_HOST (from $from)"
+}
+
+# render_units DIR: write both units as they are installed. hbbs is rendered from
+# remotesmith-hbbs.service.in (RS_HOST was validated as a DNS name, so it is safe
+# to substitute); hbbr has no per-site values and is copied.
+render_units() {
+  local dir=$1 tmpl=$SCRIPT_DIR/$HBBS.in
+  [[ -f $tmpl ]] || die "missing $tmpl"
+  [[ -f $SCRIPT_DIR/$HBBR ]] || die "missing $SCRIPT_DIR/$HBBR"
+  sed "s/@RS_HOST@/$RS_HOST/g" "$tmpl" > "$dir/$HBBS"
+  if grep -q '@[A-Z_]*@' "$dir/$HBBS"; then die "$tmpl has a placeholder install.sh does not fill"; fi
+  grep -qx "ExecStart=$PREFIX/bin/hbbs --port 21116 --relay-servers $RELAY --key _" "$dir/$HBBS" \
+    || die "rendered $HBBS does not run hbbs with --relay-servers $RELAY"
+  cp "$SCRIPT_DIR/$HBBR" "$dir/$HBBR"
+}
+
+# The kit as it is installed: this directory's files plus the rendered hbbs unit, in a
+# temp dir. Units and helpers are installed from it, and kit/ and kits/<ver>/ are
+# copies of it, so a rollback to a kits/<ver> snapshot needs no rendering.
+stage_kit() {
+  local f
+  STAGE=$(mktemp -d)
+  for f in "${KIT_FILES[@]}"; do
+    [[ $f == "$HBBS" ]] && continue
+    [[ -f $SCRIPT_DIR/$f ]] && cp -p "$SCRIPT_DIR/$f" "$STAGE/$f"
+  done
+  render_units "$STAGE"
+}
 
 # Revert-on-failure. Once a run starts changing live state (units, helpers, the bin
 # link), any failure exit (die, set -e, a failed command) reverts to the version and
@@ -300,11 +365,11 @@ UNITS_CHANGED=0
 # install_support_files [KITDIR]: install the helpers and unit files from KITDIR
 # (default: this script's directory).
 install_support_files() {
-  local kit=${1:-$SCRIPT_DIR} f src dst
+  local kit=${1:-$STAGE} f src dst
   for f in keycheck.sh wait-resolve.sh; do
     if [[ ! -f $kit/$f ]]; then
       # An older kit snapshot may predate a helper; keep the current copy then.
-      [[ $kit == "$SCRIPT_DIR" ]] && die "missing $kit/$f"
+      [[ $kit == "$STAGE" ]] && die "missing $SCRIPT_DIR/$f"
       warn "$kit has no $f; keeping the installed one"
       continue
     fi
@@ -336,18 +401,22 @@ install_support_files() {
 }
 
 # Keep a copy of the kit on the box: sudo /opt/remotesmith-server/kit/install.sh --status
-KIT_FILES=(install.sh keycheck.sh wait-resolve.sh firewall.sh probe.py
-  remotesmith-hbbs.service remotesmith-hbbr.service README.md firewall.md dns.md)
-# copy_kit DEST: copy this kit to DEST (skipped when DEST is where we run from).
+# site.env goes with it, so the copy knows the server's name. remotesmith-hbbs.service
+# is the rendered unit (stage_kit), next to the template it came from.
+KIT_FILES=(install.sh site-env.sh site.env keycheck.sh wait-resolve.sh firewall.sh probe.py
+  remotesmith-hbbs.service.in remotesmith-hbbs.service remotesmith-hbbr.service
+  site.env.example README.md firewall.md dns.md)
+# copy_kit DEST: copy the staged kit to DEST (skipped when DEST is where we run from:
+# that copy already is the kit, and it holds the running script).
 copy_kit() {
   local dest=$1 f
   [[ $SCRIPT_DIR == "$dest" ]] && return 0
   run install -d -m 0755 -o root -g root "$dest"
   for f in "${KIT_FILES[@]}"; do
-    [[ -f $SCRIPT_DIR/$f ]] || continue
-    cmp -s "$SCRIPT_DIR/$f" "$dest/$f" 2>/dev/null && continue
-    case "$f" in *.sh|*.py) run install -m 0755 -o root -g root "$SCRIPT_DIR/$f" "$dest/$f" ;;
-      *) run install -m 0644 -o root -g root "$SCRIPT_DIR/$f" "$dest/$f" ;; esac
+    [[ -f $STAGE/$f ]] || continue
+    cmp -s "$STAGE/$f" "$dest/$f" 2>/dev/null && continue
+    case "$f" in *.sh|*.py) run install -m 0755 -o root -g root "$STAGE/$f" "$dest/$f" ;;
+      *) run install -m 0644 -o root -g root "$STAGE/$f" "$dest/$f" ;; esac
   done
 }
 
@@ -555,6 +624,7 @@ do_install() {
   need_root
   need_cmds curl unzip tar systemctl useradd getent install ss python3 ip openssl sha256sum
   local cur prev
+  stage_kit
   cur=$(link_version bin)
   prev=$(link_version previous)
   log "target version $VERSION; installed: ${cur:-none}; previous: ${prev:-none}"
@@ -671,8 +741,8 @@ summary() {
   [[ $DRY_RUN == 1 ]] && return 0
   echo
   echo "RemoteSmith server $(link_version bin) is running (previous: $(link_version previous))."
-  echo "  host: rs.johnnycode.ai   key: $(cat "$PREFIX/data/id_ed25519.pub" 2>/dev/null)"
-  echo "  clients: ID server rs.johnnycode.ai, relay rs.johnnycode.ai:21117, key as above"
+  echo "  host: $RS_HOST   key: $(cat "$PREFIX/data/id_ed25519.pub" 2>/dev/null)"
+  echo "  clients: ID server $RS_HOST, relay $RELAY, key as above"
 }
 
 do_status() {
@@ -705,7 +775,10 @@ do_status() {
 main() {
   parse_args "$@"
   [[ $DRY_RUN == 1 ]] && log "dry run: nothing will be changed"
+  load_site
   case "$MODE" in
+    render) [[ -d $RENDER_DIR ]] || die "no such directory: $RENDER_DIR"; render_units "$RENDER_DIR"
+            log "wrote $RENDER_DIR/$HBBS and $RENDER_DIR/$HBBR" ;;
     install) do_install ;;
     rollback) do_rollback ;;
     restore) do_restore ;;

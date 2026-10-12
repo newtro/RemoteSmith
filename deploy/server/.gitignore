@@ -1,1 +1,3 @@
 __pycache__/
+# per-deployment settings (copy site.env.example); never committed (AC-33)
+site.env

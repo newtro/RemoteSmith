@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 # verify-server.sh: check the public RemoteSmith server from the Mac (or any outside host).
 #
-#   deploy/server/verify-server.sh                 full check against rs.johnnycode.ai
+#   deploy/server/verify-server.sh                 full check against the server in site.env
 #   deploy/server/verify-server.sh --key KEY       use KEY instead of fetching it over ssh
 #   deploy/server/verify-server.sh --ipv6          require the IPv6 port checks (by default
-#                                                  they run when this host has IPv6 to the VM)
+#                                                  they run when this host has IPv6 to the server)
 #   deploy/server/verify-server.sh --no-server-status   skip the ssh health report
 #   deploy/server/verify-server.sh --host H --no-dns --key K --no-server-status
 #                                                  probe any server (e.g. a test container)
 #
-# Checks: DNS (A and AAAA must be the VM's own addresses, i.e. DNS-only; --ip6 "" skips AAAA),
+# Defaults come from deploy/server/site.env (copy site.env.example): RS_HOST, RS_IPV4,
+# RS_IPV6, SSH_TARGET. --host, --ip4, --ip6 and --ssh override them.
+#
+# Checks: DNS (A and AAAA must be the server's own addresses, i.e. DNS-only; --ip6 "" skips AAAA),
 # TCP 21115-21117 reachable, UDP 21116 answers a registration, TCP 21114/21118/21119
 # NOT reachable, and AC-5: hbbs and hbbr refuse a wrong key and a missing key, and
 # accept the right one (positive control). Prints the client configuration at the end.
 # Needs: python3, dig, ssh (unless --key is given). Exit 0 only when every check passes.
 set -euo pipefail
 
-HOST=rs.johnnycode.ai
-IP4=98.93.243.79
-IP6=2600:1f18:72b8:5500:81e8:9091:9439:f3ef
-SSH_HOST=vm
+KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091  # site-env.sh is beside this script; shellchecked on its own
+. "$KIT_DIR/site-env.sh"
+RS_HOST='' RS_IPV4='' RS_IPV6='' SSH_TARGET=''
+if [[ -f $KIT_DIR/site.env ]]; then site_env_load "$KIT_DIR/site.env" || exit 2; fi
+HOST=$RS_HOST
+IP4=$RS_IPV4
+IP6=$RS_IPV6
+SSH_HOST=$SSH_TARGET
 PREFIX=/opt/remotesmith-server
 KEY=
 CHECK_V6=0
@@ -36,13 +44,21 @@ while [[ $# -gt 0 ]]; do
     --ipv6) CHECK_V6=1 ;;
     --no-server-status) SERVER_STATUS=0 ;;
     --no-dns) CHECK_DNS=0 ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
-PROBE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/probe.py"
+[[ -n $HOST ]] || { echo "no server: set RS_HOST in $KIT_DIR/site.env (copy site.env.example) or pass --host" >&2; exit 2; }
+if [[ $CHECK_DNS == 1 && -z $IP4 ]]; then
+  echo "no expected IPv4 address: set RS_IPV4 in $KIT_DIR/site.env or pass --ip4 (or --no-dns)" >&2; exit 2
+fi
+if [[ -z $KEY || $SERVER_STATUS == 1 ]] && [[ -z $SSH_HOST ]]; then
+  echo "no ssh target for the key and status checks: set SSH_TARGET in $KIT_DIR/site.env, pass --ssh, or use --key K --no-server-status" >&2; exit 2
+fi
+
+PROBE="$KIT_DIR/probe.py"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }

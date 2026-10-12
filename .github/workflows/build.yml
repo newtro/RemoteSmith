@@ -67,6 +67,11 @@ jobs:
           echo "checked ${#files[@]} script(s)"
           exit "$status"
 
+      - name: "RemoteSmith: no personal infrastructure in the repo (AC-33)"
+        shell: bash
+        # CI has no deploy/server/site.env, so this is the IP-literal check only.
+        run: scripts/check-private.sh
+
       - name: "RemoteSmith: actionlint"
         shell: bash
         run: |

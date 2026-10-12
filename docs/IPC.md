@@ -196,7 +196,7 @@ brackets) so additive changes stay compatible. Timestamps are integer **Unix sec
   ],
   "power": {"sleep_disabled": true, "detail": null},
   "preboot_unlock": {"detected": false, "detail": null},
-  "server": {"state": "registered", "host": "rs.johnnycode.ai", "detail": null},
+  "server": {"state": "registered", "host": "rs.example.com", "detail": null},
   "unattended": {"ready": false, "cold_boot_verified_at": null},
   "inbound_sessions": [
     {"conn_id": 7, "peer_id": "987654321", "alias": "Scott-PC", "kind": "human", "since": 1791820800}

@@ -48,14 +48,24 @@ if compgen -G ".github/workflows/*.yml" >/dev/null; then
   fi
 fi
 if [[ -f deploy/server/install.sh ]]; then
-  echo "== deploy/server: shellcheck, probe.py syntax, install.sh dry run"
+  echo "== deploy/server: shellcheck, probe.py syntax, unit render, install.sh dry run"
   if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck deploy/server/*.sh
+    shellcheck deploy/server/*.sh scripts/check-private.sh
   else
     echo "shellcheck not installed (brew install shellcheck); skipping"
   fi
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' deploy/server/probe.py
-  bash deploy/server/install.sh --dry-run --arch amd64 >/dev/null
+  # A documentation host (RFC 2606), so the result doesn't depend on a local site.env.
+  units=$(mktemp -d)
+  bash deploy/server/install.sh --render-units "$units" --host rs.example.com >/dev/null
+  grep -qx 'ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.example.com:21117 --key _' \
+    "$units/remotesmith-hbbs.service"
+  grep -qx 'ExecStartPre=/opt/remotesmith-server/libexec/wait-resolve.sh rs.example.com 60' "$units/remotesmith-hbbs.service"
+  cmp -s "$units/remotesmith-hbbr.service" deploy/server/remotesmith-hbbr.service
+  rm -rf "$units"
+  bash deploy/server/install.sh --dry-run --arch amd64 --host rs.example.com >/dev/null
   bash deploy/server/firewall.sh --dry-run >/dev/null
 fi
+echo "== no personal infrastructure in the repo (AC-33)"
+scripts/check-private.sh
 echo "verify: OK"

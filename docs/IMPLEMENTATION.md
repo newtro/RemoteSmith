@@ -98,13 +98,13 @@ There is no local Developer ID cert. Signing follows the iSmith pattern (`/Volum
 - `-exportArchive` with `method=developer-id` and `teamID=232A77467G`, using the cloud-managed cert from the Apple ID signed in to Xcode;
 - `-exportNotarizedApp`, then `stapler validate`.
 
-Local dev builds sign with `Apple Development: scott@johnnycode.ai (52XDFWFDBZ)`, so TCC permissions persist across rebuilds. CI produces unsigned Mac artifacts; signing and notarization happen locally in `scripts/release-mac.sh`, because the cloud cert needs the Xcode account.
+Local dev builds sign with the developer's own `Apple Development` certificate (configured locally, never committed), so TCC permissions persist across rebuilds. CI produces unsigned Mac artifacts; signing and notarization happen locally in `scripts/release-mac.sh`, because the cloud cert needs the Xcode account.
 
 Bundle id: `ai.johnnycode.remotesmith`. App name: `RemoteSmith`.
 
 ## Server
 
-- **Host:** `rs.johnnycode.ai` → Lightsail `vm` (98.93.243.79), Cloudflare DNS-only.
+- **Host:** a per-deployment DNS name (`RS_HOST`) on a Lightsail VM, Cloudflare DNS-only. The name, addresses, ssh target and account names live only in the gitignored `deploy/server/site.env` (template: `site.env.example`); `install.sh` renders the hbbs unit from `remotesmith-hbbs.service.in`, and `scripts/check-private.sh` (run by `scripts/verify.sh`) keeps them out of the repo (AC-33, DEC-15).
 - **Runtime:** hbbs and hbbr 1.1.16 as native binaries under systemd. The VM has no Docker, and RAM is tight, so each unit has `MemoryMax=`.
 - **hbbr:** runs with `-k _`.
 - **Firewall:** Lightsail firewall plus ufw/iptables allow TCP 21115–21117 and UDP 21116 only.

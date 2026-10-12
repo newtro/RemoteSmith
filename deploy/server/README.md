@@ -1,26 +1,47 @@
-# RemoteSmith server (hbbs + hbbr on Lightsail)
+# RemoteSmith server (hbbs + hbbr under systemd)
 
-RemoteSmith uses the stock **rustdesk-server OSS 1.1.16** as its rendezvous (`hbbs`) and relay (`hbbr`) server. It runs as two native systemd services on the shared Lightsail VM (`ssh vm`, instance `Ubuntu-1`), under the name `rs.johnnycode.ai`. This covers FLOW-3 and AC-4, AC-5 and AC-44 in [docs/PLAN.md](../../docs/PLAN.md).
+RemoteSmith uses the stock **rustdesk-server OSS 1.1.16** as its rendezvous (`hbbs`) and relay (`hbbr`) server. It runs as two native systemd services on a small Ubuntu 24.04 server, here a shared AWS Lightsail VM that also hosts other apps. This covers FLOW-3 and AC-4, AC-5 and AC-44 in [docs/PLAN.md](../../docs/PLAN.md).
+
+## site.env: your deployment's values
+
+The kit carries no deployment's host, addresses or account names (AC-33, DEC-15). Copy [`site.env.example`](site.env.example) to `site.env` in this directory and fill it in; `site.env` is gitignored.
+
+| Key | Used by | What |
+|---|---|---|
+| `RS_HOST` | `install.sh`, `verify-server.sh`, clients | the server's public DNS name (ID server; relay is `RS_HOST:21117`) |
+| `RS_IPV4`, `RS_IPV6` | `verify-server.sh`, dns.md | the server's public addresses: what the A / AAAA records must say. `RS_IPV6` may be empty. |
+| `SSH_TARGET` | `verify-server.sh`, the procedures below | how the Mac reaches the server over ssh (an `~/.ssh/config` alias or `user@host`) |
+| `LIGHTSAIL_INSTANCE`, `LIGHTSAIL_REGION`, `AWS_PROFILE` | firewall.md | the Lightsail instance firewall |
+| `CF_ZONE`, `CF_CREDENTIALS_FILE` | dns.md | the Cloudflare zone holding `RS_HOST`, and the local file with the API token |
+
+- **How it is read.** `site-env.sh` parses it line by line (`KEY=VALUE`, optional quotes, `#` comments) and never runs it as shell, since `install.sh` reads it as root. Unknown keys are an error.
+- **It ships with the kit.** The procedures below copy this directory, `site.env` included, to the server. `install.sh` takes `RS_HOST` from the `site.env` beside it (`--host NAME` overrides) and renders `remotesmith-hbbs.service` from `remotesmith-hbbs.service.in`. The copies it keeps in `kit/` and `kits/<ver>/` hold `site.env` and the rendered unit, so `--status` and `--rollback` work there. Without a `site.env`, `--status` and `--rollback` use the name in the installed hbbs unit.
+- **Preview the units:** `deploy/server/install.sh --render-units DIR` writes both units as they would be installed.
+- **The repo stays clean.** `scripts/verify.sh` runs `scripts/check-private.sh`. It fails on any public IP literal in the repo, and, when `site.env` exists, on any of its identifying values (plus the fixed strings in an optional, gitignored `.private-patterns` at the repo root). It prints only file and line, never the value.
+- **Ports are not settings.** The kit uses RustDesk's defaults (TCP 21115–21117, UDP 21116), which is what clients assume when given only a host.
+
+The commands below are run from the repo root on the Mac after loading it: `set -a; . deploy/server/site.env; set +a`.
 
 | File | What it is |
 |---|---|
 | `install.sh` | Install or upgrade (pinned version + SHA-256), `--rollback`, `--restore-data`, `--status`, `--dry-run`. Runs **on the VM** as root. |
-| `remotesmith-hbbs.service`, `remotesmith-hbbr.service` | systemd units: hardened, memory-capped, key enforced. |
+| `remotesmith-hbbs.service.in`, `remotesmith-hbbr.service` | systemd units: hardened, memory-capped, key enforced. The hbbs unit is a template: `install.sh` fills in `@RS_HOST@`. |
+| `site.env.example`, `site-env.sh` | Your deployment's values (copy to the gitignored `site.env`) and the parser the scripts share. |
 | `keycheck.sh`, `wait-resolve.sh` | Pre-start helpers. `keycheck.sh` validates the keypair so the units fail closed (see "Key enforcement"). `wait-resolve.sh` waits for DNS at boot (see "Known caveats"). |
 | `firewall.sh`, `firewall.md` | The ufw rules (a script) and the Lightsail firewall changes (AWS MCP and CLI). |
-| `dns.md` | The Cloudflare A and AAAA records, DNS-only. |
+| `dns.md` | The A and AAAA records (Cloudflare API), DNS-only. |
 | `verify-server.sh`, `probe.py` | Outside-in checks from the Mac: DNS, ports, UDP, AC-5 wire probes, and the public key. |
 
 ## Decisions
 
 - **systemd, not Docker.**
-  - The VM has no Docker, and RAM is the binding constraint: about 1.6 GiB available, with swap nearly full on 2026-10-12.
+  - The target VM has no Docker, and RAM is the binding constraint: about 1.6 GiB available, with swap nearly full when surveyed.
   - Native binaries cost about 10 MiB in total, and every other app on the box is a systemd unit.
   - PLAN §4 says Docker; [IMPLEMENTATION.md](../../docs/IMPLEMENTATION.md) records the deviation.
 - **A dedicated `remotesmith` system user, not `User=ubuntu`.**
-  - The `aws-vm` convention (`User=ubuntu`) is for loopback-only apps behind Caddy. hbbs and hbbr are different: they listen on public ports directly, on all interfaces, and they hold the server's private key.
+  - The VM's convention for its other apps (`User=ubuntu`) is for loopback-only apps behind a reverse proxy. hbbs and hbbr are different: they listen on public ports directly, on all interfaces, and they hold the server's private key.
   - Running them as `ubuntu` would let a compromised relay read every other app's `.env`, and `ubuntu` has sudo.
-  - `waypoint-relay` on the same box already set the precedent of a dedicated user for an internet-facing daemon.
+  - Another internet-facing daemon on the same box already runs as its own dedicated user.
   - The user has no shell and no login, and owns only `data/`.
 - **Layout.** Everything lives under `/opt/remotesmith-server`:
 
@@ -42,20 +63,18 @@ RemoteSmith uses the stock **rustdesk-server OSS 1.1.16** as its rendezvous (`hb
 
 ## First deploy (orchestrator, from the Mac)
 
-1. **Survey.** These are read-only, and their results on 2026-10-12 are listed below:
-   - `ssh vm 'free -h; ss -ltnup | grep -E ":211(1[4-9])\b"; systemctl list-unit-files | grep remotesmith; ls /opt'`
-   - Nothing was on 21114–21119.
-   - No `remotesmith*` units or `/opt/remotesmith-server` existed.
-   - MemAvailable was about 1.6 GiB.
-2. **DNS first:** follow [dns.md](dns.md). This needs approval.
-   - Wait until `ssh vm getent ahosts rs.johnnycode.ai` answers.
+0. **site.env:** copy `site.env.example` to `site.env` and fill it in (see above), then `set -a; . deploy/server/site.env; set +a`.
+1. **Survey.** These are read-only. Before the first deploy, expect nothing on 21114–21119, no `remotesmith*` units, no `/opt/remotesmith-server`, and enough free memory (the caps total 192 MiB):
+   - `ssh "$SSH_TARGET" 'free -h; ss -ltnup | grep -E ":211(1[4-9])\b"; systemctl list-unit-files | grep remotesmith; ls /opt'`
+2. **DNS first:** follow [dns.md](dns.md). On a shared zone this needs approval.
+   - Wait until `ssh "$SSH_TARGET" getent ahosts "$RS_HOST"` answers.
    - hbbs resolves its relay name only once, at start, so `install.sh` refuses to run until the name resolves.
 3. **Copy the kit and install:**
 
    ```bash
-   rsync -a --delete deploy/server/ vm:/tmp/remotesmith-server-kit/
-   ssh vm 'sudo /tmp/remotesmith-server-kit/install.sh --dry-run'   # review
-   ssh vm 'sudo /tmp/remotesmith-server-kit/install.sh'
+   rsync -a --delete deploy/server/ "$SSH_TARGET":/tmp/remotesmith-server-kit/   # site.env included
+   ssh "$SSH_TARGET" 'sudo /tmp/remotesmith-server-kit/install.sh --dry-run'   # review
+   ssh "$SSH_TARGET" 'sudo /tmp/remotesmith-server-kit/install.sh'
    ```
 
    It downloads and verifies 1.1.16 and creates the user and directories.
@@ -63,8 +82,8 @@ RemoteSmith uses the stock **rustdesk-server OSS 1.1.16** as its rendezvous (`hb
    It generates the server keypair with `rustdesk-utils genkeypair` and backs it up straight away to `backups/…-new-key.tar.gz`.
 
    It installs the units, starts hbbs and then hbbr, checks health, and prints the public key.
-4. **Host firewall:** `ssh vm 'sudo /opt/remotesmith-server/kit/firewall.sh'`. This needs approval, as a firewall change.
-5. **Lightsail firewall:** follow [firewall.md](firewall.md) §1 with the AWS MCP. This also needs approval.
+4. **Host firewall:** `ssh "$SSH_TARGET" 'sudo /opt/remotesmith-server/kit/firewall.sh'`. This needs approval, as a firewall change.
+5. **Cloud firewall:** follow [firewall.md](firewall.md) §1 (Lightsail, AWS MCP or CLI). This also needs approval.
 6. **Verify:** run `deploy/server/verify-server.sh` from the Mac. It must end `0 failed`.
 7. **Off-box key backup:** see "Keys" below. If the key exists only on the VM, losing the VM means re-keying every client.
 
@@ -80,7 +99,7 @@ Nothing else is touched: no Caddy, Postgres or Redis, and no restart of any othe
 
 1. Add the new version's SHA-256 values to `asset_sha256()` in `install.sh`. Take them from the release page's asset digests, then confirm against a download with `shasum -a 256`. Set `DEFAULT_VERSION`.
 2. Update the unit comments if the flags changed. Diff the upstream release notes for argument changes.
-3. Run `scripts/verify.sh`, rsync the kit, and run `ssh vm 'sudo /tmp/remotesmith-server-kit/install.sh'`. This:
+3. Run `scripts/verify.sh`, rsync the kit (with `site.env`) as in "First deploy", and run `ssh "$SSH_TARGET" 'sudo /tmp/remotesmith-server-kit/install.sh'`. This:
    - backs up `data/`;
    - installs `releases/<new>` and the new units and helpers;
    - points `previous` at the old version and `bin` at the new one;
@@ -102,7 +121,7 @@ So an interrupted earlier run always gets a restart. A no-op run still takes a f
 ## Rollback
 
 ```bash
-ssh vm 'sudo /opt/remotesmith-server/kit/install.sh --rollback'
+ssh "$SSH_TARGET" 'sudo /opt/remotesmith-server/kit/install.sh --rollback'
 ```
 
 This swaps `bin` and `previous` and reinstalls the units and helpers recorded in `kits/<previous>`. If there is no snapshot, it warns and keeps the current ones. Then it restarts both units and runs the health check. It never touches the keys. Run it again to roll forward.
@@ -123,16 +142,16 @@ This swaps `bin` and `previous` and reinstalls the units and helpers recorded in
   ```bash
   mkdir -p ~/.config/remotesmith/server-keys && chmod 700 ~/.config/remotesmith/server-keys
   f=~/.config/remotesmith/server-keys/rs-keys-$(date -u +%Y%m%d).tar.gz
-  ssh vm 'sudo tar -C /opt/remotesmith-server -czf - data/id_ed25519 data/id_ed25519.pub' > "$f" \
+  ssh "$SSH_TARGET" 'sudo tar -C /opt/remotesmith-server -czf - data/id_ed25519 data/id_ed25519.pub' > "$f" \
     && tar -tzf "$f" | grep -qx data/id_ed25519 && chmod 600 "$f" && echo "saved $f"
   ```
 
-  `pg-nightly-backup` does **not** cover this directory.
+  Check whether the VM's own backup jobs cover `/opt/remotesmith-server`; don't assume they do.
 - **Restore** (same VM, or a rebuilt one after `install.sh`):
 
   ```bash
-  scp ~/.config/remotesmith/server-keys/rs-keys-YYYYMMDD.tar.gz vm:/tmp/
-  ssh vm 'sudo /opt/remotesmith-server/kit/install.sh --restore-data /tmp/rs-keys-YYYYMMDD.tar.gz && rm /tmp/rs-keys-YYYYMMDD.tar.gz'
+  scp ~/.config/remotesmith/server-keys/rs-keys-YYYYMMDD.tar.gz "$SSH_TARGET":/tmp/
+  ssh "$SSH_TARGET" 'sudo /opt/remotesmith-server/kit/install.sh --restore-data /tmp/rs-keys-YYYYMMDD.tar.gz && rm /tmp/rs-keys-YYYYMMDD.tar.gz'
   ```
 
   `--restore-data` checks the tarball first:
@@ -147,11 +166,11 @@ This swaps `bin` and `previous` and reinstalls the units and helpers recorded in
 
 On first run (FLOW-2), each RemoteSmith install asks for:
 
-- **ID server:** `rs.johnnycode.ai`. The ports are hbbs's defaults: 21116, and 21115 for the NAT test.
-- **Relay server:** `rs.johnnycode.ai:21117`. hbbs also hands this out through `-r`, so it can be left blank.
-- **Key:** the contents of `/opt/remotesmith-server/id_ed25519.pub`, a 44-character base64 string. Print it with `deploy/server/verify-server.sh` (the last lines) or `ssh vm cat /opt/remotesmith-server/id_ed25519.pub`.
+- **ID server:** `RS_HOST`. The ports are hbbs's defaults: 21116, and 21115 for the NAT test.
+- **Relay server:** `RS_HOST:21117`. hbbs also hands this out through `-r`, so it can be left blank.
+- **Key:** the contents of `/opt/remotesmith-server/id_ed25519.pub`, a 44-character base64 string. Print it with `deploy/server/verify-server.sh` (the last lines) or `ssh "$SSH_TARGET" cat /opt/remotesmith-server/id_ed25519.pub`.
 
-The key is public, but it is personal configuration. It stays in local client config and never goes in the repo (AC-33, AC-40).
+`verify-server.sh` prints all three at the end. The host and key are personal configuration. It stays in local client config and never goes in the repo (AC-33, AC-40).
 
 ## Key enforcement (AC-5): what the OSS server actually does
 
@@ -238,19 +257,19 @@ The caps protect the neighbours rather than the daemons. Each unit also has `Tas
   - hbbr on 21117 can change the blocklist and bandwidth limits.
   - Any process on the VM can reach them, including an SSRF in one of the other apps. That fits the box's existing trust model, but it is a real lever: a local compromise could redirect the relay hbbs hands out.
   - It also means probes must come from outside the VM. From inside, the "right key" relay probe reads as "refused".
-- **The relay name is resolved once.** hbbs resolves `--relay-servers rs.johnnycode.ai:21117` only at start, and permanently drops it if DNS fails. Clients then get no relay from hbbs.
+- **The relay name is resolved once.** hbbs resolves `--relay-servers RS_HOST:21117` only at start, and permanently drops it if DNS fails. Clients then get no relay from hbbs.
   - DNS is therefore a start condition. `ExecStartPre=wait-resolve.sh` waits up to 60 s, then **fails the start**, and `Restart=` retries with backoff until the name resolves. hbbs never runs without its relay.
   - `install.sh` refuses to install before the name resolves.
-  - The health check (`--status`) asks hbbs's admin port for its live relay list (`probe.py relays`). That list must be exactly `rs.johnnycode.ai:21117`; if it isn't, the check prints the restart command. This also catches a relay rewritten through the loopback admin channel.
+  - The health check (`--status`) asks hbbs's admin port for its live relay list (`probe.py relays`). That list must be exactly `RS_HOST:21117`; if it isn't, the check prints the restart command. This also catches a relay rewritten through the loopback admin channel.
 - **Version check.** Once a day, hbbs posts its version to RustDesk's version-check API and logs `new version is available`. This is outbound only, and no client data goes with it. AC-6 is about clients and is unaffected. The calls can't be blocked per unit without also blocking replies to clients.
 - **Log noise.** `ERROR ... Failed to generate new id` appears three times at hbbs start. hbb_common's client `Config` tries to read a MAC address over netlink, which the sandbox blocks (`RestrictAddressFamilies`). The server doesn't use that ID. Allowing `AF_NETLINK` would only let it write a client config file into `data/`.
 - **x86_64 sandbox.** The units were exercised under load only on arm64. The amd64 binary is static-pie, and its SHA-256 matches the pin. The first real-VM start is the x86_64 check of `SystemCallFilter`, and `install.sh` health-checks it and fails loudly.
-- **The IPv4 address isn't static.** `98.93.243.79` is not a Lightsail static IP (see dns.md). This applies to the whole VM, not just RemoteSmith.
+- **Is the IPv4 address static?** Without a static IP, a Lightsail instance gets a new public address when stopped and started (see dns.md). That applies to the whole VM, not just RemoteSmith.
 
 ## Verification
 
 - **Static checks:** `scripts/verify.sh` runs `shellcheck` and `bash -n` on these scripts, and `python3 -m py_compile` on `probe.py`.
-- **Dry run on the Mac:** `deploy/server/install.sh --dry-run --arch amd64`.
+- **Dry run on the Mac:** `deploy/server/install.sh --dry-run --arch amd64` (add `--host rs.example.com` without a `site.env`). `scripts/verify.sh` runs it with `--host rs.example.com`, renders the units, and runs `scripts/check-private.sh`.
 - **Full rehearsal:** in an Ubuntu 24.04 systemd container (`--privileged`, arm64), with ufw active and `firewall.sh` applied:
   - fresh install (key generated by `install.sh`);
   - an idempotent re-run (PID unchanged);
