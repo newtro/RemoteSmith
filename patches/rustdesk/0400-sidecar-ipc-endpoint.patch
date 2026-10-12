@@ -30,19 +30,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/core_main.rs             |    5 +
  src/ipc.rs                   |   12 +
  src/lib.rs                   |    4 +
- src/remotesmith/collect.rs   |  367 ++++++++++++
+ src/remotesmith/collect.rs   |  392 +++++++++++++
  src/remotesmith/host.rs      |   97 ++++
- src/remotesmith/mod.rs       |  183 ++++++
- src/remotesmith/presence.rs  |  180 ++++++
+ src/remotesmith/mod.rs       |  193 +++++++
+ src/remotesmith/presence.rs  |  186 ++++++
  src/remotesmith/protocol.rs  | 1026 ++++++++++++++++++++++++++++++++++
- src/remotesmith/readiness.rs |  331 +++++++++++
- src/remotesmith/relay.rs     |  122 ++++
- src/remotesmith/server.rs    |  552 ++++++++++++++++++
- src/remotesmith/sessions.rs  |  310 ++++++++++
- src/remotesmith/tests.rs     |  903 ++++++++++++++++++++++++++++++
+ src/remotesmith/readiness.rs |  356 ++++++++++++
+ src/remotesmith/relay.rs     |  119 ++++
+ src/remotesmith/server.rs    |  551 ++++++++++++++++++
+ src/remotesmith/sessions.rs  |  340 +++++++++++
+ src/remotesmith/tests.rs     |  904 ++++++++++++++++++++++++++++++
  src/remotesmith/winsec.rs    |   44 ++
  src/server.rs                |    3 +
- 15 files changed, 4139 insertions(+)
+ 15 files changed, 4232 insertions(+)
  create mode 100644 src/remotesmith/collect.rs
  create mode 100644 src/remotesmith/host.rs
  create mode 100644 src/remotesmith/mod.rs
@@ -116,10 +116,10 @@ index 649f3ef955b0..34d90d90213c 100644
 +pub mod remotesmith;
 diff --git a/src/remotesmith/collect.rs b/src/remotesmith/collect.rs
 new file mode 100644
-index 000000000000..fa26ad9c8c72
+index 000000000000..16d77bec6d17
 --- /dev/null
 +++ b/src/remotesmith/collect.rs
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,392 @@
 +//! Builds the endpoint's snapshot (Status + Peers, docs/IPC.md §7-8) on threads of its own and
 +//! publishes it through a `watch` channel; the server only ever reads the latest snapshot.
 +//!
@@ -135,6 +135,8 @@ index 000000000000..fa26ad9c8c72
 +use super::sessions;
 +use super::Source;
 +use hbb_common::config::PeerConfig;
++use serde_derive::Deserialize;
++use std::collections::HashMap;
 +use hbb_common::log;
 +use hbb_common::tokio::sync::watch;
 +use std::sync::{Arc, Mutex};
@@ -151,14 +153,6 @@ index 000000000000..fa26ad9c8c72
 +#[derive(Clone)]
 +pub struct Shared {
 +    pub snap: watch::Receiver<Snapshot>,
-+    pub presence: Table,
-+}
-+
-+impl Shared {
-+    /// Is this host registered with the rendezvous server right now?
-+    pub fn registered(&self) -> bool {
-+        self.snap.borrow().status.server.state == RegState::Registered
-+    }
 +}
 +
 +/// A saved peer, as read from RustDesk's peer configs.
@@ -206,19 +200,53 @@ index 000000000000..fa26ad9c8c72
 +    }
 +}
 +
-+/// RustDesk's saved peers (the "recent" list: every machine this one has connected to).
++/// The public part of a peer file. Read directly rather than through `PeerConfig::peers`, which
++/// decrypts every saved password and deletes files that have no platform yet.
++#[derive(Deserialize, Default)]
++#[serde(default)]
++struct PeerFile {
++    options: HashMap<String, String>,
++    info: PeerFileInfo,
++}
++
++#[derive(Deserialize, Default)]
++#[serde(default)]
++struct PeerFileInfo {
++    hostname: String,
++    platform: String,
++}
++
++/// Parse one peer file; `None` for an unreadable one or one upstream hides (no platform yet).
++pub fn parse_peer_file(id: String, saved_at: Option<u64>, text: &str) -> Option<SavedPeer> {
++    let f: PeerFile = hbb_common::toml::from_str(text).ok()?;
++    if f.info.platform.is_empty() {
++        return None;
++    }
++    Some(SavedPeer {
++        alias: f
++            .options
++            .get("alias")
++            .and_then(|a| non_empty(a))
++            .or_else(|| non_empty(&f.info.hostname)),
++        platform: platform_of(&f.info.platform),
++        saved_at,
++        id,
++    })
++}
++
++/// RustDesk's saved peers (the "recent" list: every machine this one has connected to), most
++/// recently used first, as upstream lists them.
 +fn load_saved_peers() -> Vec<SavedPeer> {
-+    PeerConfig::peers(None)
++    PeerConfig::get_vec_id_modified_time_path(&None)
 +        .into_iter()
-+        .map(|(id, modified, cfg)| SavedPeer {
-+            alias: cfg
-+                .options
-+                .get("alias")
-+                .and_then(|a| non_empty(a))
-+                .or_else(|| non_empty(&cfg.info.hostname)),
-+            platform: platform_of(&cfg.info.platform),
-+            saved_at: modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()),
-+            id,
++        .filter_map(|(id, modified, path)| {
++            let meta = std::fs::metadata(&path).ok()?;
++            if !meta.is_file() || meta.len() > 1024 * 1024 {
++                return None;
++            }
++            let text = std::fs::read_to_string(&path).ok()?;
++            let saved_at = modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
++            parse_peer_file(id, saved_at, &text)
 +        })
 +        .collect()
 +}
@@ -482,10 +510,7 @@ index 000000000000..fa26ad9c8c72
 +        });
 +    }
 +
-+    Shared {
-+        snap: rx,
-+        presence: table,
-+    }
++    Shared { snap: rx }
 +}
 diff --git a/src/remotesmith/host.rs b/src/remotesmith/host.rs
 new file mode 100644
@@ -592,10 +617,10 @@ index 000000000000..cea34006d641
 +}
 diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
 new file mode 100644
-index 000000000000..2d0543033fc3
+index 000000000000..9ca767da924a
 --- /dev/null
 +++ b/src/remotesmith/mod.rs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,193 @@
 +//! RemoteSmith additions to RustDesk.
 +//!
 +//! * The local IPC endpoint the RemoteSmith tray (`remotesmith-tray`) talks to: protocol v1 of
@@ -628,6 +653,7 @@ index 000000000000..2d0543033fc3
 +#[cfg(test)]
 +mod tests;
 +
++#[allow(unused_imports)]
 +use hbb_common::log;
 +
 +/// Environment variable that replaces the whole endpoint path (socket path or pipe name), for
@@ -718,15 +744,24 @@ index 000000000000..2d0543033fc3
 +                }
 +            };
 +            rt.block_on(async move {
-+                match server::bind(&endpoint).await {
-+                    Ok(listener) => {
-+                        log::info!("remotesmith ipc: listening on {endpoint}");
-+                        // Collectors only run while someone can be served.
-+                        let shared = collect::start(source);
-+                        server::serve(listener, server::ServerConfig::default(), shared).await;
++                // Retry: the directory may still be being fixed up by RustDesk's own IPC start,
++                // or another process (a UI-hosted server, a second tray) may hold the name and
++                // exit later.
++                let mut wait = std::time::Duration::from_secs(1);
++                let listener = loop {
++                    match server::bind(&endpoint).await {
++                        Ok(l) => break l,
++                        Err(e) => {
++                            log::warn!("remotesmith ipc: cannot listen on {endpoint}: {e}; retrying in {wait:?}");
++                            hbb_common::tokio::time::sleep(wait).await;
++                            wait = (wait * 2).min(std::time::Duration::from_secs(60));
++                        }
 +                    }
-+                    Err(e) => log::error!("remotesmith ipc: cannot listen on {endpoint}: {e}"),
-+                }
++                };
++                log::info!("remotesmith ipc: listening on {endpoint}");
++                // Collectors only run while someone can be served.
++                let shared = collect::start(source);
++                server::serve(listener, server::ServerConfig::default(), shared).await;
 +            });
 +        });
 +    match spawned {
@@ -781,10 +816,10 @@ index 000000000000..2d0543033fc3
 +}
 diff --git a/src/remotesmith/presence.rs b/src/remotesmith/presence.rs
 new file mode 100644
-index 000000000000..c0f46b3773c1
+index 000000000000..7f9cc93d3c5b
 --- /dev/null
 +++ b/src/remotesmith/presence.rs
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,186 @@
 +//! Peer presence (DEF-17, §6.2): LAN discovery (upstream `lan::discover`) and the rendezvous
 +//! server's online-state query (upstream `peer_online::query_online_states`), combined into the
 +//! IPC's `checking` / `reachable{route}` / `unavailable{reason, last_seen}`.
@@ -865,10 +900,37 @@ index 000000000000..c0f46b3773c1
 +    }
 +}
 +
-+/// Ask the rendezvous server which of `ids` are online. `None` when the query fails.
++/// Can the online-query port (rendezvous port - 1) be reached? Upstream's query reports every
++/// peer offline when it cannot connect, so check first and call that "unknown", not "offline".
++async fn online_port_reachable() -> bool {
++    let (server, _, _) = crate::get_rendezvous_server(hbb_common::config::READ_TIMEOUT).await;
++    let Some((host, port)) = server.rsplit_once(':') else {
++        return false;
++    };
++    let Ok(port) = port.parse::<u16>() else {
++        return false;
++    };
++    if port == 0 {
++        return false;
++    }
++    hbb_common::socket_client::connect_tcp(
++        format!("{host}:{}", port - 1),
++        hbb_common::config::CONNECT_TIMEOUT,
++    )
++    .await
++    .is_ok()
++}
++
++/// Ask the rendezvous server which of `ids` are online. `None` when it cannot be asked.
 +pub async fn query_server(ids: Vec<String>) -> Option<HashSet<String>> {
 +    if ids.is_empty() {
 +        return Some(HashSet::new());
++    }
++    if !matches!(
++        tokio::time::timeout(QUERY_TIMEOUT, online_port_reachable()).await,
++        Ok(true)
++    ) {
++        return None;
 +    }
 +    let result: Arc<Mutex<Option<HashSet<String>>>> = Default::default();
 +    let r = result.clone();
@@ -943,27 +1005,6 @@ index 000000000000..c0f46b3773c1
 +            changed();
 +        }
 +    }
-+}
-+
-+/// Fresh check of one peer for `connect` (the table may be up to [`PROBE_INTERVAL`] old):
-+/// re-reads the LAN results and asks the server again, then updates the table.
-+pub async fn probe_now(table: &Table, id: &str, registered: bool) -> Entry {
-+    let lan = lan_online();
-+    let online = if registered {
-+        query_server(vec![id.to_owned()]).await
-+    } else {
-+        None
-+    };
-+    let now = now_secs();
-+    let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
-+    let e = t.entry(id.to_owned()).or_default();
-+    e.lan = lan.contains(id);
-+    e.id_online = online.map(|o| o.contains(id));
-+    e.probed = true;
-+    if e.lan || e.id_online == Some(true) {
-+        e.last_seen = Some(now);
-+    }
-+    e.clone()
 +}
 diff --git a/src/remotesmith/protocol.rs b/src/remotesmith/protocol.rs
 new file mode 100644
@@ -1999,10 +2040,10 @@ index 000000000000..e07dc0e7b6c2
 +}
 diff --git a/src/remotesmith/readiness.rs b/src/remotesmith/readiness.rs
 new file mode 100644
-index 000000000000..65b1111c1a2e
+index 000000000000..159a8cc47b43
 --- /dev/null
 +++ b/src/remotesmith/readiness.rs
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,356 @@
 +//! Readiness checks (§6.3, AC-55): each one only reads state; none changes a setting.
 +//! All of them may block (subprocesses, TCC queries) and run on the collector's readiness thread.
 +
@@ -2252,8 +2293,29 @@ index 000000000000..65b1111c1a2e
 +    #[cfg(windows)]
 +    {
 +        // Get-BitLockerVolume needs admin: this runs in the SYSTEM server (host facts).
-+        let script = "$ErrorActionPreference='Stop'; $v = Get-BitLockerVolume -MountPoint $env:SystemDrive; \
-+                      \"status=$($v.ProtectionStatus)\"; $v.KeyProtector | ForEach-Object { \"protector=$($_.KeyProtectorType)\" }";
++        // Get-BitLockerVolume needs admin (this runs in the SYSTEM server, via the host facts)
++        // and is missing where the BitLocker module is not installed (e.g. Windows Home); the
++        // WMI class behind it answers there too, and its absence means no BitLocker at all.
++        // KeyProtectorType numbers: docs for Win32_EncryptableVolume.GetKeyProtectorType.
++        let script = r#"$ErrorActionPreference='Stop'
++try {
++  $v = Get-BitLockerVolume -MountPoint $env:SystemDrive
++  "status=$($v.ProtectionStatus)"
++  $v.KeyProtector | ForEach-Object { "protector=$($_.KeyProtectorType)" }
++} catch [System.Management.Automation.CommandNotFoundException] {
++  try {
++    $w = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'"
++  } catch { "status=Absent"; exit 0 }
++  if (-not $w) { "status=Absent"; exit 0 }
++  $p = (Invoke-CimMethod -InputObject $w -MethodName GetProtectionStatus).ProtectionStatus
++  if ($p -eq 1) { "status=On" } else { "status=Off" }
++  $names = @{1='Tpm';2='ExternalKey';3='RecoveryPassword';4='TpmPin';5='TpmStartupKey';6='TpmPinStartupKey';7='PublicKey';8='Password';9='TpmNetworkKey';10='AdAccountOrGroup'}
++  $ids = (Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectors -Arguments @{KeyProtectorType=[uint32]0}).VolumeKeyProtectorID
++  foreach ($i in $ids) {
++    $t = (Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectorType -Arguments @{VolumeKeyProtectorID=$i}).KeyProtectorType
++    "protector=$($names[[int]$t])"
++  }
++}"#;
 +        return match Command::new("powershell")
 +            .args(["-NoProfile", "-NonInteractive", "-Command", script])
 +            .creation_flags(CREATE_NO_WINDOW)
@@ -2313,6 +2375,10 @@ index 000000000000..65b1111c1a2e
 +        }
 +    }
 +    match status.as_deref() {
++        Some("Absent") => PrebootStatus {
++            detected: Some(false),
++            detail: Some("BitLocker is not available on this edition".into()),
++        },
 +        Some("Off") => PrebootStatus {
 +            detected: Some(false),
 +            detail: None,
@@ -2336,10 +2402,10 @@ index 000000000000..65b1111c1a2e
 +}
 diff --git a/src/remotesmith/relay.rs b/src/remotesmith/relay.rs
 new file mode 100644
-index 000000000000..0d02cad1c6ec
+index 000000000000..13d2c513ed6d
 --- /dev/null
 +++ b/src/remotesmith/relay.rs
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,119 @@
 +//! Windows `--tray`: fetch the host facts from the SYSTEM `--server` over RustDesk's main IPC
 +//! (`Data::RemoteSmithHost`), the same way upstream's tray polls `ControlledSessionCount`.
 +//! Polled every 250 ms so an inbound session starting or ending reaches the sidecar well inside
@@ -2356,9 +2422,6 @@ index 000000000000..0d02cad1c6ec
 +const POLL: Duration = Duration::from_millis(250);
 +/// Facts older than this count as "service not answering".
 +const STALE: Duration = Duration::from_secs(3);
-+/// Re-sync the user-side config copy (ID, rendezvous server, used by the presence query) as
-+/// upstream's UI does at start (`start_server(false, ..)`).
-+const CONFIG_SYNC: Duration = Duration::from_secs(300);
 +
 +#[derive(Clone)]
 +pub struct Relay {
@@ -2414,14 +2477,14 @@ index 000000000000..0d02cad1c6ec
 +    loop {
 +        match crate::ipc::connect(1000, "").await {
 +            Ok(mut c) => {
-+                let mut synced_at: Option<Instant> = None;
++                // Sync the user-side config copy (ID, rendezvous server: used by the presence
++                // query) once per connection, as upstream's UI does at start.
++                if c.send(&Data::SyncConfig(None)).await.is_err() {
++                    set(&latest, None);
++                    tokio::time::sleep(Duration::from_secs(1)).await;
++                    continue;
++                }
 +                'conn: loop {
-+                    if synced_at.map_or(true, |t| t.elapsed() >= CONFIG_SYNC) {
-+                        synced_at = Some(Instant::now());
-+                        if c.send(&Data::SyncConfig(None)).await.is_err() {
-+                            break 'conn;
-+                        }
-+                    }
 +                    if c.send(&Data::RemoteSmithHost(None)).await.is_err() {
 +                        break 'conn;
 +                    }
@@ -2429,8 +2492,8 @@ index 000000000000..0d02cad1c6ec
 +                    loop {
 +                        let left = deadline.saturating_duration_since(Instant::now());
 +                        if left.is_zero() {
-+                            // An older server without the handler answers nothing.
-+                            set(&latest, None);
++                            // A slow answer (or an older server without the handler): keep the
++                            // last facts; `Relay::facts` drops them once they are 3 s old.
 +                            break;
 +                        }
 +                        match c.next_timeout2(left.as_millis().max(1) as u64).await {
@@ -2464,20 +2527,19 @@ index 000000000000..0d02cad1c6ec
 +}
 diff --git a/src/remotesmith/server.rs b/src/remotesmith/server.rs
 new file mode 100644
-index 000000000000..5465afe89c9e
+index 000000000000..9ad63a500f76
 --- /dev/null
 +++ b/src/remotesmith/server.rs
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,551 @@
 +//! The endpoint itself (docs/IPC.md §2-§10), ported from the sidecar's reference server
 +//! (`sidecar/src/fake_fork.rs`): hello first, version negotiation, per-connection isolation,
 +//! bounded reads and writes, malformed-input handling, client cap, peer-uid check on macOS and a
 +//! user-only DACL on Windows.
 +
 +use super::collect::{Shared, Snapshot};
-+use super::presence;
 +use super::protocol::{
 +    decode, encode, negotiate, read_line_bounded, DecodeError, ErrorBody, ErrorCode, LineRead,
-+    Peer, Presence, Request, ServerMessage, Status, Topic, MAX_LINE,
++    Peer, Request, ServerMessage, Status, Topic, MAX_LINE,
 +};
 +use hbb_common::log;
 +use hbb_common::tokio::{
@@ -2500,8 +2562,6 @@ index 000000000000..5465afe89c9e
 +    pub write_timeout: Duration,
 +    pub max_clients: usize,
 +    pub max_malformed: u32,
-+    /// Fresh presence probe on `connect` to a peer last seen unavailable.
-+    pub connect_probe_timeout: Duration,
 +    /// Actually start session windows (tests turn this off).
 +    pub launch: bool,
 +}
@@ -2514,7 +2574,6 @@ index 000000000000..5465afe89c9e
 +            write_timeout: Duration::from_secs(5),
 +            max_clients: 8,
 +            max_malformed: 20,
-+            connect_probe_timeout: Duration::from_millis(2500),
 +            launch: true,
 +        }
 +    }
@@ -2821,12 +2880,34 @@ index 000000000000..5465afe89c9e
 +            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
 +}
 +
-+/// Open a normal outgoing session window, exactly as `RustDesk --connect <id>` does: it hands
-+/// the request to the running main window (or starts it). No credential is passed: the session
++/// Open a normal outgoing session window, exactly as `<App> --connect <id>` does: it hands the
++/// request to the running main window (or becomes it). No credential is passed: the session
 +/// uses the saved one (docs/IPC.md §1.2).
++///
++/// macOS: through LaunchServices (`open -n -a <bundle> --args ...`), so the app is never a child
++/// of the per-user server's launchd job (a restart of that job would take the window with it).
 +fn launch_session(peer_id: &str) -> io::Result<()> {
-+    let mut child = crate::run_me(vec!["--connect", peer_id])?;
-+    // Reap it (it exits at once when a main window takes the request).
++    #[cfg(target_os = "macos")]
++    let child = {
++        let exe = std::env::current_exe()?;
++        let bundle = exe
++            .ancestors()
++            .find(|p| p.extension().map_or(false, |e| e == "app"))
++            .map(|p| p.to_path_buf());
++        match bundle {
++            Some(b) => std::process::Command::new("/usr/bin/open")
++                .arg("-n")
++                .arg("-a")
++                .arg(&b)
++                .args(["--args", "--connect", peer_id])
++                .spawn()?,
++            None => crate::run_me(vec!["--connect", peer_id])?,
++        }
++    };
++    #[cfg(not(target_os = "macos"))]
++    let child = crate::run_me(vec!["--connect", peer_id])?;
++    let mut child = child;
++    // Reap it (`open`, or a process that hands the request to a running window, exits at once).
 +    std::thread::Builder::new()
 +        .name("remotesmith-connect".into())
 +        .spawn(move || {
@@ -2843,28 +2924,9 @@ index 000000000000..5465afe89c9e
 +    if !valid_peer_id(&peer.id) {
 +        return err(ErrorCode::PeerUnavailable, "peer id is not usable");
 +    }
-+    if let Presence::Unavailable { .. } = peer.presence {
-+        // The table can be up to one probe interval old: ask again before refusing.
-+        let registered = shared.registered();
-+        let fresh = tokio::time::timeout(
-+            cfg.connect_probe_timeout,
-+            presence::probe_now(&shared.presence, &peer.id, registered),
-+        )
-+        .await;
-+        super::sessions::poke();
-+        if let Ok(e) = fresh {
-+            if let Presence::Unavailable { reason, detail, .. } =
-+                presence::presence_of(&e, registered)
-+            {
-+                let mut msg = reason.label();
-+                if let Some(d) = detail {
-+                    msg = format!("{msg}: {d}");
-+                }
-+                return err(ErrorCode::PeerUnavailable, msg);
-+            }
-+        }
-+        // Probe timed out: let the session window try and report.
-+    }
++    // Always open the session window for a saved peer, whatever the presence guess says: the
++    // window runs RustDesk's own LAN-first/ID/relay attempts and shows the real outcome, and
++    // the tray already shows the presence reason (docs/IPC.md §5, §6.2).
 +    if cfg.launch {
 +        let id = peer.id.clone();
 +        match tokio::task::spawn_blocking(move || launch_session(&id)).await {
@@ -3022,10 +3084,10 @@ index 000000000000..5465afe89c9e
 +}
 diff --git a/src/remotesmith/sessions.rs b/src/remotesmith/sessions.rs
 new file mode 100644
-index 000000000000..e481f0c575da
+index 000000000000..f6848b3b6113
 --- /dev/null
 +++ b/src/remotesmith/sessions.rs
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,340 @@
 +//! Inbound-session registry (§6.2a, AC-60) and the cold-boot ledger (§6.3, AC-55).
 +//!
 +//! `server::connection` calls [`opened`] when a connection is authorized and [`closed`] when it
@@ -3220,70 +3282,100 @@ index 000000000000..e481f0c575da
 +        };
 +        match write(&rec) {
 +            Ok(path) => log::info!(
-+                "remotesmith: recorded cold-boot login-screen connection ({after}s after boot) in {}",
-+                path.display()
++                "remotesmith: recorded cold-boot login-screen connection ({after}s after boot) in {path}"
 +            ),
 +            Err(err) => log::error!("remotesmith: cannot record the cold-boot connection: {err}"),
 +        }
 +    }
 +
-+    /// Directory of the ledger: system-wide, writable only by the privileged process that sees
-+    /// the login screen (root on macOS, SYSTEM on Windows), readable by the user's process.
-+    pub fn dir() -> Option<std::path::PathBuf> {
++    /// Where the record lives: written only by the privileged process that sees the login
++    /// screen (root on macOS, SYSTEM on Windows), readable by the user's processes, and not
++    /// writable by them, so a user process cannot fake "Unattended ready".
++    /// macOS: `/Library/Application Support/<App>/remotesmith-unattended.json` (that parent is
++    /// root-only). Windows: registry value `HKLM\SOFTWARE\<App>\RemoteSmith\Unattended`
++    /// (ProgramData is user-writable, so no file there).
++    #[cfg(target_os = "macos")]
++    pub fn path() -> Option<std::path::PathBuf> {
++        Some(
++            std::path::Path::new("/Library/Application Support")
++                .join(crate::get_app_name())
++                .join(FILE_NAME),
++        )
++    }
++
++    #[cfg(windows)]
++    fn reg_key() -> String {
++        format!("SOFTWARE\\{}\\RemoteSmith", crate::get_app_name())
++    }
++    #[cfg(windows)]
++    const REG_VALUE: &str = "Unattended";
++
++    fn write(rec: &Record) -> std::io::Result<String> {
++        let json = serde_json::to_string(rec).map_err(std::io::Error::other)?;
 +        #[cfg(target_os = "macos")]
 +        {
-+            return Some(
-+                std::path::Path::new("/Library/Application Support").join(crate::get_app_name()),
-+            );
++            use std::os::unix::fs::PermissionsExt;
++            let path = path().unwrap_or_default();
++            let dir = path.parent().unwrap_or(std::path::Path::new("/"));
++            std::fs::create_dir_all(dir)?;
++            let tmp = dir.join(format!("{FILE_NAME}.tmp"));
++            std::fs::remove_file(&tmp).ok();
++            // create_new: never follows or reuses an existing entry.
++            let mut f = std::fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&tmp)?;
++            std::io::Write::write_all(&mut f, json.as_bytes())?;
++            drop(f);
++            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
++            std::fs::rename(&tmp, &path)?;
++            return Ok(path.display().to_string());
 +        }
 +        #[cfg(windows)]
 +        {
-+            let base = std::env::var_os("ProgramData")?;
-+            return Some(std::path::Path::new(&base).join(crate::get_app_name()));
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(reg_key())?;
++            key.set_value(REG_VALUE, &json)?;
++            return Ok(format!("HKLM\\{}\\{REG_VALUE}", reg_key()));
 +        }
 +        #[allow(unreachable_code)]
-+        None
-+    }
-+
-+    pub fn path() -> Option<std::path::PathBuf> {
-+        dir().map(|d| d.join(FILE_NAME))
-+    }
-+
-+    fn write(rec: &Record) -> std::io::Result<std::path::PathBuf> {
-+        let dir = dir().ok_or_else(|| {
-+            std::io::Error::new(std::io::ErrorKind::Unsupported, "no ledger location")
-+        })?;
-+        std::fs::create_dir_all(&dir)?;
-+        let path = dir.join(FILE_NAME);
-+        let tmp = dir.join(format!("{FILE_NAME}.tmp"));
-+        let json = serde_json::to_vec(rec).map_err(std::io::Error::other)?;
-+        std::fs::write(&tmp, json)?;
-+        #[cfg(unix)]
 +        {
-+            use std::os::unix::fs::PermissionsExt;
-+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
++            let _ = json;
++            Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "no ledger location on this platform",
++            ))
 +        }
-+        std::fs::rename(&tmp, &path)?;
-+        Ok(path)
 +    }
 +
-+    /// The persisted record, if any. On macOS it must be a regular file owned by root (the only
-+    /// writer), so a user process cannot fake "Unattended ready".
++    /// The persisted record, if any.
 +    pub fn read() -> Option<Record> {
-+        let path = path()?;
-+        let meta = std::fs::symlink_metadata(&path).ok()?;
-+        if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
-+            return None;
-+        }
 +        #[cfg(target_os = "macos")]
 +        {
 +            use std::os::unix::fs::MetadataExt;
++            let path = path()?;
++            let meta = std::fs::symlink_metadata(&path).ok()?;
++            if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
++                return None;
++            }
++            // Only root writes it; anything else is not trusted.
 +            if meta.uid() != 0 {
 +                log::warn!("remotesmith: ignoring {} (not owned by root)", path.display());
 +                return None;
 +            }
++            return serde_json::from_slice(&std::fs::read(&path).ok()?).ok();
 +        }
-+        serde_json::from_slice(&std::fs::read(&path).ok()?).ok()
++        #[cfg(windows)]
++        {
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
++                .open_subkey(reg_key())
++                .ok()?;
++            let json: String = key.get_value(REG_VALUE).ok()?;
++            return serde_json::from_str(&json).ok();
++        }
++        #[allow(unreachable_code)]
++        None
 +    }
 +
 +    /// Unix seconds of the current boot.
@@ -3338,10 +3430,10 @@ index 000000000000..e481f0c575da
 +}
 diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
 new file mode 100644
-index 000000000000..d4b92076b15a
+index 000000000000..334a4fd5065e
 --- /dev/null
 +++ b/src/remotesmith/tests.rs
-@@ -0,0 +1,903 @@
+@@ -0,0 +1,904 @@
 +//! Tests for the RemoteSmith endpoint: the shared protocol fixture, the server against a raw
 +//! client (handshake, malformed input, limits, pushes, connect), the listener's permission
 +//! rules, and the pure readiness/presence/ledger logic.
@@ -3611,6 +3703,7 @@ index 000000000000..d4b92076b15a
 +        assert_eq!(pin.detected, Some(true));
 +        assert!(pin.detail.unwrap().contains("TpmPin"));
 +        assert_eq!(readiness::parse_bitlocker("").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Absent\n").detected, Some(false));
 +    }
 +
 +    #[test]
@@ -3844,6 +3937,19 @@ index 000000000000..d4b92076b15a
 +    }
 +
 +    #[test]
++    fn peer_files() {
++        let f = "password = [1, 2]\n[options]\nalias = 'Scott-PC'\n[info]\nusername = 'scott'\nhostname = 'SCOTT-PC'\nplatform = 'Windows'\n";
++        let p = collect::parse_peer_file("123".into(), Some(5), f).unwrap();
++        assert_eq!((p.id.as_str(), p.alias.as_deref(), p.platform, p.saved_at), ("123", Some("Scott-PC"), Some(Platform::Windows), Some(5)));
++        let f = "[info]\nhostname = 'mac-mini'\nplatform = 'Mac OS'\n";
++        let p = collect::parse_peer_file("9".into(), None, f).unwrap();
++        assert_eq!((p.alias.as_deref(), p.platform), (Some("mac-mini"), Some(Platform::Macos)));
++        // Upstream hides peers whose info has not arrived yet; so do we (and never delete them).
++        assert!(collect::parse_peer_file("1".into(), None, "[options]\nalias='x'\n").is_none());
++        assert!(collect::parse_peer_file("1".into(), None, "not toml [[[").is_none());
++    }
++
++    #[test]
 +    fn peer_ids_safe_for_the_command_line() {
 +        assert!(server::valid_peer_id("123456789"));
 +        assert!(server::valid_peer_id("my-host_1"));
@@ -3916,7 +4022,6 @@ index 000000000000..d4b92076b15a
 +            _dir: Dir,
 +            path: String,
 +            tx: watch::Sender<Snapshot>,
-+            table: Table,
 +            task: tokio::task::JoinHandle<()>,
 +        }
 +
@@ -3930,7 +4035,6 @@ index 000000000000..d4b92076b15a
 +            ServerConfig {
 +                hello_deadline: Duration::from_millis(400),
 +                write_timeout: Duration::from_millis(300),
-+                connect_probe_timeout: Duration::from_millis(300),
 +                launch: false,
 +                ..ServerConfig::default()
 +            }
@@ -3941,17 +4045,12 @@ index 000000000000..d4b92076b15a
 +            let path = dir.0.join("s.sock").to_string_lossy().into_owned();
 +            let listener = server::bind(&path).await.unwrap();
 +            let (tx, rx) = watch::channel(snapshot());
-+            let table: Table = Default::default();
-+            let shared = Shared {
-+                snap: rx,
-+                presence: table.clone(),
-+            };
++            let shared = Shared { snap: rx };
 +            let task = tokio::spawn(server::serve(listener, cfg, shared));
 +            Harness {
 +                _dir: dir,
 +                path,
 +                tx,
-+                table,
 +                task,
 +            }
 +        }
@@ -4145,17 +4244,11 @@ index 000000000000..d4b92076b15a
 +            let r = c.recv().await;
 +            assert_eq!((r["type"].as_str(), r["peer_id"].as_str()), (Some("connect_started"), Some("222")));
 +            assert!(!r.to_string().contains("hunter2"));
-+            // Known, last seen offline: a fresh probe runs first (no server here, so it stays
-+            // unavailable and the reply says why).
++            // Known but shown offline: the session window still opens (it runs RustDesk's own
++            // LAN/ID/relay attempts and reports the real outcome).
 +            c.send(r#"{"v":1,"id":4,"type":"connect","peer_id":"333"}"#).await;
 +            let r = c.recv().await;
-+            assert_eq!(r["id"], 4);
-+            assert!(
-+                r["type"] == "connect_started"
-+                    || r["error"]["code"] == "peer_unavailable",
-+                "{r}"
-+            );
-+            assert!(h.table.lock().unwrap().get("333").map_or(true, |e| e.probed));
++            assert_eq!((r["type"].as_str(), r["id"].as_u64()), (Some("connect_started"), Some(4)));
 +        }
 +
 +        #[tokio::test]

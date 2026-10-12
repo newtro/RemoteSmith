@@ -18,6 +18,22 @@ if [[ -x scripts/apply-patches.sh ]]; then
   echo "== patches apply cleanly"
   scripts/apply-patches.sh --check
 fi
+# The fork's RemoteSmith unit tests (patch 0400: IPC endpoint, shared fixture, readiness logic).
+# They need the patched checkout and the bootstrapped Mac toolchain (scripts/bootstrap-mac.sh)
+# plus the generated bridge files from a scripts/build-mac.sh run; skipped otherwise.
+if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
+      && -f vendor/rustdesk/src/bridge_generated.rs && -L vendor/rustdesk/target ]]; then
+  echo "== fork: RemoteSmith unit tests (cargo test --lib remotesmith, Rust 1.81)"
+  (
+    # shellcheck source=lib/mac-env.sh
+    source scripts/lib/mac-env.sh
+    cd vendor/rustdesk
+    RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" cargo test --locked --lib \
+      --features flutter,hwcodec,unix-file-copy-paste,screencapturekit remotesmith
+  )
+else
+  echo "== fork: RemoteSmith unit tests skipped (needs scripts/apply-patches.sh + scripts/build-mac.sh first)"
+fi
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done
