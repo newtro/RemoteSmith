@@ -25,7 +25,7 @@ if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
       && -f vendor/rustdesk/src/bridge_generated.rs && -L vendor/rustdesk/target ]]; then
   echo "== fork: RemoteSmith unit tests (cargo test --lib remotesmith, Rust 1.81)"
   (
-    # shellcheck source=lib/mac-env.sh
+    # shellcheck source=scripts/lib/mac-env.sh
     source scripts/lib/mac-env.sh
     cd vendor/rustdesk
     RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" cargo test --locked --lib \
