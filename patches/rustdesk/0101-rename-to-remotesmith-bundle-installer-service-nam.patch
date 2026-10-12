@@ -38,10 +38,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  flutter/windows/CMakeLists.txt                |   2 +-
  flutter/windows/runner/Runner.rc              |  12 +-
  flutter/windows/runner/main.cpp               |   2 +-
+ libs/portable/Cargo.toml                      |   8 +-
  res/msi/Package/License.rtf                   | 317 +-----------------
- res/msi/preprocess.py                         |  11 +-
+ res/msi/preprocess.py                         |  13 +-
+ src/auth_2fa.rs                               |   2 +-
  src/platform/macos.rs                         |  71 +++-
- 17 files changed, 132 insertions(+), 362 deletions(-)
+ 19 files changed, 138 insertions(+), 368 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
 index 76461d696dd4..b71886c427e7 100644
@@ -398,6 +400,25 @@ index 747d6f586b9d..ae436463cec3 100644
    FUNC_RUSTDESK_GET_APP_NAME get_rustdesk_app_name = (FUNC_RUSTDESK_GET_APP_NAME)GetProcAddress(hInstance, "get_rustdesk_app_name");
    if (get_rustdesk_app_name) {
      wchar_t app_name_buffer[512] = {0};
+diff --git a/libs/portable/Cargo.toml b/libs/portable/Cargo.toml
+index 165d9834957e..932e87465795 100644
+--- a/libs/portable/Cargo.toml
++++ b/libs/portable/Cargo.toml
+@@ -26,10 +26,10 @@ windows = { version = "0.61", features = [
+ native-windows-gui = {version = "1.0", default-features = false, features = ["animation-timer", "image-decoder"]}
+ 
+ [package.metadata.winres]
+-LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
+-ProductName = "RustDesk"
+-OriginalFilename = "rustdesk.exe"
+-FileDescription = "RustDesk Remote Desktop"
++LegalCopyright = "AGPL-3.0. Based on RustDesk, Copyright © 2026 Purslane Tech Pte. Ltd."
++ProductName = "RemoteSmith"
++OriginalFilename = "remotesmith.exe"
++FileDescription = "RemoteSmith Remote Desktop"
+ #ProductVersion = ""
+ 
+ [target.'cfg(target_os="windows")'.build-dependencies]
 diff --git a/res/msi/Package/License.rtf b/res/msi/Package/License.rtf
 index b7dc525726e4..f68c635d927b 100644
 --- a/res/msi/Package/License.rtf
@@ -721,7 +742,7 @@ index b7dc525726e4..f68c635d927b 100644
 +RemoteSmith does not collect personal data. It connects only to the servers you configure.\par
 +}
 diff --git a/res/msi/preprocess.py b/res/msi/preprocess.py
-index ffbd478806e2..9d77e6e175c4 100644
+index ffbd478806e2..6b9b587d9dc1 100644
 --- a/res/msi/preprocess.py
 +++ b/res/msi/preprocess.py
 @@ -27,15 +27,15 @@ g_arpsystemcomponent = {
@@ -752,6 +773,15 @@ index ffbd478806e2..9d77e6e175c4 100644
      )
      parser.add_argument(
          "-v", "--version", type=str, default="", help="The app version."
+@@ -93,7 +93,7 @@ def make_parser():
+         "-m",
+         "--manufacturer",
+         type=str,
+-        default="Purslane Tech Pte. Ltd.",
++        default="RemoteSmith",
+         help="The app manufacturer.",
+     )
+     return parser
 @@ -498,7 +498,8 @@ def init_global_vars(dist_dir, app_name, args):
  
  
@@ -762,6 +792,19 @@ index ffbd478806e2..9d77e6e175c4 100644
          return
      license_file = Path(sys.argv[0]).parent.joinpath("Package/License.rtf")
      with open(license_file, "r", encoding="utf-8") as f:
+diff --git a/src/auth_2fa.rs b/src/auth_2fa.rs
+index 1c243bc77646..459f99698d6f 100644
+--- a/src/auth_2fa.rs
++++ b/src/auth_2fa.rs
+@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
+     static ref CURRENT_2FA: Mutex<Option<(TOTPInfo, TOTP)>> = Mutex::new(None);
+ }
+ 
+-const ISSUER: &str = "RustDesk";
++const ISSUER: &str = "RemoteSmith";
+ const TAG_LOGIN: &str = "Connection";
+ 
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 diff --git a/src/platform/macos.rs b/src/platform/macos.rs
 index 4386e07ee8d0..813068efdc50 100644
 --- a/src/platform/macos.rs

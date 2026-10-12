@@ -14,8 +14,10 @@ Content-Transfer-Encoding: 8bit
 - The software update check (api.rustdesk.com, stock RustDesk downloads) is
   disabled in do_check_software_update(), which every update path goes
   through; the Auto update option is hidden.
-- NAT test and the HTTP TCP proxy skip work when no server is configured
-  instead of dialling ":21116".
+- With no ID server configured (Direct LAN only or not set up), the NAT test,
+  the HTTP TCP proxy and connect-by-ID stop early with a clear error instead
+  of dialling ":21116", and the public-IPv6 probe skips the default public
+  STUN servers (Google, Cloudflare, ...).
 - User-clicked links (download, release notes, EULA, public-server guide) go
   to github.com/newtro/RemoteSmith.
 - New src/remotesmith.rs holds RemoteSmith-only policy.
@@ -26,14 +28,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  flutter/lib/consts.dart                       |  2 ++
  .../lib/desktop/pages/connection_page.dart    |  2 +-
- .../lib/desktop/pages/desktop_home_page.dart  |  4 ++--
- .../desktop/pages/desktop_setting_page.dart   |  5 +++--
- flutter/lib/desktop/pages/install_page.dart   |  5 +++--
- src/client.rs                                 |  4 ++++
- src/common.rs                                 | 20 +++++++++++++++++--
+ .../lib/desktop/pages/desktop_home_page.dart  |  4 +--
+ .../desktop/pages/desktop_setting_page.dart   |  5 ++--
+ flutter/lib/desktop/pages/install_page.dart   |  5 ++--
+ src/client.rs                                 |  9 +++++++
+ src/common.rs                                 | 25 +++++++++++++++++--
  src/lib.rs                                    |  2 ++
- src/remotesmith.rs                            | 11 ++++++++++
- 9 files changed, 46 insertions(+), 9 deletions(-)
+ src/remotesmith.rs                            | 11 ++++++++
+ 9 files changed, 56 insertions(+), 9 deletions(-)
  create mode 100644 src/remotesmith.rs
 
 diff --git a/flutter/lib/consts.dart b/flutter/lib/consts.dart
@@ -125,7 +127,7 @@ index fe94b388bf87..daba8d1c92e4 100644
                                  Icon(Icons.launch_outlined, size: 16)
                                      .marginOnly(right: 5),
 diff --git a/src/client.rs b/src/client.rs
-index d3e66e73c6c6..a0e9937a82b0 100644
+index d3e66e73c6c6..2ba1dcaf9f14 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -464,6 +464,10 @@ impl Client {
@@ -139,8 +141,20 @@ index d3e66e73c6c6..a0e9937a82b0 100644
                  (
                      check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),
                      RENDEZVOUS_SERVERS[1..]
+@@ -476,6 +480,11 @@ impl Client {
+                 (check_port(other_server, RENDEZVOUS_PORT), Vec::new(), true)
+             }
+         };
++        if rendezvous_server.is_empty() {
++            // RemoteSmith: no ID server (Direct LAN only or not set up). Stop here rather than
++            // run the STUN/WebRTC/punch setup, which would query public STUN servers (DEF-2).
++            bail!("No ID server is configured. Connect by the peer's LAN IP address, or set an ID server in Settings > Network.");
++        }
+ 
+         // Same relay gate as the v6 socket below: under any forced relay the v6 punch cannot
+         // be used, so probing v6 reachability is wasted work on every such connection.
 diff --git a/src/common.rs b/src/common.rs
-index 0d46bafe2962..5e6405ef71b2 100644
+index 0d46bafe2962..eba227fcf8a1 100644
 --- a/src/common.rs
 +++ b/src/common.rs
 @@ -706,6 +706,10 @@ async fn test_nat_type_() -> ResultType<bool> {
@@ -191,6 +205,18 @@ index 0d46bafe2962..5e6405ef71b2 100644
  }
  
  /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
+@@ -2651,6 +2667,11 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
+ }
+ 
+ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
++    // RemoteSmith: the public IPv6 address only serves hole punching through the ID server.
++    // Without one (Direct LAN only), don't query the default public STUN servers (DEF-2).
++    if Config::get_rendezvous_server().is_empty() {
++        return None;
++    }
+     {
+         // One look and one claim of the minute, under one lock: two connections arriving
+         // together would otherwise both find it over and both probe.
 diff --git a/src/lib.rs b/src/lib.rs
 index 649f3ef955b0..e6918c2dbd0d 100644
 --- a/src/lib.rs

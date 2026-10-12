@@ -8,19 +8,20 @@ Content-Transfer-Encoding: 8bit
 
 Seed DEFAULT_SETTINGS with approve-mode=password, direct-server=Y and
 enable-lan-discovery=Y (user-changeable), and OVERWRITE_SETTINGS with
-verification-method=use-permanent-password so the temporary password stays
-disabled and the setting cannot be changed back. custom.txt (if any) still
-extends both maps.
+verification-method=use-permanent-password, so the temporary password stays
+disabled and cannot be turned back on, and allow-hide-cm=N, so the renamed
+(custom-client) build can never hide the host's connection window (§6.2a).
+custom.txt (if any) still extends both maps.
 
-Plan: DEC-10, DEF-13, AC-10, §4 thin-fork patch 3.
+Plan: DEC-10, DEF-13, AC-10, AC-60, §4 thin-fork patch 3.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/config.rs | 74 +++++++++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 72 insertions(+), 2 deletions(-)
+ src/config.rs | 81 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 79 insertions(+), 2 deletions(-)
 
 diff --git a/src/config.rs b/src/config.rs
-index 68c8a3ebe92b..7ad6311d1329 100644
+index 68c8a3ebe92b..d5902c139a65 100644
 --- a/src/config.rs
 +++ b/src/config.rs
 @@ -75,8 +75,8 @@ lazy_static::lazy_static! {
@@ -34,7 +35,7 @@ index 68c8a3ebe92b..7ad6311d1329 100644
      pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
      pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
      pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-@@ -85,6 +85,27 @@ lazy_static::lazy_static! {
+@@ -85,6 +85,32 @@ lazy_static::lazy_static! {
      pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
  }
  
@@ -52,17 +53,22 @@ index 68c8a3ebe92b..7ad6311d1329 100644
 +
 +/// RemoteSmith fixed settings (DEC-10, AC-10): only the permanent password is accepted,
 +/// the temporary (one-time) password stays disabled and cannot be turned back on.
++/// `allow-hide-cm=N`: the renamed (custom-client) build would otherwise honour hide_cm with the
++/// hardened password-only defaults, letting a session run with no host-side indicator (§6.2a).
 +pub fn remotesmith_overwrite_settings() -> HashMap<String, String> {
-+    HashMap::from([(
-+        "verification-method".to_owned(),
-+        "use-permanent-password".to_owned(),
-+    )])
++    HashMap::from([
++        (
++            "verification-method".to_owned(),
++            "use-permanent-password".to_owned(),
++        ),
++        ("allow-hide-cm".to_owned(), "N".to_owned()),
++    ])
 +}
 +
  #[cfg(target_os = "android")]
  lazy_static::lazy_static! {
      pub static ref ANDROID_RUSTLS_PLATFORM_VERIFIER_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-@@ -3702,3 +3723,52 @@ mod remotesmith_no_default_servers_tests {
+@@ -3702,3 +3728,54 @@ mod remotesmith_no_default_servers_tests {
          assert!(!LINK_DOCS_HOME.contains("rustdesk.com"));
      }
  }
@@ -83,6 +89,8 @@ index 68c8a3ebe92b..7ad6311d1329 100644
 +            o.get("verification-method").map(String::as_str),
 +            Some("use-permanent-password")
 +        );
++        assert_eq!(o.get("allow-hide-cm").map(String::as_str), Some("N"));
++        assert!(!option2bool("allow-hide-cm", "N"));
 +        assert!(option2bool(keys::OPTION_DIRECT_SERVER, "Y"));
 +    }
 +
