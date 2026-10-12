@@ -1,0 +1,668 @@
+# RemoteSmith CI: apply patches/ onto vendor/rustdesk (RustDesk 1.5.0), then build
+# the macOS arm64 and Windows x64 Flutter apps.
+#
+# Every build job mirrors the matching job in upstream RustDesk 1.5.0's
+# vendor/rustdesk/.github/workflows/flutter-build.yml (and bridge.yml /
+# third-party-RustDeskTempTopMostWindow.yml). Step names are kept identical to
+# upstream's so a failing step can be looked up there. Steps that exist only
+# here are prefixed "RemoteSmith:". Intentional differences are listed in
+# docs/CI.md.
+#
+# Upstream's steps assume the RustDesk source is the repo root; here it is the
+# vendor/rustdesk submodule, so each job sets defaults.run.working-directory to
+# vendor/rustdesk and `uses:` steps (which ignore that default) get explicit
+# vendor/rustdesk paths.
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - "unit/**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Upstream flutter-build.yml builds the Windows Flutter app with SCITER_RUST_VERSION (1.75)
+  # and the macOS app with MAC_RUST_VERSION (1.81, required by the cidre crate).
+  WINDOWS_RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  # bridge.yml: the default bridge for every Flutter 3.24.5 platform is generated with 3.22.3.
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  BRIDGE_RUST_VERSION: "1.75"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  ARTIFACT_RETENTION_DAYS: 14
+
+jobs:
+  ci-lint:
+    name: ci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: "RemoteSmith: bash -n on scripts"
+        shell: bash
+        run: |
+          shopt -s nullglob
+          status=0
+          files=(scripts/*.sh deploy/server/*.sh)
+          for f in "${files[@]}"; do
+            echo "bash -n $f"
+            bash -n "$f" || status=1
+          done
+          echo "checked ${#files[@]} script(s)"
+          exit "$status"
+
+      - name: "RemoteSmith: actionlint"
+        shell: bash
+        run: |
+          # Pinned release; the download script verifies nothing, so check the tarball hash.
+          ver=1.7.12
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
+          curl -fsSL -o checksums.txt \
+            "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_checksums.txt"
+          grep " actionlint_${ver}_linux_amd64.tar.gz\$" checksums.txt | sed "s/actionlint_${ver}_linux_amd64.tar.gz/actionlint.tar.gz/" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color .github/workflows/*.yml
+
+  # Mirrors bridge.yml (generate_bridge, the 3.22.3 "bridge-artifact" matrix entry), run on the
+  # patched sources so the generated bridge matches RemoteSmith's src/flutter_ffi.rs.
+  generate-bridge:
+    name: generate-bridge
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: vendor/rustdesk
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: "RemoteSmith: Apply patches"
+        working-directory: .
+        shell: bash
+        run: |
+          git config --global user.name "RemoteSmith CI"
+          git config --global user.email "ci@remotesmith.invalid"
+          if [[ -f scripts/apply-patches.sh ]]; then
+            bash scripts/apply-patches.sh
+          else
+            echo "::notice title=Patches skipped::scripts/apply-patches.sh not found; building stock vendor/rustdesk"
+          fi
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install ca-certificates -y
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc \
+            git \
+            g++ \
+            libclang-dev \
+            libgtk-3-dev \
+            llvm-dev \
+            nasm \
+            ninja-build \
+            pkg-config \
+            wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.BRIDGE_RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+          workspaces: vendor/rustdesk -> target
+
+      - name: Cache Bridge
+        id: cache-bridge
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: /tmp/flutter_rust_bridge
+          key: bridge-${{ env.BRIDGE_FLUTTER_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # Default Flutter 3.22.3: extended_text 14 needs a newer Dart, so downgrade for resolution.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          path: |
+            ./vendor/rustdesk/src/bridge_generated.rs
+            ./vendor/rustdesk/src/bridge_generated.io.rs
+            ./vendor/rustdesk/flutter/lib/generated_bridge.dart
+            ./vendor/rustdesk/flutter/lib/generated_bridge.freezed.dart
+            ./vendor/rustdesk/flutter/macos/Runner/bridge_generated.h
+            ./vendor/rustdesk/flutter/ios/Runner/bridge_generated.h
+
+  # Mirrors third-party-RustDeskTempTopMostWindow.yml for the x64 matrix entry
+  # (windows-2022, Release, x64, Windows10). The DLL goes into the Windows bundle.
+  build-RustDeskTempTopMostWindow:
+    name: build-RustDeskTempTopMostWindow (x64)
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      project_path: WindowInjection/WindowInjection.vcxproj
+      build_output_dir: RustDeskTempTopMostWindow/WindowInjection/x64/Release
+    steps:
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Download the source code
+        run: |
+          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+
+      - name: Build the project
+        run: |
+          cd RustDeskTempTopMostWindow && git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+          msbuild ${{ env.project_path }} -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          path: |
+            ./${{ env.build_output_dir }}/WindowInjection.dll
+
+  # Mirrors flutter-build.yml build-for-windows-flutter, x86_64-pc-windows-msvc matrix entry.
+  build-for-windows-flutter:
+    name: x86_64-pc-windows-msvc
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: vendor/rustdesk
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ARCH: x86_64
+      FLUTTER_ARCH: x64
+      VCPKG_TRIPLET: x64-windows-static
+      BUILD_ARGS: "--vram"
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: "RemoteSmith: Apply patches"
+        working-directory: .
+        shell: bash
+        run: |
+          git config --global user.name "RemoteSmith CI"
+          git config --global user.email "ci@remotesmith.invalid"
+          if [[ -f scripts/apply-patches.sh ]]; then
+            bash scripts/apply-patches.sh
+          else
+            echo "::notice title=Patches skipped::scripts/apply-patches.sh not found; building stock vendor/rustdesk"
+          fi
+
+      - name: "RemoteSmith: Read app metadata"
+        shell: bash
+        run: |
+          # Read names from the (patched) sources instead of hard-coding RustDesk, so the
+          # branding patches can rename the app without editing this workflow.
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          app_name=$(sed -n '/^\[package.metadata.bundle\]/,/^\[/ s/^name = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          app_exe=$(sed -n 's/^set(BINARY_NAME "\(.*\)")/\1/p' flutter/windows/CMakeLists.txt | head -n1)
+          for v in version app_name app_exe; do
+            if [[ -z "${!v}" ]]; then echo "::error::could not read $v from the sources"; exit 1; fi
+          done
+          {
+            echo "VERSION=$version"
+            echo "APP_NAME=$app_name"
+            echo "APP_EXE=$app_exe"
+          } >> "$GITHUB_ENV"
+          echo "version=$version app_name=$app_name app_exe=$app_exe.exe"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./vendor/rustdesk
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225  # v2.12.0; https://github.com/subosito/flutter-action/issues/277
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      # The rustdesk/engine windows-x64-release.zip is built for the 3.24-era x64 engine (matches FLUTTER_VERSION).
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          flutter_root="$(dirname "$(dirname "$(which flutter)")")"
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$flutter_root"
+          cd "$flutter_root"
+          if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.WINDOWS_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+          workspaces: vendor/rustdesk -> target
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          vcpkgJsonGlob: vendor/rustdesk/vcpkg.json
+          doNotCache: false
+
+      # Upstream sets VCPKG_BINARY_SOURCES=clear;x-gha,readwrite, but vcpkg at this commit has
+      # removed the x-gha backend (it logs a warning and builds every port from source). Use the
+      # files backend on a directory saved with actions/cache instead.
+      - name: "RemoteSmith: Configure vcpkg binary cache"
+        shell: bash
+        run: |
+          dir="${RUNNER_TEMP}/vcpkg-binary-cache"
+          mkdir -p "$dir"
+          echo "VCPKG_BINARY_CACHE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$dir,readwrite" >> "$GITHUB_ENV"
+
+      - name: "RemoteSmith: Restore vcpkg binary cache"
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vendor/rustdesk/vcpkg.json', 'vendor/rustdesk/res/vcpkg/**', 'vendor/rustdesk/res/vcpkg-triplets/**') }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" \
+            install \
+            --triplet ${{ env.VCPKG_TRIPLET }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
+        shell: bash
+
+      - name: Build rustdesk
+        run: |
+          # Windows: build RustDesk
+          # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ env.BUILD_ARGS }}
+          mv ./flutter/build/windows/${{ env.FLUTTER_ARCH }}/runner/Release ./rustdesk
+
+          # Download usbmmidd_v2.zip and extract it to ./rustdesk
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          # Download printer driver files and extract them to ./rustdesk
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+
+            # Check and move the files
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+                Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
+                Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+                mkdir ./rustdesk/drivers
+                mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+                Expand-Archive printer_driver_adapter.zip -DestinationPath .
+                mv -Force .\printer_driver_adapter.dll ./rustdesk
+            } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
+                Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
+            } else {
+                Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
+            }
+          } catch {
+              Write-Host "Ingore the printer driver error."
+          }
+
+      - name: find Runner.res
+        # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
+        # Runner.rc does not contain actual version, but Runner.res does
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            echo "Runner.res: $runner_res";
+            cp "$runner_res" ./libs/portable/Runner.res;
+            echo "list ./libs/portable/Runner.res";
+            ls -l ./libs/portable/Runner.res;
+          fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./vendor/rustdesk/rustdesk"
+
+      # The portable app folder. The artifact downloads as a zip: unzip and run the exe.
+      - name: Upload unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remotesmith-unsigned-windows-${{ env.ARCH }}
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          path: vendor/rustdesk/rustdesk
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/${{ env.APP_EXE }}.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/remotesmith-${{ env.VERSION }}-${{ env.ARCH }}.exe
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+        with:
+          msbuild-architecture: x86
+
+      - name: Build msi
+        # res/msi (WiX v4 + native CustomActions). --app-name is read from the sources; for
+        # stock RustDesk it equals preprocess.py's default, so this is upstream's command.
+        run: |
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../rustdesk --app-name "${{ env.APP_NAME }}"
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          mv $msi.FullName ../../SignOutput/remotesmith-${{ env.VERSION }}-${{ env.ARCH }}.msi
+          sha256sum ../../SignOutput/remotesmith-*.msi
+
+      - name: "RemoteSmith: Upload unsigned installers"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remotesmith-unsigned-windows-${{ env.ARCH }}-installers
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          path: |
+            vendor/rustdesk/SignOutput/remotesmith-*.exe
+            vendor/rustdesk/SignOutput/remotesmith-*.msi
+
+  # Mirrors flutter-build.yml build-for-macOS, aarch64-apple-darwin matrix entry, minus signing.
+  build-for-macOS:
+    name: aarch64-apple-darwin
+    needs: [generate-bridge]
+    runs-on: macos-14
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: vendor/rustdesk
+    env:
+      TARGET: aarch64-apple-darwin
+      ARCH: aarch64
+      VCPKG_TRIPLET: arm64-osx
+      EXTRA_BUILD_ARGS: "--screencapturekit"
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: "RemoteSmith: Apply patches"
+        working-directory: .
+        shell: bash
+        run: |
+          git config --global user.name "RemoteSmith CI"
+          git config --global user.email "ci@remotesmith.invalid"
+          if [[ -f scripts/apply-patches.sh ]]; then
+            bash scripts/apply-patches.sh
+          else
+            echo "::notice title=Patches skipped::scripts/apply-patches.sh not found; building stock vendor/rustdesk"
+          fi
+
+      - name: "RemoteSmith: Read app metadata"
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [[ -z "$version" ]]; then echo "::error::could not read version from Cargo.toml"; exit 1; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version"
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          # Install NASM 2.16.x from official release.
+          # Do NOT use `brew install nasm` which installs NASM 3.x.
+          # NASM 3.x is a complete rewrite with incompatible CLI options and removed features.
+          # aom and other multimedia libraries require NASM 2.x for x86/x86_64 assembly.
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+            git apply ${{ github.workspace }}/vendor/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: macos-14
+          workspaces: vendor/rustdesk -> target
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./vendor/rustdesk
+
+      - name: Test cursor sizing
+        working-directory: vendor/rustdesk/flutter
+        run: flutter test --timeout 60s test/cursor_size_test.dart test/cursor_replay_test.dart test/cursor_default_test.dart
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          vcpkgJsonGlob: vendor/rustdesk/vcpkg.json
+          doNotCache: false
+
+      # See the Windows job: x-gha is gone from vcpkg, so use the files backend + actions/cache.
+      - name: "RemoteSmith: Configure vcpkg binary cache"
+        shell: bash
+        run: |
+          dir="${RUNNER_TEMP}/vcpkg-binary-cache"
+          mkdir -p "$dir"
+          echo "VCPKG_BINARY_CACHE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$dir,readwrite" >> "$GITHUB_ENV"
+
+      - name: "RemoteSmith: Restore vcpkg binary cache"
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vendor/rustdesk/vcpkg.json', 'vendor/rustdesk/res/vcpkg/**', 'vendor/rustdesk/res/vcpkg-triplets/**') }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
+
+      - name: Show version information (Rust, cargo, Clang)
+        shell: bash
+        run: |
+          clang --version || true
+          rustup -V
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+
+      - name: Build rustdesk
+        run: |
+          MIN_MACOS_VERSION="12.3"
+          sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+          sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+          sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+          sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ env.EXTRA_BUILD_ARGS }}
+
+      - name: "RemoteSmith: Locate app bundle"
+        shell: bash
+        run: |
+          # The bundle name comes from the (patched) Xcode project, so find it rather than
+          # hard-coding RustDesk.app.
+          apps=(flutter/build/macos/Build/Products/Release/*.app)
+          if [[ ${#apps[@]} -ne 1 || ! -d "${apps[0]}" ]]; then
+            echo "::error::expected exactly one .app in Release, found: ${apps[*]}"
+            exit 1
+          fi
+          echo "APP_PATH=${apps[0]}" >> "$GITHUB_ENV"
+          echo "APP_BUNDLE=$(basename "${apps[0]}")" >> "$GITHUB_ENV"
+          echo "app: ${apps[0]}"
+
+      - name: create unsigned dmg
+        run: |
+          CREATE_DMG="$(command -v create-dmg)"
+          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          create-dmg --icon "${APP_BUNDLE}" 200 190 --hide-extension "${APP_BUNDLE}" --window-size 800 400 --app-drop-link 600 185 remotesmith-${{ env.VERSION }}-${{ env.ARCH }}-unsigned.dmg "${APP_PATH}"
+          # Also a zip of the bare .app; ditto keeps the framework symlinks that codesign needs.
+          ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" remotesmith-${{ env.VERSION }}-${{ env.ARCH }}-unsigned.app.zip
+
+      - name: Upload unsigned macOS app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remotesmith-unsigned-macos-${{ env.ARCH }}
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+          # can not upload the .app directory directly, which destroys the link structure, causing codesign to fail
+          path: |
+            vendor/rustdesk/remotesmith-${{ env.VERSION }}-${{ env.ARCH }}-unsigned.dmg
+            vendor/rustdesk/remotesmith-${{ env.VERSION }}-${{ env.ARCH }}-unsigned.app.zip
