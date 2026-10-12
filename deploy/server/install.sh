@@ -265,7 +265,12 @@ UNITS_CHANGED=0
 install_support_files() {
   local kit=${1:-$SCRIPT_DIR} f src dst
   for f in keycheck.sh wait-resolve.sh; do
-    [[ -f $kit/$f ]] || die "missing $kit/$f"
+    if [[ ! -f $kit/$f ]]; then
+      # An older kit snapshot may predate a helper; keep the current copy then.
+      [[ $kit == "$SCRIPT_DIR" ]] && die "missing $kit/$f"
+      warn "$kit has no $f; keeping the installed one"
+      continue
+    fi
     if ! cmp -s "$kit/$f" "$PREFIX/libexec/$f" 2>/dev/null; then
       log "installing libexec/$f"
       run install -m 0755 -o root -g root "$kit/$f" "$PREFIX/libexec/$f"
@@ -395,41 +400,45 @@ health() {
       warn "nothing listening on $proto/$p"; ok=1
     fi
   done
-  # Both daemons log "Key: <public key>" at startup when enforcement is on. An empty
-  # key (fail-open) prints no such line. Only the current run's log counts.
+  # Enforcement, checked live on the wire (not from logs, which rotate):
+  # wrong key refused and right key accepted, on hbbs and on hbbr. hbbr treats
+  # loopback as its admin console, so it is probed on this host's own address.
   if [[ -n ${pk:-} ]]; then
-    for unit in "$HBBS" "$HBBR"; do
-      line=$(current_log "$unit" | grep -E 'Key: ' | tail -1 || true)
-      if [[ $line == *"Key: $pk"* ]]; then
-        log "$unit enforces the server key"
-      else
-        warn "$unit has not logged 'Key: $pk' (last: ${line:-none})"; ok=1
-      fi
-    done
+    local probe="$SCRIPT_DIR/probe.py" self_ip r
+    r=$(python3 -I "$probe" punch 127.0.0.1 not-the-server-key 2>&1 || true)
+    if [[ $r == LICENSE_MISMATCH ]]; then log "hbbs refuses a wrong key"
+    else warn "hbbs did not refuse a wrong key: $r"; ok=1; fi
+    r=$(python3 -I "$probe" punch 127.0.0.1 "$pk" 2>&1 || true)
+    if [[ $r == ID_NOT_EXIST ]]; then log "hbbs accepts the server key"
+    else warn "hbbs with the server key: $r"; ok=1; fi
+    self_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}' | head -1)
+    if [[ -z $self_ip ]]; then
+      warn "no non-loopback IPv4 address found; can't probe hbbr"; ok=1
+    else
+      r=$(python3 -I "$probe" relay "$self_ip" not-the-server-key 2>&1 || true)
+      if [[ $r == refused* ]]; then log "hbbr refuses a wrong key"
+      else warn "hbbr did not refuse a wrong key: $r"; ok=1; fi
+      r=$(python3 -I "$probe" relay "$self_ip" "$pk" 2>&1 || true)
+      if [[ $r == accepted ]]; then log "hbbr accepts the server key"
+      else warn "hbbr with the server key: $r"; ok=1; fi
+    fi
   fi
-  # hbbs resolves --relay-servers once at start and drops the name if DNS fails;
-  # clients then get no relay from it until hbbs restarts.
-  line=$(current_log "$HBBS" | grep -E 'relay-servers=' | tail -1 || true)
-  if [[ $line == *"relay-servers=[\"$RELAY\"]"* ]]; then
+  # The relay hbbs hands out right now. hbbs resolves --relay-servers once at start
+  # and drops the name if DNS fails; clients then get no relay until it restarts.
+  line=$(python3 -I "$SCRIPT_DIR/probe.py" relays 2>&1 | tr '\n' ' ' | sed 's/ *$//' || true)
+  if [[ $line == "$RELAY" ]]; then
     log "hbbs hands out relay $RELAY"
   else
-    warn "hbbs is not handing out relay $RELAY (log: ${line:-none}); does $RS_HOST resolve? Fix DNS, then: sudo systemctl restart $HBBS"
+    warn "hbbs hands out relay '${line}', expected '$RELAY'. Does $RS_HOST resolve? Fix DNS, then: sudo systemctl restart $HBBS"
     ok=1
   fi
   return $ok
 }
 
-# The journal of the unit's current run only.
-current_log() {
-  local inv
-  inv=$(systemctl show -p InvocationID --value "$1" 2>/dev/null || true)
-  [[ -n $inv ]] || return 0
-  journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager 2>/dev/null || true
-}
 
 # Retry health for a few seconds: the daemons log asynchronously.
 wait_healthy() {
-  [[ $DRY_RUN == 1 ]] && { printf 'DRY-RUN: health check (units active, keypair valid, ports listening, key enforced)\n'; return 0; }
+  [[ $DRY_RUN == 1 ]] && { printf 'DRY-RUN: health check (units active, keypair valid, ports listening, key enforced on the wire, relay handed out)\n'; return 0; }
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if health >/dev/null 2>&1; then health; return 0; fi
     sleep 1
@@ -439,7 +448,7 @@ wait_healthy() {
 
 do_install() {
   need_root
-  need_cmds curl unzip tar systemctl useradd getent install ss journalctl
+  need_cmds curl unzip tar systemctl useradd getent install ss python3 ip
   local cur prev
   cur=$(link_version bin)
   prev=$(link_version previous)
@@ -474,14 +483,17 @@ do_install() {
     log "nothing changed and both units are active; not restarting"
   fi
   if ! wait_healthy; then
-    if [[ $switched == 1 && -n $cur ]]; then
-      warn "unhealthy after switching to $VERSION; rolling back to $cur"
-      point_link bin "$cur"
-      if [[ -n $prev ]]; then point_link previous "$prev"; else run rm -f "$PREFIX/previous"; fi
+    # Revert whatever this run changed: the version, the units/helpers, or both.
+    if [[ -n $cur ]] && [[ $switched == 1 || $UNITS_CHANGED == 1 ]]; then
+      warn "unhealthy after this change; reverting to $cur and the units it last ran with"
+      if [[ $switched == 1 ]]; then
+        point_link bin "$cur"
+        if [[ -n $prev ]]; then point_link previous "$prev"; else run rm -f "$PREFIX/previous"; fi
+      fi
       restore_kit_for "$cur"
       restart_services
-      wait_healthy || die "rollback to $cur is unhealthy too; see journalctl -u $HBBS -u $HBBR"
-      die "upgrade to $VERSION failed and was rolled back to $cur"
+      wait_healthy || die "the revert to $cur is unhealthy too; see journalctl -u $HBBS -u $HBBR"
+      die "install of $VERSION (this kit) failed and was reverted to $cur"
     fi
     die "install is unhealthy; see journalctl -u $HBBS -u $HBBR"
   fi
@@ -586,7 +598,7 @@ do_status() {
       return 1
     fi
   else
-    echo "(run with sudo for the full health check: key validity, journal key lines)"
+    echo "(run with sudo for the full health check: key validity, live key-enforcement probes)"
   fi
 }
 

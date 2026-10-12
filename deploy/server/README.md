@@ -87,7 +87,7 @@ Nothing else is touched: no Caddy, Postgres or Redis, and no restart of any othe
    - restarts hbbs, then hbbr;
    - runs the health checks.
 
-   **If the new version is unhealthy, it automatically switches back.** It re-points `bin` and reinstalls the units and helpers from `kits/<old>`, then exits non-zero.
+   **If the result is unhealthy, it automatically reverts.** It re-points `bin` and reinstalls the units and helpers from `kits/<current>`, then exits non-zero. This covers a new version, and also a kit-only change such as an edited unit with the same version.
 4. Run `deploy/server/verify-server.sh`.
 
    **AC-44:** the key in `data/` never changes on an upgrade, so existing clients keep working without re-keying. In the arm64 rehearsal (1.1.15 → 1.1.16 → rollback → 1.1.16), the public key was identical at every step.
@@ -176,7 +176,7 @@ The kit prevents all of that:
 - **The key comes first.** `install.sh` creates the key before any daemon starts.
 - **Both units check it before starting.** Both run `ExecStartPre=keycheck.sh`, which requires a readable, valid keypair whose halves match. If the key is broken, the daemon never starts. It never serves without enforcement and never gets to mint its own key.
 - **hbbr can't write `data/`.**
-- **The health check confirms it.** `install.sh` requires the line `Key: <public key>` in the current run's journal for both units.
+- **The health check confirms it on the wire, not from the journal, which rotates.** The check is `install.sh` health, which also runs on `--status`. From the VM it sends hbbs (127.0.0.1:21116) and hbbr (the VM's own non-loopback address, port 21117) a wrong key, which must be refused, and the server key, which must be accepted.
 
 This was tested in the container: unreadable key, unwritable `data/`, and wrong-key probes during the failure, all refused.
 
@@ -217,7 +217,7 @@ The caps protect the neighbours rather than the daemons. Each unit also has `Tas
 - **The relay name is resolved once.** hbbs resolves `--relay-servers rs.johnnycode.ai:21117` only at start, and permanently drops it if DNS fails. Clients then get no relay from hbbs.
   - `wait-resolve.sh` (`ExecStartPre=-`) gives DNS up to 60 s at boot before hbbs starts anyway.
   - `install.sh` refuses to install before the name resolves.
-  - The health check (`--status`) requires `relay-servers=["rs.johnnycode.ai:21117"]` in the current run's log, and prints the restart command if it's missing.
+  - The health check (`--status`) asks hbbs's admin port for its live relay list (`probe.py relays`). That list must be exactly `rs.johnnycode.ai:21117`; if it isn't, the check prints the restart command. This also catches a relay rewritten through the loopback admin channel.
 - **Version check.** Once a day, hbbs posts its version to RustDesk's version-check API and logs `new version is available`. This is outbound only, and no client data goes with it. AC-6 is about clients and is unaffected. The calls can't be blocked per unit without also blocking replies to clients.
 - **Log noise.** `ERROR ... Failed to generate new id` appears three times at hbbs start. hbb_common's client `Config` tries to read a MAC address over netlink, which the sandbox blocks (`RestrictAddressFamilies`). The server doesn't use that ID. Allowing `AF_NETLINK` would only let it write a client config file into `data/`.
 - **x86_64 sandbox.** The units were exercised under load only on arm64. The amd64 binary is static-pie, and its SHA-256 matches the pin. The first real-VM start is the x86_64 check of `SystemCallFilter`, and `install.sh` health-checks it and fails loudly.

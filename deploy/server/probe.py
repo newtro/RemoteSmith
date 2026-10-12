@@ -13,6 +13,9 @@ protos/rendezvous.proto) so no client build is needed.
                                       LICENSE_MISMATCH means hbbs refused the key.
   probe.py tcp HOST PORT              TCP connect. Prints "open", "refused", "filtered"
                                       or "unreachable".
+  probe.py relays [PORT]              Ask hbbs's loopback admin port (127.0.0.1:21115)
+                                      for the relay servers it currently hands out
+                                      (one per line). Only works on the server itself.
   probe.py relay HOST KEY [PORT]      TCP RequestRelay with a random uuid, carrying KEY.
                                       Prints "refused" if hbbr closes the connection
                                       at once (key rejected), or "accepted" if it holds
@@ -193,7 +196,32 @@ def tcp(host, port):
     return 0
 
 
+def relays(port):
+    # hbbs treats loopback connections to 21115 as its plain-text admin console;
+    # "rs" with no argument lists the live relay servers.
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(b"rs")
+        s.settimeout(3)
+        out = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                out += chunk
+        except socket.timeout:
+            pass
+    sys.stdout.write(out.decode(errors="replace"))
+    return 0
+
+
 def main(argv):
+    if len(argv) >= 2 and argv[1] == "relays":
+        try:
+            return relays(int(argv[2]) if len(argv) > 2 else 21115)
+        except OSError as e:
+            print("error: %s" % e)
+            return 2
     if len(argv) < 3:
         print(__doc__, file=sys.stderr)
         return 2

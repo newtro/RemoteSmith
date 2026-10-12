@@ -71,6 +71,8 @@ case "$MODE" in
       to=${line%%ALLOW*}
       to=${to//(v6)/}
       to=$(printf '%s' "$to" | sed 's/[[:space:]]*$//')
+      # Interface-scoped loopback rules don't face the network.
+      [[ $to == *" on lo"* ]] && continue
       if [[ $to == Anywhere* ]]; then
         echo "FAIL: '$line' allows every port (including 21114/21118/21119)"; fail=1; continue
       fi
@@ -88,7 +90,7 @@ case "$MODE" in
           fi
         done
       done
-    done < <(printf '%s\n' "$status" | grep -E '[[:space:]]ALLOW[[:space:]]' || true)
+    done < <(printf '%s\n' "$status" | grep -E '[[:space:]]ALLOW IN[[:space:]]' || true)
     if [[ $fail == 0 ]]; then echo "firewall OK"; else exit 1; fi
     ;;
 esac
