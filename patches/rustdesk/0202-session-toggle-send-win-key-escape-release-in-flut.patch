@@ -29,7 +29,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 73 insertions(+), 1 deletion(-)
 
 diff --git a/flutter/lib/common/widgets/toolbar.dart b/flutter/lib/common/widgets/toolbar.dart
-index c3896b0972c3..b3fa21f6e6b1 100644
+index c3896b0972c3..8a171b05ccf6 100644
 --- a/flutter/lib/common/widgets/toolbar.dart
 +++ b/flutter/lib/common/widgets/toolbar.dart
 @@ -16,6 +16,9 @@ import 'package:get/get.dart';
@@ -95,9 +95,9 @@ index c3896b0972c3..b3fa21f6e6b1 100644
 +        child: Text(translate('Translate Mac/Windows shortcuts'))));
 +  }
 +
-+  // swap key (replaced by the translation above while it is on)
++  // swap key (never applies on a Mac/Windows pair: translated or raw is the choice there)
    if (ffiModel.keyboard &&
-+      !translating &&
++      !translatable &&
        ((isMacOS && pi.platform != kPeerPlatformMacOS) ||
            (!isMacOS && pi.platform == kPeerPlatformMacOS))) {
      final option = 'allow_swap_key';

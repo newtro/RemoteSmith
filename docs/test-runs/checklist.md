@@ -5,6 +5,10 @@ Each unit appends its own section. Record results per release in `docs/test-runs
 
 ## Keyboard: DEC-22 key mapping and escape chord (unit B2, patches 0201–0202)
 
+**Supported path:** keyboard mode **Map** (upstream's default). Translate and Legacy keyboard
+modes are best effort: Translate mode on a Windows controller sends Ctrl+letter as text, so
+shortcuts don't translate there. If a step fails, first confirm toolbar → Keyboard → Map mode.
+
 **Setup.** Both machines on the release build. Start each session with the defaults: keyboard mode
 **Map**, Settings → General → Input source **1** (the keyboard grab), toolbar → Keyboard →
 **Translate Mac/Windows shortcuts** on. "Captured" means the pointer is over the remote image and

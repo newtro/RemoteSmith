@@ -32,9 +32,9 @@ src/remotesmith_keymap.rs (declared from keyboard.rs):
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/keyboard.rs             |   91 ++-
- src/remotesmith_keymap.rs   | 1120 +++++++++++++++++++++++++++++++++++
- src/ui_session_interface.rs |   17 +-
- 3 files changed, 1226 insertions(+), 2 deletions(-)
+ src/remotesmith_keymap.rs   | 1222 +++++++++++++++++++++++++++++++++++
+ src/ui_session_interface.rs |   18 +-
+ 3 files changed, 1328 insertions(+), 3 deletions(-)
  create mode 100644 src/remotesmith_keymap.rs
 
 diff --git a/src/keyboard.rs b/src/keyboard.rs
@@ -178,10 +178,10 @@ index e7bdce9b5439..a10e7d8f827f 100644
          "map" => KeyboardMode::Map,
 diff --git a/src/remotesmith_keymap.rs b/src/remotesmith_keymap.rs
 new file mode 100644
-index 000000000000..c3a0729e9782
+index 000000000000..fc4f7828b889
 --- /dev/null
 +++ b/src/remotesmith_keymap.rs
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1222 @@
 +//! RemoteSmith key-mapping contract (DEC-6 / DEC-22, PLAN §6.1).
 +//!
 +//! Translation happens on the controller, on the key events upstream has already built for the
@@ -669,18 +669,47 @@ index 000000000000..c3a0729e9782
 +}
 +
 +/// Mouse events carry modifier flags (Cmd+click and so on); map them with the same table.
++/// The flags follow what the keyboard translation is holding on the host, so a click during
++/// Cmd+Tab (host holds Alt) says Alt, not Ctrl, and the host keeps its Alt.
++pub fn map_mouse_modifiers_with(
++    t: &Translator,
++    dir: Direction,
++    mods: &mut Vec<EnumOrUnknown<ControlKey>>,
++) {
++    if dir == Direction::None {
++        return;
++    }
++    let table = Translator {
++        dir,
++        ..Default::default()
++    };
++    // A translator still on another mapping is healed by the next key event; use the table.
++    let t = if t.dir == dir { t } else { &table };
++    let mut e = KeyEvent::new();
++    e.modifiers = std::mem::take(mods);
++    remap_modifier_list(t, &mut e);
++    *mods = e.modifiers;
++}
++
 +pub fn map_mouse_modifiers(dir: Direction, mods: &mut Vec<EnumOrUnknown<ControlKey>>) {
 +    if dir == Direction::None {
 +        return;
 +    }
-+    let t = Translator {
-+        dir,
-+        ..Default::default()
-+    };
-+    let mut e = KeyEvent::new();
-+    e.modifiers = std::mem::take(mods);
-+    remap_modifier_list(&t, &mut e);
-+    *mods = e.modifiers;
++    map_mouse_modifiers_with(&TRANSLATOR.lock().unwrap(), dir, mods);
++}
++
++/// Whether upstream's Cmd/Ctrl swap (`allow_swap_key`) may touch outgoing events. Never on a
++/// Mac<->Windows pair: translated mode uses the DEC-22 table, and raw mode means physical keys,
++/// whatever swap setting was saved for the peer (it is left as saved).
++pub fn upstream_swap_allowed(local: LocalOs, peer_platform: &str, allow_swap_key: bool) -> bool {
++    allow_swap_key && direction(local, peer_platform, "") == Direction::None
++}
++
++pub fn session_upstream_swap_allowed<T: crate::ui_session_interface::InvokeUiSession>(
++    session: &crate::ui_session_interface::Session<T>,
++    allow_swap_key: bool,
++) -> bool {
++    upstream_swap_allowed(local_os(), &session.peer_platform(), allow_swap_key)
 +}
 +
 +// ---- process-wide state (one physical keyboard, like upstream's TO_RELEASE) --------------------
@@ -1272,6 +1301,79 @@ index 000000000000..c3a0729e9782
 +    }
 +
 +    #[test]
++    fn mouse_click_during_cmd_tab_keeps_host_alt() {
++        // keyboard -> mouse -> keyboard: Cmd held, Tab (host holds Alt), click, Tab, release.
++        let lwin = CMD.peer_code("windows");
++        let lalt = ALT.peer_code("windows");
++        let tab = rdev::win_scancode_from_key(Key::Tab).unwrap();
++        let mut t = Translator::default();
++        let d = Direction::MacToWindows;
++        let m = KeyboardMode::Map;
++        translate_with(
++            &mut t,
++            d,
++            "Windows",
++            m,
++            &ev(Key::MetaLeft, true),
++            vec![map_ev(lwin, true)],
++        );
++        translate_with(
++            &mut t,
++            d,
++            "Windows",
++            m,
++            &ev(Key::Tab, true),
++            vec![map_ev(tab, true)],
++        );
++        translate_with(
++            &mut t,
++            d,
++            "Windows",
++            m,
++            &ev(Key::Tab, false),
++            vec![map_ev(tab, false)],
++        );
++        let mut mods: Vec<EnumOrUnknown<ControlKey>> = vec![ControlKey::Meta.into()];
++        map_mouse_modifiers_with(&t, d, &mut mods);
++        assert_eq!(mods, vec![EnumOrUnknown::new(ControlKey::Alt)]);
++        // The next Tab still cycles with Alt held: no modifier events, just Tab.
++        let out = translate_with(
++            &mut t,
++            d,
++            "Windows",
++            m,
++            &ev(Key::Tab, true),
++            vec![map_ev(tab, true)],
++        );
++        assert_eq!(out.iter().map(chr).collect::<Vec<_>>(), vec![(tab, true)]);
++        let out = translate_with(
++            &mut t,
++            d,
++            "Windows",
++            m,
++            &ev(Key::MetaLeft, false),
++            vec![map_ev(lwin, false)],
++        );
++        assert_eq!(out.iter().map(chr).collect::<Vec<_>>(), vec![(lalt, false)]);
++        // Translator on another mapping: the plain table.
++        let other = Translator::default();
++        let mut mods: Vec<EnumOrUnknown<ControlKey>> = vec![ControlKey::Meta.into()];
++        map_mouse_modifiers_with(&other, d, &mut mods);
++        assert_eq!(mods, vec![EnumOrUnknown::new(ControlKey::Control)]);
++    }
++
++    #[test]
++    fn upstream_swap_never_applies_on_mac_windows_pairs() {
++        // A saved allow_swap_key=Y must not turn raw mode (or "Send Win key") into Ctrl.
++        assert!(!upstream_swap_allowed(LocalOs::MacOs, "Windows", true));
++        assert!(!upstream_swap_allowed(LocalOs::Windows, "Mac OS", true));
++        // Pairs RemoteSmith does not translate keep upstream's option.
++        assert!(upstream_swap_allowed(LocalOs::MacOs, "Linux", true));
++        assert!(upstream_swap_allowed(LocalOs::Other, "Mac OS", true));
++        assert!(!upstream_swap_allowed(LocalOs::MacOs, "Linux", false));
++    }
++
++    #[test]
 +    fn mouse_modifiers() {
 +        let mut m: Vec<EnumOrUnknown<ControlKey>> =
 +            vec![ControlKey::Meta.into(), ControlKey::Shift.into()];
@@ -1303,7 +1405,7 @@ index 000000000000..c3a0729e9782
 +    }
 +}
 diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
-index f28752e77d7e..3828d7b07715 100644
+index f28752e77d7e..4e5afb822686 100644
 --- a/src/ui_session_interface.rs
 +++ b/src/ui_session_interface.rs
 @@ -640,6 +640,12 @@ impl<T: InvokeUiSession> Session<T> {
@@ -1319,19 +1421,18 @@ index f28752e77d7e..3828d7b07715 100644
          let mut lc = self.lc.write().unwrap();
          if k.eq("remote_dir") {
              v = lc.get_all_remote_dir(v);
-@@ -697,7 +703,10 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -697,7 +703,9 @@ impl<T: InvokeUiSession> Session<T> {
  
      pub fn swap_modifier_key(&self, msg: &mut KeyEvent) {
          let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
 -        if allow_swap_key {
-+        // RemoteSmith: the DEC-22 translation replaces the swap while it is on.
-+        if allow_swap_key
-+            && keyboard::rs_keymap::session_direction(self) == keyboard::rs_keymap::Direction::None
-+        {
++        // RemoteSmith: on Mac<->Windows the swap never applies (translated: DEC-22 table; raw:
++        // physical keys), whatever was saved for the peer.
++        if keyboard::rs_keymap::session_upstream_swap_allowed(self, allow_swap_key) {
              if let Some(key_event::Union::ControlKey(ck)) = msg.union {
                  let ck = ck.enum_value_or_default();
                  let ck = match ck {
-@@ -1923,6 +1932,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+@@ -1923,8 +1931,14 @@ impl<T: InvokeUiSession> Interface for Session<T> {
      }
  
      fn swap_modifier_mouse(&self, msg: &mut base::protos::message::MouseEvent) {
@@ -1342,5 +1443,8 @@ index f28752e77d7e..3828d7b07715 100644
 +            return;
 +        }
          let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
-         if allow_swap_key {
+-        if allow_swap_key {
++        if keyboard::rs_keymap::session_upstream_swap_allowed(self, allow_swap_key) {
              msg.modifiers = msg
+                 .modifiers
+                 .iter()
