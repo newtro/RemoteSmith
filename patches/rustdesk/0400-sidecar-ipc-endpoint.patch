@@ -1,0 +1,4729 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:35:40 -0400
+Subject: remotesmith(0400): sidecar IPC endpoint
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fork side of the RemoteSmith fork<->sidecar IPC, protocol v1 (docs/IPC.md;
+DEF-4, DEF-17, DEC-5, §6.2, §6.2a, §6.3; AC-20, AC-21, AC-25, AC-55, AC-60).
+
+- src/remotesmith/: protocol types ported verbatim from the sidecar, the
+  endpoint (hello/negotiation, bounded lines, malformed-input handling,
+  client cap, write and hello deadlines, per-topic pushes, MAX_LINE on
+  output), snapshot collectors (saved peers, LAN + rendezvous presence,
+  macOS TCC/launchd/pmset/fdesetup and Windows service/powercfg/BitLocker
+  readiness, registration, key fingerprint, cold-boot ledger), connect via
+  the existing `--connect` path with no credential on the IPC.
+- macOS: listens in the per-user server process at
+  /tmp/<AppName>-<uid>/remotesmith-ipc.sock (0700 dir, 0600 socket, peer
+  uid check); never in a root process.
+- Windows: the --tray process (user token) creates
+  \\.\pipe\<AppName>-ipc-<user> with a user-only DACL and relays sessions,
+  registration and BitLocker state from the SYSTEM --server through the new
+  ipc::Data::RemoteSmithHost request.
+- Everything runs on its own threads and runtime; RustDesk never waits on it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core_main.rs             |    5 +
+ src/ipc.rs                   |   12 +
+ src/lib.rs                   |    4 +
+ src/remotesmith/collect.rs   |  428 ++++++++++++++
+ src/remotesmith/host.rs      |   98 ++++
+ src/remotesmith/mod.rs       |  203 +++++++
+ src/remotesmith/presence.rs  |  265 +++++++++
+ src/remotesmith/protocol.rs  | 1026 ++++++++++++++++++++++++++++++++++
+ src/remotesmith/readiness.rs |  411 ++++++++++++++
+ src/remotesmith/relay.rs     |  119 ++++
+ src/remotesmith/server.rs    |  551 ++++++++++++++++++
+ src/remotesmith/sessions.rs  |  380 +++++++++++++
+ src/remotesmith/tests.rs     | 1008 +++++++++++++++++++++++++++++++++
+ src/remotesmith/winsec.rs    |   44 ++
+ src/server.rs                |    3 +
+ 15 files changed, 4557 insertions(+)
+ create mode 100644 src/remotesmith/collect.rs
+ create mode 100644 src/remotesmith/host.rs
+ create mode 100644 src/remotesmith/mod.rs
+ create mode 100644 src/remotesmith/presence.rs
+ create mode 100644 src/remotesmith/protocol.rs
+ create mode 100644 src/remotesmith/readiness.rs
+ create mode 100644 src/remotesmith/relay.rs
+ create mode 100644 src/remotesmith/server.rs
+ create mode 100644 src/remotesmith/sessions.rs
+ create mode 100644 src/remotesmith/tests.rs
+ create mode 100644 src/remotesmith/winsec.rs
+
+diff --git a/src/core_main.rs b/src/core_main.rs
+index b5a451ed842a..0b0698a0f63f 100644
+--- a/src/core_main.rs
++++ b/src/core_main.rs
+@@ -379,7 +379,12 @@ pub fn core_main() -> Option<Vec<String>> {
+             }
+         } else if args[0] == "--tray" {
+             if !crate::check_process("--tray", true) {
++                // RemoteSmith: the sidecar's pipe is created here, with the user's token.
++                #[cfg(windows)]
++                crate::remotesmith::start_relay();
+                 crate::tray::start_tray();
++                #[cfg(windows)]
++                crate::remotesmith::park();
+             }
+             return None;
+         } else if args[0] == "--install-service" {
+diff --git a/src/ipc.rs b/src/ipc.rs
+index fdb1e147824f..dc4d51f844c6 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -497,6 +497,8 @@ pub enum Data {
+     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
+     #[cfg(target_os = "macos")]
+     HasNoActiveConns(Option<bool>),
++    /// RemoteSmith: host facts (JSON) for the sidecar endpoint relayed by the Windows tray.
++    RemoteSmithHost(Option<String>),
+     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+     Whiteboard((String, crate::whiteboard::CustomEvent)),
+     ControlPermissionsRemoteModify(Option<bool>),
+@@ -1120,6 +1122,16 @@ async fn handle(data: Data, stream: &mut Connection) {
+                     .await
+             );
+         }
++        #[cfg(not(any(target_os = "android", target_os = "ios")))]
++        Data::RemoteSmithHost(None) => {
++            allow_err!(
++                stream
++                    .send(&Data::RemoteSmithHost(Some(
++                        crate::remotesmith::host_facts_json()
++                    )))
++                    .await
++            );
++        }
+         #[cfg(target_os = "macos")]
+         Data::HasNoActiveConns(None) => {
+             allow_err!(
+diff --git a/src/lib.rs b/src/lib.rs
+index 649f3ef955b0..34d90d90213c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -73,3 +73,7 @@ pub mod privacy_mode;
+ pub mod virtual_display_manager;
+ 
+ mod kcp_stream;
++
++/// RemoteSmith: sidecar IPC endpoint and host session/readiness data.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub mod remotesmith;
+diff --git a/src/remotesmith/collect.rs b/src/remotesmith/collect.rs
+new file mode 100644
+index 000000000000..e8da058cb149
+--- /dev/null
++++ b/src/remotesmith/collect.rs
+@@ -0,0 +1,428 @@
++//! Builds the endpoint's snapshot (Status + Peers, docs/IPC.md §7-8) on threads of its own and
++//! publishes it through a `watch` channel; the server only ever reads the latest snapshot.
++//!
++//! Threads: `remotesmith-collect` (snapshot, woken by session changes within milliseconds and
++//! every second otherwise), `remotesmith-ready` (TCC every 5 s; launchd/pmset/fdesetup or the
++//! Windows equivalents every 30 s), `remotesmith-presence` (presence.rs) and, on the Windows
++//! tray, `remotesmith-relay` (relay.rs).
++
++use super::host::{self, HostFacts};
++use super::presence::{self, Table};
++use super::protocol::*;
++use super::readiness;
++use super::sessions;
++use super::Source;
++use hbb_common::config::PeerConfig;
++use serde_derive::Deserialize;
++use std::collections::HashMap;
++use hbb_common::log;
++use hbb_common::tokio::sync::watch;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant, UNIX_EPOCH};
++
++/// Everything the endpoint serves.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Snapshot {
++    pub status: Status,
++    pub peers: Vec<Peer>,
++}
++
++/// Handed to the server.
++#[derive(Clone)]
++pub struct Shared {
++    pub snap: watch::Receiver<Snapshot>,
++}
++
++/// A saved peer, as read from RustDesk's peer configs.
++#[derive(Debug, Clone, PartialEq)]
++pub struct SavedPeer {
++    pub id: String,
++    pub alias: Option<String>,
++    pub platform: Option<Platform>,
++    pub saved_at: Option<u64>,
++}
++
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Readiness {
++    pub service: ServiceStatus,
++    pub permissions: Vec<PermissionStatus>,
++    pub power: PowerStatus,
++    pub preboot: PrebootStatus,
++}
++
++const MAX_TEXT: usize = 256;
++
++fn clamp(s: &str) -> String {
++    if s.chars().count() <= MAX_TEXT {
++        s.to_owned()
++    } else {
++        s.chars().take(MAX_TEXT).collect()
++    }
++}
++
++fn non_empty(s: &str) -> Option<String> {
++    let t = s.trim();
++    (!t.is_empty()).then(|| clamp(t))
++}
++
++pub fn platform_of(s: &str) -> Option<Platform> {
++    let l = s.to_ascii_lowercase();
++    if l.is_empty() {
++        None
++    } else if l.contains("windows") {
++        Some(Platform::Windows)
++    } else if l.contains("mac") || l.contains("darwin") {
++        Some(Platform::Macos)
++    } else {
++        Some(Platform::Other)
++    }
++}
++
++/// The public part of a peer file. Read directly rather than through `PeerConfig::peers`, which
++/// decrypts every saved password and deletes files that have no platform yet.
++#[derive(Deserialize, Default)]
++#[serde(default)]
++struct PeerFile {
++    options: HashMap<String, String>,
++    info: PeerFileInfo,
++}
++
++#[derive(Deserialize, Default)]
++#[serde(default)]
++struct PeerFileInfo {
++    hostname: String,
++    platform: String,
++}
++
++/// Parse one peer file; `None` for an unreadable one or one upstream hides (no platform yet).
++pub fn parse_peer_file(id: String, saved_at: Option<u64>, text: &str) -> Option<SavedPeer> {
++    let f: PeerFile = hbb_common::toml::from_str(text).ok()?;
++    if f.info.platform.is_empty() {
++        return None;
++    }
++    Some(SavedPeer {
++        alias: f
++            .options
++            .get("alias")
++            .and_then(|a| non_empty(a))
++            .or_else(|| non_empty(&f.info.hostname)),
++        platform: platform_of(&f.info.platform),
++        saved_at,
++        id,
++    })
++}
++
++/// RustDesk's saved peers (the "recent" list: every machine this one has connected to), most
++/// recently used first, as upstream lists them.
++fn load_saved_peers() -> Vec<SavedPeer> {
++    PeerConfig::get_vec_id_modified_time_path(&None)
++        .into_iter()
++        .filter_map(|(id, modified, path)| {
++            let meta = std::fs::metadata(&path).ok()?;
++            if !meta.is_file() || meta.len() > 1024 * 1024 {
++                return None;
++            }
++            let text = std::fs::read_to_string(&path).ok()?;
++            let saved_at = modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
++            parse_peer_file(id, saved_at, &text)
++        })
++        .collect()
++}
++
++/// The `server` field from the configured rendezvous servers and hbb_common's online state.
++pub fn server_status(servers: &[String], online_state: i64) -> ServerStatus {
++    let host = servers
++        .iter()
++        .map(|s| s.trim())
++        .find(|s| !s.is_empty())
++        .map(|s| {
++            // host:port or [v6]:port -> host
++            let h = if let Some(rest) = s.strip_prefix('[') {
++                rest.split(']').next().unwrap_or(rest)
++            } else {
++                s.rsplit_once(':')
++                    .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
++                    .map_or(s, |(h, _)| h)
++            };
++            clamp(h)
++        });
++    let Some(host) = host else {
++        return ServerStatus {
++            state: RegState::NotConfigured,
++            host: None,
++            detail: Some("no ID server configured".into()),
++        };
++    };
++    let (state, detail) = match online_state {
++        x if x > 0 => (RegState::Registered, None),
++        0 => (RegState::Registering, Some("connecting to the ID server".into())),
++        _ => (RegState::Failed, Some("cannot reach the ID server".into())),
++    };
++    ServerStatus {
++        state,
++        host: Some(host),
++        detail,
++    }
++}
++
++/// Prerequisites (other than the cold-boot record) that do not positively pass. Anything
++/// unknown counts as failing (fail closed).
++pub fn failing_checks(s: &Status) -> Vec<&'static str> {
++    let mut out = Vec::new();
++    if !s.service.running {
++        out.push("service");
++    }
++    match s.platform {
++        Platform::Macos => {
++            for (n, label) in [
++                (Permission::Accessibility, "accessibility"),
++                (Permission::ScreenRecording, "screen_recording"),
++                (Permission::InputMonitoring, "input_monitoring"),
++                (Permission::SystemAudioRecording, "system_audio_recording"),
++            ] {
++                if !s
++                    .permissions
++                    .iter()
++                    .any(|p| p.name == n && p.state == PermState::Granted)
++                {
++                    out.push(label);
++                }
++            }
++        }
++        Platform::Windows => {}
++        Platform::Other => out.push("platform"),
++    }
++    if s.power.sleep_disabled != Some(true) {
++        out.push("power");
++    }
++    if s.preboot_unlock.detected != Some(false) {
++        out.push("preboot_unlock");
++    }
++    if s.server.state != RegState::Registered {
++        out.push("server");
++    }
++    out
++}
++
++/// The fork's "Unattended ready" flag (docs/IPC.md §7): a recorded cold-boot login-screen
++/// connection (made with every prerequisite passing, see `sessions::ledger`), and every
++/// prerequisite passing now. The sidecar re-derives the same checks.
++pub fn unattended_ready(s: &Status) -> bool {
++    s.unattended.cold_boot_verified_at.is_some() && failing_checks(s).is_empty()
++}
++
++/// The prerequisites as this process sees them right now (used when recording the cold-boot
++/// connection, in the process that served it). Blocking: runs the readiness checks.
++pub fn prerequisites_now() -> Status {
++    Status {
++        platform: this_platform(),
++        service: readiness::service(),
++        permissions: readiness::permissions(),
++        power: readiness::power(),
++        preboot_unlock: readiness::preboot(),
++        server: server_status(
++            &hbb_common::config::Config::get_rendezvous_servers(),
++            hbb_common::config::get_online_state(),
++        ),
++        ..Default::default()
++    }
++}
++
++fn this_platform() -> Platform {
++    if cfg!(target_os = "macos") {
++        Platform::Macos
++    } else if cfg!(windows) {
++        Platform::Windows
++    } else {
++        Platform::Other
++    }
++}
++
++/// Assemble the snapshot. `facts` is `None` when the Windows relay cannot reach the service.
++pub fn build(
++    facts: Option<&HostFacts>,
++    ready: &Readiness,
++    saved: &[SavedPeer],
++    presence: &Table,
++) -> Snapshot {
++    let my_id = facts.map(|f| f.my_id.clone()).filter(|s| !s.is_empty());
++    let alias_of = |id: &str| saved.iter().find(|p| p.id == id).and_then(|p| p.alias.clone());
++    let mut status = Status {
++        app_version: crate::VERSION.to_owned(),
++        platform: this_platform(),
++        my_id: my_id.clone(),
++        key_fingerprint: facts.and_then(|f| f.key_fingerprint.clone()),
++        service: ready.service.clone(),
++        permissions: ready.permissions.clone(),
++        power: ready.power.clone(),
++        preboot_unlock: facts
++            .and_then(|f| f.preboot.clone())
++            .unwrap_or_else(|| ready.preboot.clone()),
++        server: match facts {
++            Some(f) => server_status(&f.rendezvous_servers, f.online_state),
++            None => ServerStatus {
++                state: RegState::Unknown,
++                host: None,
++                detail: Some("the RemoteSmith service is not answering".into()),
++            },
++        },
++        unattended: UnattendedStatus {
++            ready: false,
++            cold_boot_verified_at: facts
++                .and_then(|f| f.cold_boot.as_ref())
++                .map(|r| r.verified_at),
++        },
++        inbound_sessions: facts
++            .map(|f| {
++                f.sessions
++                    .iter()
++                    .map(|s| InboundSession {
++                        conn_id: s.conn_id.max(0) as u64,
++                        peer_id: clamp(&s.peer_id),
++                        alias: alias_of(&s.peer_id).or_else(|| non_empty(&s.name)),
++                        kind: SessionKind::Human,
++                        since: Some(s.since),
++                    })
++                    .collect()
++            })
++            .unwrap_or_default(),
++    };
++    status.unattended.ready = unattended_ready(&status);
++    let registered = status.server.state == RegState::Registered;
++    let table = presence.lock().unwrap_or_else(|e| e.into_inner()).clone();
++    let peers = saved
++        .iter()
++        .filter(|p| Some(&p.id) != my_id.as_ref())
++        .map(|p| Peer {
++            id: p.id.clone(),
++            alias: p.alias.clone(),
++            platform: p.platform,
++            presence: table
++                .get(&p.id)
++                .map(|e| presence::presence_of(e, registered))
++                .unwrap_or(Presence::Checking),
++        })
++        .collect();
++    Snapshot { status, peers }
++}
++
++fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
++    if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
++        log::error!("remotesmith: cannot start {name}: {e}");
++    }
++}
++
++/// Start the collector threads and return what the server needs.
++pub fn start(source: Source) -> Shared {
++    let (tx, rx) = watch::channel(Snapshot::default());
++    let table: Table = Default::default();
++    let saved: Arc<Mutex<Vec<SavedPeer>>> = Default::default();
++    let ready: Arc<Mutex<Readiness>> = Default::default();
++
++    #[cfg(windows)]
++    let relay = match source {
++        Source::Relay => Some(super::relay::start()),
++        Source::Local => None,
++    };
++
++    // Readiness.
++    {
++        let ready = ready.clone();
++        spawn("remotesmith-ready", move || {
++            let mut slow_at: Option<Instant> = None;
++            loop {
++                let mut r = ready.lock().unwrap_or_else(|e| e.into_inner()).clone();
++                r.permissions = readiness::permissions();
++                if slow_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(30)) {
++                    slow_at = Some(Instant::now());
++                    r.service = readiness::service();
++                    r.power = readiness::power();
++                    // Windows: BitLocker needs admin, so the relayed host facts carry it and
++                    // this local value is only the fallback.
++                    if cfg!(not(windows)) || source == Source::Local {
++                        r.preboot = readiness::preboot();
++                    }
++                }
++                let changed = {
++                    let mut cur = ready.lock().unwrap_or_else(|e| e.into_inner());
++                    let changed = *cur != r;
++                    *cur = r;
++                    changed
++                };
++                if changed {
++                    sessions::poke();
++                }
++                std::thread::sleep(Duration::from_secs(5));
++            }
++        });
++    }
++
++    // Presence.
++    {
++        let table = table.clone();
++        let saved = saved.clone();
++        let rx = rx.clone();
++        spawn("remotesmith-presence", move || {
++            presence::run(
++                table,
++                || {
++                    let my_id = rx.borrow().status.my_id.clone();
++                    saved
++                        .lock()
++                        .unwrap_or_else(|e| e.into_inner())
++                        .iter()
++                        .filter(|p| Some(&p.id) != my_id.as_ref())
++                        .map(|p| p.id.clone())
++                        .collect()
++                },
++                || rx.borrow().status.server.state == RegState::Registered,
++                sessions::poke,
++            )
++        });
++    }
++
++    // Snapshot.
++    {
++        let table = table.clone();
++        spawn("remotesmith-collect", move || {
++            let mut gen = 0u64;
++            let mut peers_at: Option<Instant> = None;
++            loop {
++                if peers_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
++                    peers_at = Some(Instant::now());
++                    let list = load_saved_peers();
++                    for p in &list {
++                        presence::seed_last_seen(&table, &p.id, p.saved_at);
++                    }
++                    let mut cur = saved.lock().unwrap_or_else(|e| e.into_inner());
++                    if *cur != list {
++                        *cur = list;
++                    }
++                }
++                let facts = match source {
++                    Source::Local => Some(host::local_facts()),
++                    #[cfg(windows)]
++                    Source::Relay => relay.as_ref().and_then(|r| r.facts()),
++                };
++                let snap = {
++                    let r = ready.lock().unwrap_or_else(|e| e.into_inner());
++                    let s = saved.lock().unwrap_or_else(|e| e.into_inner());
++                    build(facts.as_ref(), &r, &s, &table)
++                };
++                tx.send_if_modified(|cur| {
++                    if *cur != snap {
++                        *cur = snap;
++                        true
++                    } else {
++                        false
++                    }
++                });
++                // Wake on any session change (opened/closed hooks, relay updates, pokes) within
++                // milliseconds, and at least once a second.
++                gen = sessions::wait_change(gen, Duration::from_secs(1));
++            }
++        });
++    }
++
++    Shared { snap: rx }
++}
+diff --git a/src/remotesmith/host.rs b/src/remotesmith/host.rs
+new file mode 100644
+index 000000000000..e2e8dc97ca97
+--- /dev/null
++++ b/src/remotesmith/host.rs
+@@ -0,0 +1,98 @@
++//! Facts only the process hosting the RustDesk server knows. On macOS that is the same process
++//! as the endpoint; on Windows the SYSTEM `--server` answers `ipc::Data::RemoteSmithHost` with
++//! them and the user's `--tray` relays them to the sidecar.
++
++use super::protocol::PrebootStatus;
++use super::sessions::{self, ledger::Record, Inbound};
++use hbb_common::config::{self, Config};
++use serde_derive::{Deserialize, Serialize};
++use std::sync::Mutex;
++use std::time::{Duration, Instant};
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct HostFacts {
++    pub sessions: Vec<Inbound>,
++    /// hbb_common's online state: > 0 registered (latency ms), 0 connecting, < 0 failed.
++    pub online_state: i64,
++    pub rendezvous_servers: Vec<String>,
++    pub my_id: String,
++    pub key_fingerprint: Option<String>,
++    /// Only filled where the endpoint cannot compute it itself (Windows: BitLocker needs admin).
++    pub preboot: Option<PrebootStatus>,
++    pub cold_boot: Option<Record>,
++}
++
++impl HostFacts {
++    pub fn to_json(&self) -> String {
++        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
++    }
++
++    pub fn from_json(s: &str) -> Option<Self> {
++        serde_json::from_str(s).ok()
++    }
++}
++
++/// The host's public-key fingerprint in the format RustDesk shows it (`ipc` config
++/// "fingerprint"), once the key is confirmed by the rendezvous server.
++pub fn key_fingerprint() -> Option<String> {
++    if Config::get_key_confirmed() {
++        let pk = Config::get_key_pair().1;
++        if !pk.is_empty() {
++            return Some(crate::common::pk_to_fingerprint(pk));
++        }
++    }
++    None
++}
++
++/// Cached ledger read (the file changes at most once per boot).
++pub fn cold_boot_record() -> Option<Record> {
++    static CACHE: Mutex<Option<(Instant, Option<Record>)>> = Mutex::new(None);
++    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some((at, rec)) = c.as_ref() {
++        if at.elapsed() < Duration::from_secs(5) {
++            return rec.clone();
++        }
++    }
++    // A record without captured prerequisites (an older build) does not count: fail closed.
++    let rec = sessions::ledger::read().filter(|r| !r.prerequisites_passed.is_empty());
++    *c = Some((Instant::now(), rec.clone()));
++    rec
++}
++
++pub fn local_facts() -> HostFacts {
++    HostFacts {
++        sessions: sessions::snapshot().0,
++        online_state: config::get_online_state(),
++        rendezvous_servers: Config::get_rendezvous_servers(),
++        my_id: Config::get_id_or(String::new()),
++        key_fingerprint: key_fingerprint(),
++        preboot: host_preboot(),
++        cold_boot: cold_boot_record(),
++    }
++}
++
++/// Windows: BitLocker state, refreshed by a background thread started on first use, so the IPC
++/// handler that calls this never waits on PowerShell.
++#[cfg(windows)]
++fn host_preboot() -> Option<PrebootStatus> {
++    use std::sync::OnceLock;
++    static CACHE: Mutex<Option<PrebootStatus>> = Mutex::new(None);
++    static STARTED: OnceLock<()> = OnceLock::new();
++    STARTED.get_or_init(|| {
++        std::thread::Builder::new()
++            .name("remotesmith-preboot".into())
++            .spawn(|| loop {
++                let p = super::readiness::preboot();
++                *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
++                std::thread::sleep(Duration::from_secs(60));
++            })
++            .ok();
++    });
++    CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone()
++}
++
++#[cfg(not(windows))]
++fn host_preboot() -> Option<PrebootStatus> {
++    None
++}
+diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
+new file mode 100644
+index 000000000000..5628f57d2f3c
+--- /dev/null
++++ b/src/remotesmith/mod.rs
+@@ -0,0 +1,203 @@
++//! RemoteSmith additions to RustDesk.
++//!
++//! * The local IPC endpoint the RemoteSmith tray (`remotesmith-tray`) talks to: protocol v1 of
++//!   docs/IPC.md in the RemoteSmith repo (DEF-4, DEF-17). Patch range 0400.
++//! * Host-side session and readiness data: the inbound-session registry behind the tray badge
++//!   (§6.2a, AC-60) and the readiness checks including the cold-boot ledger (§6.3, AC-55).
++//!   Patch range 0500.
++//!
++//! Isolation (DEC-5, AC-25): the endpoint and its collectors run on threads of their own, with a
++//! tokio runtime of their own. Nothing RustDesk does waits on them; the only calls *into* this
++//! module from RustDesk code are the session hooks, which take one short mutex and return.
++
++pub mod host;
++pub mod protocol;
++pub mod sessions;
++
++#[cfg(any(target_os = "macos", windows))]
++mod collect;
++#[cfg(any(target_os = "macos", windows))]
++mod presence;
++#[cfg(any(target_os = "macos", windows))]
++mod readiness;
++#[cfg(windows)]
++mod relay;
++#[cfg(any(target_os = "macos", windows))]
++mod server;
++#[cfg(windows)]
++mod winsec;
++
++#[cfg(test)]
++mod tests;
++
++#[allow(unused_imports)]
++use hbb_common::log;
++
++/// Environment variable that replaces the whole endpoint path (socket path or pipe name), for
++/// tests and dev tools. The private-directory rules still apply to an overridden socket path.
++pub const ENV_IPC_PATH: &str = "REMOTESMITH_IPC_PATH";
++/// File name of the socket inside the fork's per-user IPC directory.
++pub const SOCKET_NAME: &str = "remotesmith-ipc.sock";
++
++/// Where the data for the endpoint comes from.
++#[cfg(any(target_os = "macos", windows))]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Source {
++    /// This process hosts the RustDesk server: sessions, registration and keys are local
++    /// (macOS per-user `--server`; a Windows portable/user-mode server).
++    Local,
++    /// Windows `--tray`: runs with the user's token and relays sessions, registration and
++    /// pre-boot state from the SYSTEM `--server` over RustDesk's own IPC.
++    #[cfg(windows)]
++    Relay,
++}
++
++/// Start the endpoint in a process that hosts the RustDesk server (`start_server(true, ..)`).
++///
++/// macOS: the per-user `--server`, or the UI process when it starts the server itself. A root
++/// process (the login-window `--server`) does not listen: no tray runs there, and the session
++/// hooks still record the cold-boot connection in that process.
++/// Windows: only a server running with a user's token (portable); the SYSTEM `--server` never
++/// creates the pipe (docs/IPC.md §2) - the `--tray` process does, through [`start_relay`].
++pub fn start_local() {
++    #[cfg(target_os = "macos")]
++    {
++        if crate::platform::is_root() {
++            log::info!("remotesmith ipc: not listening in a root process");
++            return;
++        }
++        spawn(Source::Local);
++    }
++    #[cfg(windows)]
++    {
++        if crate::platform::is_root() {
++            return;
++        }
++        spawn(Source::Local);
++    }
++}
++
++/// Start the relaying endpoint in the Windows `--tray` process (the user's own token).
++#[cfg(windows)]
++pub fn start_relay() {
++    if crate::platform::is_root() {
++        log::error!("remotesmith ipc: refusing to create the pipe from a SYSTEM process");
++        return;
++    }
++    spawn(Source::Relay);
++}
++
++/// Block while the endpoint started by this process is running. The Windows `--tray` process
++/// calls it after the tray UI returns (hidden tray, tray error), so the pipe outlives the icon.
++#[cfg(windows)]
++pub fn park() {
++    if let Some(h) = ENDPOINT.lock().unwrap().take() {
++        h.join().ok();
++    }
++}
++
++#[cfg(windows)]
++static ENDPOINT: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
++
++#[cfg(any(target_os = "macos", windows))]
++fn spawn(source: Source) {
++    use std::sync::atomic::{AtomicBool, Ordering};
++    static STARTED: AtomicBool = AtomicBool::new(false);
++    if STARTED.swap(true, Ordering::SeqCst) {
++        return;
++    }
++    let endpoint = endpoint();
++    let spawned = std::thread::Builder::new()
++        .name("remotesmith-ipc".into())
++        .spawn(move || {
++            let rt = match hbb_common::tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(e) => {
++                    log::error!("remotesmith ipc: no runtime: {e}");
++                    return;
++                }
++            };
++            rt.block_on(async move {
++                // Retry: the directory may still be being fixed up by RustDesk's own IPC start,
++                // or another process (a UI-hosted server, a second tray) may hold the name and
++                // exit later.
++                let mut wait = std::time::Duration::from_secs(1);
++                #[cfg_attr(not(windows), allow(unused_variables, unused_assignments))]
++                let mut attempts = 0u32;
++                let listener = loop {
++                    attempts += 1;
++                    match server::bind(&endpoint).await {
++                        Ok(l) => break l,
++                        // A duplicate Windows tray must not linger (park() waits on this thread):
++                        // after a few tries it gives up, as upstream's own duplicate tray does.
++                        #[cfg(windows)]
++                        Err(e) if source == Source::Relay && attempts >= 3 => {
++                            log::warn!("remotesmith ipc: cannot listen on {endpoint}: {e}; giving up");
++                            return;
++                        }
++                        Err(e) => {
++                            log::warn!("remotesmith ipc: cannot listen on {endpoint}: {e}; retrying in {wait:?}");
++                            hbb_common::tokio::time::sleep(wait).await;
++                            wait = (wait * 2).min(std::time::Duration::from_secs(60));
++                        }
++                    }
++                };
++                log::info!("remotesmith ipc: listening on {endpoint}");
++                // Collectors only run while someone can be served.
++                let shared = collect::start(source);
++                server::serve(listener, server::ServerConfig::default(), shared).await;
++            });
++        });
++    match spawned {
++        Ok(_h) => {
++            #[cfg(windows)]
++            {
++                *ENDPOINT.lock().unwrap() = Some(_h);
++            }
++        }
++        // thread::Builder::spawn fails (EAGAIN) rather than panicking; the fork carries on.
++        Err(e) => log::error!("remotesmith ipc: cannot start thread: {e}"),
++    }
++}
++
++/// The endpoint for the current user (docs/IPC.md §2).
++#[cfg(any(target_os = "macos", windows))]
++pub(crate) fn endpoint() -> String {
++    if let Ok(p) = std::env::var(ENV_IPC_PATH) {
++        if !p.is_empty() {
++            return p;
++        }
++    }
++    platform_endpoint()
++}
++
++/// `<the fork's per-user IPC dir>/remotesmith-ipc.sock`, i.e. `/tmp/<AppName>-<uid>/...`: the
++/// same 0700 directory hbb_common creates for RustDesk's own IPC socket.
++#[cfg(target_os = "macos")]
++fn platform_endpoint() -> String {
++    let main = hbb_common::config::Config::ipc_path("");
++    match std::path::Path::new(&main).parent() {
++        Some(dir) => dir.join(SOCKET_NAME).to_string_lossy().into_owned(),
++        None => format!("/tmp/{}-{}/{SOCKET_NAME}", crate::get_app_name(), unsafe {
++            hbb_common::libc::geteuid()
++        }),
++    }
++}
++
++/// `\\.\pipe\<AppName>-ipc-<username>`.
++#[cfg(windows)]
++fn platform_endpoint() -> String {
++    let user = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into());
++    let user: String = user.chars().filter(|c| *c != '\\' && *c != '/').collect();
++    format!(r"\\.\pipe\{}-ipc-{user}", crate::get_app_name())
++}
++
++/// Answer to `ipc::Data::RemoteSmithHost(None)` on RustDesk's main IPC: the host facts that only
++/// the process hosting the server knows (sessions, registration, keys, pre-boot unlock). The
++/// Windows `--tray` relays them; it is cheap (cached values only) and never blocks the caller.
++pub fn host_facts_json() -> String {
++    host::local_facts().to_json()
++}
+diff --git a/src/remotesmith/presence.rs b/src/remotesmith/presence.rs
+new file mode 100644
+index 000000000000..380aa669046f
+--- /dev/null
++++ b/src/remotesmith/presence.rs
+@@ -0,0 +1,265 @@
++//! Peer presence (DEF-17, §6.2): a bounded LAN discovery round (upstream's discovery packets) and the rendezvous
++//! server's online-state query (upstream `peer_online::query_online_states`), combined into the
++//! IPC's `checking` / `reachable{route}` / `unavailable{reason, last_seen}`.
++
++use super::protocol::{Presence, Reason, Route};
++use super::sessions::now_secs;
++use hbb_common::{log, tokio};
++use std::collections::{HashMap, HashSet};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++/// Full probe interval: one LAN broadcast round (at most [`LAN_ROUND`]) plus one server query.
++pub const PROBE_INTERVAL: Duration = Duration::from_secs(15);
++const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Entry {
++    /// Answered the last LAN discovery round.
++    pub lan: bool,
++    /// The rendezvous server's answer; `None` when it could not be asked (not registered,
++    /// unreachable) or has not been asked yet.
++    pub id_online: Option<bool>,
++    /// A probe has completed for this peer.
++    pub probed: bool,
++    /// Last time the peer was reachable by any route (Unix seconds).
++    pub last_seen: Option<u64>,
++}
++
++pub type Table = Arc<Mutex<HashMap<String, Entry>>>;
++
++/// Pure mapping from probe results to the wire presence.
++pub fn presence_of(e: &Entry, registered: bool) -> Presence {
++    if e.lan {
++        return Presence::Reachable { route: Route::Lan };
++    }
++    if e.id_online == Some(true) {
++        return Presence::Reachable { route: Route::Id };
++    }
++    if !e.probed {
++        return Presence::Checking;
++    }
++    if e.id_online.is_none() || !registered {
++        return Presence::Unavailable {
++            reason: Reason::ServerUnreachable,
++            detail: Some("not on the LAN, and the ID server cannot be asked".into()),
++            last_seen: e.last_seen,
++        };
++    }
++    Presence::Unavailable {
++        reason: Reason::Offline,
++        detail: None,
++        last_seen: e.last_seen,
++    }
++}
++
++fn apply(table: &Table, ids: &[String], lan: &HashSet<String>, online: Option<&HashSet<String>>) {
++    let now = now_secs();
++    let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
++    t.retain(|k, _| ids.contains(k));
++    for id in ids {
++        let e = t.entry(id.clone()).or_default();
++        e.lan = lan.contains(id);
++        e.id_online = online.map(|o| o.contains(id));
++        e.probed = true;
++        if e.lan || e.id_online == Some(true) {
++            e.last_seen = Some(now);
++        }
++    }
++}
++
++/// Seed `last_seen` from the time RustDesk last saved the peer (its last session), so a peer
++/// never seen online since startup still shows a meaningful "last seen".
++pub fn seed_last_seen(table: &Table, id: &str, saved_at: Option<u64>) {
++    let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
++    let e = t.entry(id.to_owned()).or_default();
++    if e.last_seen.is_none() {
++        e.last_seen = saved_at;
++    }
++}
++
++/// Can the online-query port (rendezvous port - 1) be reached? Upstream's query reports every
++/// peer offline when it cannot connect, so check first and call that "unknown", not "offline".
++async fn online_port_reachable() -> bool {
++    let (server, _, _) = crate::get_rendezvous_server(hbb_common::config::READ_TIMEOUT).await;
++    let Some((host, port)) = server.rsplit_once(':') else {
++        return false;
++    };
++    let Ok(port) = port.parse::<u16>() else {
++        return false;
++    };
++    if port == 0 {
++        return false;
++    }
++    hbb_common::socket_client::connect_tcp(
++        format!("{host}:{}", port - 1),
++        hbb_common::config::CONNECT_TIMEOUT,
++    )
++    .await
++    .is_ok()
++}
++
++/// Ask the rendezvous server which of `ids` are online. `None` when it cannot be asked.
++pub async fn query_server(ids: Vec<String>) -> Option<HashSet<String>> {
++    if ids.is_empty() {
++        return Some(HashSet::new());
++    }
++    if !matches!(
++        tokio::time::timeout(QUERY_TIMEOUT, online_port_reachable()).await,
++        Ok(true)
++    ) {
++        return None;
++    }
++    let result: Arc<Mutex<Option<HashSet<String>>>> = Default::default();
++    let r = result.clone();
++    let q = crate::client::peer_online::query_online_states(ids, move |onlines, _offlines| {
++        *r.lock().unwrap_or_else(|e| e.into_inner()) = Some(onlines.into_iter().collect());
++    });
++    if tokio::time::timeout(QUERY_TIMEOUT, q).await.is_err() {
++        return None;
++    }
++    let out = result.lock().unwrap_or_else(|e| e.into_inner()).take();
++    out
++}
++
++/// LAN discovery round limits. Upstream's `lan::discover` keeps listening while packets keep
++/// arriving and stores every responder, which a LAN host could abuse to keep it running and grow
++/// the stored list without bound. Ours has an absolute deadline, a packet budget, and only
++/// remembers saved peers; it stores nothing on disk.
++pub const LAN_ROUND: Duration = Duration::from_millis(2500);
++pub const LAN_MAX_PACKETS: usize = 512;
++const LAN_MAX_SOCKETS: usize = 16;
++
++fn lan_port() -> u16 {
++    (hbb_common::config::RENDEZVOUS_PORT + 3) as u16
++}
++
++/// The id of a valid discovery `pong` from a saved peer, else `None`.
++pub fn accept_pong(packet: &[u8], saved: &HashSet<String>) -> Option<String> {
++    use hbb_common::protobuf::Message as _;
++    use hbb_common::rendezvous_proto::{rendezvous_message, RendezvousMessage};
++    let msg = RendezvousMessage::parse_from_bytes(packet).ok()?;
++    match msg.union {
++        Some(rendezvous_message::Union::PeerDiscovery(p)) if p.cmd == "pong" => {
++            saved.contains(&p.id).then(|| p.id.clone())
++        }
++        _ => None,
++    }
++}
++
++fn ping_packet() -> Option<Vec<u8>> {
++    use hbb_common::protobuf::Message as _;
++    use hbb_common::rendezvous_proto::{PeerDiscovery, RendezvousMessage};
++    let mut m = RendezvousMessage::new();
++    m.set_peer_discovery(PeerDiscovery {
++        cmd: "ping".to_owned(),
++        ..Default::default()
++    });
++    m.write_to_bytes().ok()
++}
++
++/// One bounded discovery round: broadcast upstream's discovery ping on every IPv4 interface and
++/// collect pongs until [`LAN_ROUND`] has passed (absolute) or [`LAN_MAX_PACKETS`] arrived.
++/// Returns the saved peers that answered.
++pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
++    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
++    let mut found = HashSet::new();
++    if saved.is_empty() {
++        return found;
++    }
++    let Some(ping) = ping_packet() else {
++        return found;
++    };
++    let mut addrs: Vec<Ipv4Addr> = default_net::get_interfaces()
++        .into_iter()
++        .flat_map(|i| i.ipv4.into_iter().map(|v| v.addr))
++        .collect();
++    addrs.push(Ipv4Addr::UNSPECIFIED);
++    addrs.dedup();
++    let sockets: Vec<UdpSocket> = addrs
++        .into_iter()
++        .filter_map(|a| UdpSocket::bind(SocketAddr::from((a, 0))).ok())
++        .filter(|s| {
++            s.set_broadcast(true).is_ok()
++                && s.set_nonblocking(true).is_ok()
++        })
++        .take(LAN_MAX_SOCKETS)
++        .collect();
++    let dest = SocketAddr::from((Ipv4Addr::BROADCAST, lan_port()));
++    for s in &sockets {
++        s.send_to(&ping, dest).ok();
++    }
++    let deadline = Instant::now() + LAN_ROUND;
++    let mut packets = 0usize;
++    let mut buf = [0u8; 2048];
++    while Instant::now() < deadline && packets < LAN_MAX_PACKETS && found.len() < saved.len() {
++        let mut got_any = false;
++        for s in &sockets {
++            while let Ok((n, _)) = s.recv_from(&mut buf) {
++                got_any = true;
++                packets += 1;
++                if let Some(id) = accept_pong(&buf[..n], saved) {
++                    found.insert(id);
++                }
++                if packets >= LAN_MAX_PACKETS {
++                    break;
++                }
++            }
++        }
++        if !got_any {
++            std::thread::sleep(Duration::from_millis(20));
++        }
++    }
++    found
++}
++
++/// Probe forever on the calling thread (its own runtime is built here; the caller must not be
++/// inside one). `ids` lists the enrolled peers; `registered` says whether
++/// this host is registered with the rendezvous server (an offline answer is only trusted then).
++pub fn run(
++    table: Table,
++    ids: impl Fn() -> Vec<String>,
++    registered: impl Fn() -> bool,
++    changed: impl Fn(),
++) {
++    let rt = match tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++    {
++        Ok(rt) => rt,
++        Err(e) => {
++            log::error!("remotesmith presence: no runtime: {e}");
++            return;
++        }
++    };
++    let mut last_ids: Vec<String> = Vec::new();
++    let mut last_probe: Option<Instant> = None;
++    loop {
++        let cur = ids();
++        let due = last_probe.map_or(true, |t| t.elapsed() >= PROBE_INTERVAL);
++        if !(due || cur != last_ids) || cur.is_empty() {
++            if cur.is_empty() && cur != last_ids {
++                apply(&table, &cur, &HashSet::new(), None);
++                last_ids = cur;
++                changed();
++            }
++            std::thread::sleep(Duration::from_secs(1));
++            continue;
++        }
++        last_probe = Some(Instant::now());
++        let saved: HashSet<String> = cur.iter().cloned().collect();
++        let lan = discover_lan(&saved);
++        let online = if registered() {
++            rt.block_on(query_server(cur.clone()))
++        } else {
++            None
++        };
++        let before = table.lock().unwrap_or_else(|e| e.into_inner()).clone();
++        apply(&table, &cur, &lan, online.as_ref());
++        let after = table.lock().unwrap_or_else(|e| e.into_inner()).clone();
++        last_ids = cur;
++        if before != after {
++            changed();
++        }
++    }
++}
+diff --git a/src/remotesmith/protocol.rs b/src/remotesmith/protocol.rs
+new file mode 100644
+index 000000000000..e07dc0e7b6c2
+--- /dev/null
++++ b/src/remotesmith/protocol.rs
+@@ -0,0 +1,1026 @@
++//! RemoteSmith fork <-> sidecar IPC protocol v1 (docs/IPC.md in the RemoteSmith repo).
++//!
++//! A verbatim port of the sidecar's normative serde definitions (`sidecar/src/protocol.rs`), so
++//! both ends decode the same JSON the same way. Keep the two in sync; the shared fixture
++//! `docs/ipc-fixtures/v1.jsonl` is decoded by the tests of both.
++
++use hbb_common::tokio;
++use serde::{Deserialize, Serialize};
++
++/// Protocol version this build speaks natively.
++pub const PROTOCOL_VERSION: u32 = 1;
++/// Lowest protocol version this sidecar accepts.
++pub const MIN_VERSION: u32 = 1;
++/// Highest protocol version this sidecar accepts.
++pub const MAX_VERSION: u32 = 1;
++/// Maximum line length including the trailing newline (docs/IPC.md §3).
++pub const MAX_LINE: usize = 1024 * 1024;
++
++/// Wire envelope: `{"v":1,"id":7,"type":"...", ...body fields}`.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct Envelope<T> {
++    pub v: u32,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub id: Option<u64>,
++    #[serde(flatten)]
++    pub body: T,
++}
++
++impl<T> Envelope<T> {
++    pub fn new(v: u32, id: Option<u64>, body: T) -> Self {
++        Self { v, id, body }
++    }
++}
++
++/// Client -> server requests.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum Request {
++    Hello {
++        min_version: u32,
++        max_version: u32,
++        client: String,
++        client_version: String,
++    },
++    GetStatus,
++    ListPeers,
++    Connect {
++        peer_id: String,
++    },
++    Subscribe {
++        topics: Vec<Topic>,
++    },
++    Ping,
++    /// Any request type this build does not know.
++    #[serde(other)]
++    Unknown,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Topic {
++    Status,
++    Peers,
++    #[serde(other)]
++    Unknown,
++}
++
++/// Server -> client messages (responses carry `id`, pushed events do not).
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum ServerMessage {
++    HelloOk {
++        version: u32,
++        min_version: u32,
++        max_version: u32,
++        #[serde(default, deserialize_with = "lenient")]
++        server: String,
++        #[serde(default, deserialize_with = "lenient")]
++        server_version: String,
++    },
++    Status {
++        status: Box<Status>,
++    },
++    Peers {
++        #[serde(deserialize_with = "peers_array")]
++        peers: Vec<Peer>,
++    },
++    ConnectStarted {
++        peer_id: String,
++    },
++    ConnectResult {
++        peer_id: String,
++        ok: bool,
++        #[serde(
++            default,
++            deserialize_with = "lenient",
++            skip_serializing_if = "Option::is_none"
++        )]
++        reason: Option<Reason>,
++        #[serde(
++            default,
++            deserialize_with = "lenient",
++            skip_serializing_if = "Option::is_none"
++        )]
++        detail: Option<String>,
++    },
++    Subscribed {
++        #[serde(default, deserialize_with = "lenient_vec")]
++        topics: Vec<Topic>,
++    },
++    Pong,
++    Error {
++        error: ErrorBody,
++    },
++    /// Any message type this build does not know; clients ignore it.
++    #[serde(other)]
++    Unknown,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct ErrorBody {
++    pub code: ErrorCode,
++    #[serde(default, deserialize_with = "lenient")]
++    pub message: String,
++    /// Only on `version_mismatch`: the server's supported range.
++    #[serde(
++        default,
++        deserialize_with = "lenient",
++        skip_serializing_if = "Option::is_none"
++    )]
++    pub min_version: Option<u32>,
++    #[serde(
++        default,
++        deserialize_with = "lenient",
++        skip_serializing_if = "Option::is_none"
++    )]
++    pub max_version: Option<u32>,
++}
++
++impl ErrorBody {
++    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
++        Self {
++            code,
++            message: message.into(),
++            min_version: None,
++            max_version: None,
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ErrorCode {
++    VersionMismatch,
++    HelloRequired,
++    BadRequest,
++    LineTooLong,
++    UnknownType,
++    PeerUnknown,
++    PeerUnavailable,
++    Busy,
++    Internal,
++    #[serde(untagged)]
++    Other(String),
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum Platform {
++    Macos,
++    Windows,
++    #[default]
++    #[serde(other)]
++    Other,
++}
++
++/// The fork's status snapshot (docs/IPC.md §7).
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct Status {
++    #[serde(deserialize_with = "lenient")]
++    pub app_version: String,
++    #[serde(deserialize_with = "lenient")]
++    pub platform: Platform,
++    #[serde(deserialize_with = "lenient")]
++    pub my_id: Option<String>,
++    #[serde(deserialize_with = "lenient")]
++    pub key_fingerprint: Option<String>,
++    #[serde(deserialize_with = "lenient")]
++    pub service: ServiceStatus,
++    #[serde(deserialize_with = "lenient_vec")]
++    pub permissions: Vec<PermissionStatus>,
++    #[serde(deserialize_with = "lenient")]
++    pub power: PowerStatus,
++    #[serde(deserialize_with = "lenient")]
++    pub preboot_unlock: PrebootStatus,
++    #[serde(deserialize_with = "lenient")]
++    pub server: ServerStatus,
++    #[serde(deserialize_with = "lenient")]
++    pub unattended: UnattendedStatus,
++    #[serde(deserialize_with = "sessions_array")]
++    pub inbound_sessions: Vec<InboundSession>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct ServiceStatus {
++    #[serde(deserialize_with = "lenient")]
++    pub running: bool,
++    #[serde(deserialize_with = "lenient")]
++    pub detail: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct PermissionStatus {
++    pub name: Permission,
++    #[serde(default, deserialize_with = "lenient")]
++    pub state: PermState,
++    #[serde(
++        default,
++        deserialize_with = "lenient",
++        skip_serializing_if = "Option::is_none"
++    )]
++    pub detail: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Permission {
++    Accessibility,
++    ScreenRecording,
++    InputMonitoring,
++    SystemAudioRecording,
++    #[serde(untagged)]
++    Other(String),
++}
++
++impl Permission {
++    pub fn display_name(&self) -> String {
++        match self {
++            Permission::Accessibility => "Accessibility".into(),
++            Permission::ScreenRecording => "Screen Recording".into(),
++            Permission::InputMonitoring => "Input Monitoring".into(),
++            Permission::SystemAudioRecording => "Screen & System Audio Recording".into(),
++            Permission::Other(s) => s.clone(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum PermState {
++    Granted,
++    Missing,
++    #[default]
++    #[serde(other)]
++    Unknown,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct PowerStatus {
++    #[serde(deserialize_with = "lenient")]
++    pub sleep_disabled: Option<bool>,
++    #[serde(deserialize_with = "lenient")]
++    pub detail: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct PrebootStatus {
++    #[serde(deserialize_with = "lenient")]
++    pub detected: Option<bool>,
++    #[serde(deserialize_with = "lenient")]
++    pub detail: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct ServerStatus {
++    #[serde(deserialize_with = "lenient")]
++    pub state: RegState,
++    #[serde(deserialize_with = "lenient")]
++    pub host: Option<String>,
++    #[serde(deserialize_with = "lenient")]
++    pub detail: Option<String>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum RegState {
++    Registered,
++    Registering,
++    NotConfigured,
++    Failed,
++    #[default]
++    #[serde(other)]
++    Unknown,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++#[serde(default)]
++pub struct UnattendedStatus {
++    #[serde(deserialize_with = "lenient")]
++    pub ready: bool,
++    #[serde(deserialize_with = "lenient")]
++    pub cold_boot_verified_at: Option<u64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct InboundSession {
++    #[serde(default, deserialize_with = "lenient")]
++    pub conn_id: u64,
++    #[serde(default, deserialize_with = "lenient")]
++    pub peer_id: String,
++    #[serde(default, deserialize_with = "lenient")]
++    pub alias: Option<String>,
++    #[serde(default, deserialize_with = "lenient")]
++    pub kind: SessionKind,
++    #[serde(default, deserialize_with = "lenient")]
++    pub since: Option<u64>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum SessionKind {
++    Agent,
++    #[default]
++    #[serde(other)]
++    Human,
++}
++
++/// An enrolled peer as the fork reports it (docs/IPC.md §8).
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct Peer {
++    pub id: String,
++    #[serde(default, deserialize_with = "lenient")]
++    pub alias: Option<String>,
++    #[serde(default, deserialize_with = "lenient")]
++    pub platform: Option<Platform>,
++    #[serde(default, deserialize_with = "lenient")]
++    pub presence: Presence,
++}
++
++/// Presence as reported on the wire (DEF-17). `Unknown` is the sidecar's own state.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(tag = "state", rename_all = "snake_case")]
++pub enum Presence {
++    Checking,
++    Reachable {
++        #[serde(default, deserialize_with = "lenient")]
++        route: Route,
++    },
++    Unavailable {
++        #[serde(default, deserialize_with = "lenient")]
++        reason: Reason,
++        #[serde(
++            default,
++            deserialize_with = "lenient",
++            skip_serializing_if = "Option::is_none"
++        )]
++        detail: Option<String>,
++        #[serde(
++            default,
++            deserialize_with = "lenient",
++            skip_serializing_if = "Option::is_none"
++        )]
++        last_seen: Option<u64>,
++    },
++    /// The sidecar's own state; also the fallback for any unrecognised state.
++    #[default]
++    #[serde(other)]
++    Unknown,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Route {
++    Lan,
++    Id,
++    #[serde(untagged)]
++    Other(String),
++}
++
++impl Route {
++    pub fn label(&self) -> String {
++        match self {
++            Route::Lan => "LAN".into(),
++            Route::Id => "ID".into(),
++            Route::Other(s) => s.clone(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Reason {
++    Offline,
++    AuthFailed,
++    HostMissingPermissions,
++    ServerUnreachable,
++    IdentityMismatch,
++    NotEnrolled,
++    Timeout,
++    Cancelled,
++    #[serde(untagged)]
++    Other(String),
++}
++
++impl Reason {
++    pub fn label(&self) -> String {
++        match self {
++            Reason::Offline => "offline".into(),
++            Reason::AuthFailed => "auth failed".into(),
++            Reason::HostMissingPermissions => "host missing permissions".into(),
++            Reason::ServerUnreachable => "server unreachable".into(),
++            Reason::IdentityMismatch => "host key mismatch".into(),
++            Reason::NotEnrolled => "not enrolled".into(),
++            Reason::Timeout => "timed out".into(),
++            Reason::Cancelled => "cancelled".into(),
++            Reason::Other(s) => s.clone(),
++        }
++    }
++}
++
++// ---- leniency (docs/IPC.md §3, §11) -------------------------------------------------------
++// null, a wrong JSON type or an unrecognised shape in a defaulted field yields that field's
++// default, and a bad element of a list is dropped, instead of rejecting the whole message
++// (which would leave stale state on screen).
++
++fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
++where
++    D: serde::Deserializer<'de>,
++    T: serde::de::DeserializeOwned + Default,
++{
++    let v = serde_json::Value::deserialize(d)?;
++    Ok(T::deserialize(v).unwrap_or_default())
++}
++
++/// Top-level peer list: must be an array (anything else rejects the message, so a broken
++/// list is never mistaken for "no peers" and onboarding); unreadable elements are dropped, but
++/// a non-empty list with no readable element at all is rejected too.
++fn peers_array<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++    T: serde::de::DeserializeOwned,
++{
++    use serde::de::Error;
++    match serde_json::Value::deserialize(d)? {
++        serde_json::Value::Array(items) => {
++            let n = items.len();
++            let out: Vec<T> = items
++                .into_iter()
++                .filter_map(|e| T::deserialize(e).ok())
++                .collect();
++            if n > 0 && out.is_empty() {
++                return Err(D::Error::custom(
++                    "no readable peer in a non-empty peer list",
++                ));
++            }
++            Ok(out)
++        }
++        _ => Err(D::Error::custom("peers must be an array")),
++    }
++}
++
++/// Inbound sessions: null / absent means none; any other non-array rejects the whole status,
++/// so a malformed list can never silently clear the session badge (AC-60).
++fn sessions_array<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++    T: serde::de::DeserializeOwned,
++{
++    use serde::de::Error;
++    match serde_json::Value::deserialize(d)? {
++        serde_json::Value::Null => Ok(Vec::new()),
++        serde_json::Value::Array(items) => Ok(items
++            .into_iter()
++            .filter_map(|e| T::deserialize(e).ok())
++            .collect()),
++        _ => Err(D::Error::custom("inbound_sessions must be an array")),
++    }
++}
++
++fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++    T: serde::de::DeserializeOwned,
++{
++    Ok(match serde_json::Value::deserialize(d)? {
++        serde_json::Value::Array(items) => items
++            .into_iter()
++            .filter_map(|e| T::deserialize(e).ok())
++            .collect(),
++        _ => Vec::new(),
++    })
++}
++
++impl Default for Route {
++    fn default() -> Self {
++        Route::Other("unknown route".into())
++    }
++}
++
++impl Default for Reason {
++    fn default() -> Self {
++        Reason::Other("unspecified".into())
++    }
++}
++
++/// Outcome of the version negotiation rule in docs/IPC.md §4.
++pub fn negotiate(
++    client_min: u32,
++    client_max: u32,
++    server_min: u32,
++    server_max: u32,
++) -> Option<u32> {
++    let chosen = client_max.min(server_max);
++    if chosen < client_min.max(server_min) {
++        None
++    } else {
++        Some(chosen)
++    }
++}
++
++/// Serialize one message as a single line with trailing newline. The fork's server enforces
++/// [`MAX_LINE`] on top of this (`server::encode_bounded`).
++pub fn encode<T: Serialize>(v: u32, id: Option<u64>, body: T) -> String {
++    // Serialization of these plain types cannot fail; fall back to an empty object defensively.
++    let mut s = serde_json::to_string(&Envelope::new(v, id, body)).unwrap_or_else(|_| "{}".into());
++    s.push('\n');
++    s
++}
++
++/// Why a received line could not be used.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DecodeError {
++    TooLong,
++    NotUtf8,
++    /// serde_json's error category only (`syntax`, `data`, `eof`, `io`). The full serde message
++    /// can quote received values, so it is never kept or logged.
++    BadJson(&'static str),
++}
++
++impl DecodeError {
++    /// Log-safe description of a rejected line: its size and why, never its content.
++    pub fn describe(&self, len: usize) -> String {
++        match self {
++            DecodeError::TooLong => format!("{len}-byte line over the 1 MiB limit"),
++            DecodeError::NotUtf8 => format!("{len}-byte line, not UTF-8"),
++            DecodeError::BadJson(c) => format!("{len}-byte line, unparseable JSON ({c} error)"),
++        }
++    }
++}
++
++/// Parse one line (without its newline). Best-effort extracts `id` for error replies.
++pub fn decode<T: for<'de> Deserialize<'de>>(
++    line: &[u8],
++) -> Result<Envelope<T>, (DecodeError, Option<u64>)> {
++    if line.len() >= MAX_LINE {
++        return Err((DecodeError::TooLong, None));
++    }
++    let text = std::str::from_utf8(line).map_err(|_| (DecodeError::NotUtf8, None))?;
++    let text = text.strip_suffix('\r').unwrap_or(text);
++    match serde_json::from_str::<Envelope<T>>(text) {
++        Ok(env) => Ok(env),
++        Err(e) => {
++            let id = serde_json::from_str::<serde_json::Value>(text)
++                .ok()
++                .and_then(|v| v.get("id").and_then(|i| i.as_u64()));
++            let category = match e.classify() {
++                serde_json::error::Category::Syntax => "syntax",
++                serde_json::error::Category::Data => "data",
++                serde_json::error::Category::Eof => "eof",
++                serde_json::error::Category::Io => "io",
++            };
++            Err((DecodeError::BadJson(category), id))
++        }
++    }
++}
++
++/// Result of reading one bounded line.
++#[derive(Debug, PartialEq, Eq)]
++pub enum LineRead {
++    Line(Vec<u8>),
++    /// A line exceeded [`MAX_LINE`]; it was discarded up to and including its newline.
++    TooLong,
++    Eof,
++}
++
++/// Read one `\n`-terminated line without ever buffering more than `max` bytes.
++/// An unterminated tail at EOF is reported as `Eof` (a half-written line is never acted upon).
++pub async fn read_line_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<LineRead>
++where
++    R: tokio::io::AsyncBufRead + Unpin,
++{
++    use tokio::io::AsyncBufReadExt;
++    let mut buf: Vec<u8> = Vec::new();
++    let mut overflow = false;
++    loop {
++        let chunk = reader.fill_buf().await?;
++        if chunk.is_empty() {
++            return Ok(LineRead::Eof);
++        }
++        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
++            if !overflow && buf.len() + pos < max {
++                buf.extend_from_slice(&chunk[..pos]);
++            } else {
++                overflow = true;
++            }
++            reader.consume(pos + 1);
++            return Ok(if overflow {
++                LineRead::TooLong
++            } else {
++                LineRead::Line(buf)
++            });
++        }
++        let n = chunk.len();
++        if !overflow {
++            if buf.len() + n >= max {
++                overflow = true;
++                buf = Vec::new();
++            } else {
++                buf.extend_from_slice(chunk);
++            }
++        }
++        reader.consume(n);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn rt<T>(v: &T) -> T
++    where
++        T: Serialize + for<'de> Deserialize<'de>,
++    {
++        serde_json::from_str(&serde_json::to_string(v).unwrap()).unwrap()
++    }
++
++    fn sample_status() -> Status {
++        Status {
++            app_version: "1.5.0-rs.1".into(),
++            platform: Platform::Macos,
++            my_id: Some("123456789".into()),
++            key_fingerprint: Some("SHA256:aa:bb".into()),
++            service: ServiceStatus {
++                running: true,
++                detail: None,
++            },
++            permissions: vec![
++                PermissionStatus {
++                    name: Permission::Accessibility,
++                    state: PermState::Granted,
++                    detail: None,
++                },
++                PermissionStatus {
++                    name: Permission::Other("full_disk_access".into()),
++                    state: PermState::Missing,
++                    detail: Some("x".into()),
++                },
++            ],
++            power: PowerStatus {
++                sleep_disabled: Some(true),
++                detail: None,
++            },
++            preboot_unlock: PrebootStatus {
++                detected: Some(false),
++                detail: None,
++            },
++            server: ServerStatus {
++                state: RegState::Registered,
++                host: Some("rs.johnnycode.ai".into()),
++                detail: None,
++            },
++            unattended: UnattendedStatus {
++                ready: true,
++                cold_boot_verified_at: Some(1_791_820_800),
++            },
++            inbound_sessions: vec![InboundSession {
++                conn_id: 7,
++                peer_id: "987".into(),
++                alias: Some("Scott-PC".into()),
++                kind: SessionKind::Agent,
++                since: Some(1),
++            }],
++        }
++    }
++
++    #[test]
++    fn requests_round_trip() {
++        let reqs = vec![
++            Request::Hello {
++                min_version: 1,
++                max_version: 1,
++                client: "t".into(),
++                client_version: "0".into(),
++            },
++            Request::GetStatus,
++            Request::ListPeers,
++            Request::Connect {
++                peer_id: "123".into(),
++            },
++            Request::Subscribe {
++                topics: vec![Topic::Status, Topic::Peers],
++            },
++            Request::Ping,
++        ];
++        for (i, r) in reqs.into_iter().enumerate() {
++            let line = encode(1, Some(i as u64), r.clone());
++            assert!(line.ends_with('\n') && !line[..line.len() - 1].contains('\n'));
++            let env: Envelope<Request> = decode(line.trim_end().as_bytes()).unwrap();
++            assert_eq!(env.v, 1);
++            assert_eq!(env.id, Some(i as u64));
++            assert_eq!(env.body, r);
++        }
++    }
++
++    #[test]
++    fn server_messages_round_trip() {
++        let msgs = vec![
++            ServerMessage::HelloOk {
++                version: 1,
++                min_version: 1,
++                max_version: 1,
++                server: "RemoteSmith".into(),
++                server_version: "1.5.0".into(),
++            },
++            ServerMessage::Status {
++                status: Box::new(sample_status()),
++            },
++            ServerMessage::Peers {
++                peers: vec![
++                    Peer {
++                        id: "1".into(),
++                        alias: Some("PC".into()),
++                        platform: Some(Platform::Windows),
++                        presence: Presence::Reachable { route: Route::Lan },
++                    },
++                    Peer {
++                        id: "2".into(),
++                        alias: None,
++                        platform: None,
++                        presence: Presence::Unavailable {
++                            reason: Reason::Other("weird".into()),
++                            detail: Some("d".into()),
++                            last_seen: Some(5),
++                        },
++                    },
++                    Peer {
++                        id: "3".into(),
++                        alias: None,
++                        platform: None,
++                        presence: Presence::Checking,
++                    },
++                ],
++            },
++            ServerMessage::ConnectStarted {
++                peer_id: "1".into(),
++            },
++            ServerMessage::ConnectResult {
++                peer_id: "1".into(),
++                ok: false,
++                reason: Some(Reason::AuthFailed),
++                detail: None,
++            },
++            ServerMessage::Subscribed {
++                topics: vec![Topic::Peers],
++            },
++            ServerMessage::Pong,
++            ServerMessage::Error {
++                error: ErrorBody {
++                    code: ErrorCode::VersionMismatch,
++                    message: "m".into(),
++                    min_version: Some(2),
++                    max_version: Some(3),
++                },
++            },
++        ];
++        for m in msgs {
++            let line = encode(1, None, m.clone());
++            let env: Envelope<ServerMessage> = decode(line.trim_end().as_bytes()).unwrap();
++            assert_eq!(env.id, None);
++            assert_eq!(env.body, m);
++        }
++        assert_eq!(rt(&sample_status()), sample_status());
++    }
++
++    #[test]
++    fn documented_examples_parse() {
++        let hello = r#"{"v":1,"id":1,"type":"hello_ok","version":1,"min_version":1,"max_version":1,"server":"RemoteSmith","server_version":"1.5.0-rs.1"}"#;
++        let env: Envelope<ServerMessage> = decode(hello.as_bytes()).unwrap();
++        assert!(matches!(
++            env.body,
++            ServerMessage::HelloOk { version: 1, .. }
++        ));
++        let err = r#"{"v":1,"id":3,"type":"error","error":{"code":"peer_unknown","message":"no peer 987654321"}}"#;
++        let env: Envelope<ServerMessage> = decode(err.as_bytes()).unwrap();
++        assert_eq!(env.id, Some(3));
++        match env.body {
++            ServerMessage::Error { error } => assert_eq!(error.code, ErrorCode::PeerUnknown),
++            other => panic!("{other:?}"),
++        }
++        let peer = r#"{"v":1,"type":"peers","peers":[{"id":"987654321","alias":"Scott-PC","platform":"windows","presence":{"state":"reachable","route":"lan"}}]}"#;
++        let env: Envelope<ServerMessage> = decode(peer.as_bytes()).unwrap();
++        assert!(matches!(env.body, ServerMessage::Peers { .. }));
++    }
++
++    #[test]
++    fn unknown_values_map_to_fallbacks() {
++        let line = r#"{"v":1,"type":"peers","extra":true,"peers":[
++            {"id":"1","presence":{"state":"teleporting"}},
++            {"id":"2","presence":{"state":"reachable","route":"carrier_pigeon"}},
++            {"id":"3"}]}"#
++            .replace('\n', "");
++        let env: Envelope<ServerMessage> = decode(line.as_bytes()).unwrap();
++        let ServerMessage::Peers { peers } = env.body else {
++            panic!()
++        };
++        assert_eq!(peers[0].presence, Presence::Unknown);
++        assert_eq!(
++            peers[1].presence,
++            Presence::Reachable {
++                route: Route::Other("carrier_pigeon".into())
++            }
++        );
++        assert_eq!(peers[2].presence, Presence::Unknown);
++
++        let st = r#"{"v":1,"type":"status","status":{"platform":"beos","permissions":[{"name":"accessibility","state":"maybe"}],"server":{"state":"exploded"},"inbound_sessions":[{"peer_id":"9","kind":"robot"}]}}"#;
++        let env: Envelope<ServerMessage> = decode(st.as_bytes()).unwrap();
++        let ServerMessage::Status { status } = env.body else {
++            panic!()
++        };
++        assert_eq!(status.platform, Platform::Other);
++        assert_eq!(status.permissions[0].state, PermState::Unknown);
++        assert_eq!(status.server.state, RegState::Unknown);
++        assert_eq!(status.inbound_sessions[0].kind, SessionKind::Human);
++        assert!(!status.unattended.ready);
++
++        let unk = r#"{"v":1,"type":"desk_mode","on":true}"#;
++        let env: Envelope<ServerMessage> = decode(unk.as_bytes()).unwrap();
++        assert_eq!(env.body, ServerMessage::Unknown);
++        let unk_req = r#"{"v":1,"id":4,"type":"format_disk"}"#;
++        let env: Envelope<Request> = decode(unk_req.as_bytes()).unwrap();
++        assert_eq!(env.body, Request::Unknown);
++        assert_eq!(env.id, Some(4));
++    }
++
++    #[test]
++    fn malformed_lines_are_errors_with_best_effort_id() {
++        assert!(matches!(
++            decode::<Request>(b"not json"),
++            Err((DecodeError::BadJson(_), None))
++        ));
++        assert!(matches!(
++            decode::<Request>(b"[1,2]"),
++            Err((DecodeError::BadJson(_), None))
++        ));
++        assert!(matches!(
++            decode::<Request>(&[0xff, 0xfe]),
++            Err((DecodeError::NotUtf8, None))
++        ));
++        // Right shape but wrong field type: id still recovered for the error reply.
++        assert!(matches!(
++            decode::<Request>(br#"{"v":1,"id":9,"type":"connect","peer_id":5}"#),
++            Err((DecodeError::BadJson(_), Some(9)))
++        ));
++        // Missing v.
++        assert!(decode::<Request>(br#"{"id":1,"type":"ping"}"#).is_err());
++        let big = vec![b'a'; MAX_LINE];
++        assert!(matches!(
++            decode::<Request>(&big),
++            Err((DecodeError::TooLong, None))
++        ));
++        // CRLF tolerated.
++        assert!(decode::<Request>(b"{\"v\":1,\"id\":1,\"type\":\"ping\"}\r").is_ok());
++    }
++
++    #[test]
++    fn credentials_are_not_representable_on_connect() {
++        // A client cannot smuggle a password through `connect`; extra fields are dropped.
++        let env: Envelope<Request> =
++            decode(br#"{"v":1,"id":2,"type":"connect","peer_id":"1","password":"hunter2"}"#)
++                .unwrap();
++        let re = encode(1, env.id, env.body);
++        assert!(!re.contains("hunter2"));
++    }
++
++    #[test]
++    fn nulls_wrong_types_and_bad_elements_do_not_reject_the_message() {
++        let st = r#"{"v":1,"type":"status","status":{"app_version":null,"platform":null,"service":null,
++            "permissions":[{"name":"accessibility","state":null},{"state":"granted"},7,{"name":"screen_recording","state":"granted"}],
++            "power":{"sleep_disabled":"yes"},"server":null,"unattended":{"ready":null},
++            "inbound_sessions":[{"conn_id":null,"kind":null,"peer_id":"9"},{"alias":"x"},"junk"]}}"#
++            .replace('\n', "");
++        let env: Envelope<ServerMessage> = decode(st.as_bytes()).unwrap();
++        let ServerMessage::Status { status } = env.body else {
++            panic!()
++        };
++        assert_eq!(status.platform, Platform::Other);
++        assert!(!status.service.running);
++        // Element without a name is dropped; others kept.
++        assert_eq!(status.permissions.len(), 2);
++        assert_eq!(status.permissions[0].state, PermState::Unknown);
++        assert_eq!(status.power.sleep_disabled, None);
++        assert_eq!(status.server.state, RegState::Unknown);
++        assert!(!status.unattended.ready);
++        // Sessions stay visible even when malformed (badge must not silently clear).
++        assert_eq!(status.inbound_sessions.len(), 2);
++        assert_eq!(status.inbound_sessions[0].peer_id, "9");
++        assert_eq!(status.inbound_sessions[1].peer_id, "");
++
++        let peers = r#"{"v":1,"type":"peers","peers":[{"id":"1","presence":null},{"id":"2","alias":5,
++            "presence":{"state":"reachable"}},{"id":"3","presence":{"state":"unavailable","last_seen":"x"}},{"alias":"no id"}]}"#
++            .replace('\n', "");
++        let env: Envelope<ServerMessage> = decode(peers.as_bytes()).unwrap();
++        let ServerMessage::Peers { peers } = env.body else {
++            panic!()
++        };
++        assert_eq!(peers.len(), 3);
++        assert_eq!(peers[0].presence, Presence::Unknown);
++        assert_eq!(peers[1].alias, None);
++        assert_eq!(
++            peers[1].presence,
++            Presence::Reachable {
++                route: Route::Other("unknown route".into())
++            }
++        );
++        assert_eq!(
++            peers[2].presence,
++            Presence::Unavailable {
++                reason: Reason::Other("unspecified".into()),
++                detail: None,
++                last_seen: None
++            }
++        );
++
++        let e = r#"{"v":1,"id":1,"type":"error","error":{"code":"version_mismatch","message":null,"min_version":2,"max_version":3}}"#;
++        let env: Envelope<ServerMessage> = decode(e.as_bytes()).unwrap();
++        let ServerMessage::Error { error } = env.body else {
++            panic!()
++        };
++        assert_eq!(error.code, ErrorCode::VersionMismatch);
++        assert_eq!((error.min_version, error.max_version), (Some(2), Some(3)));
++
++        let h = r#"{"v":1,"id":1,"type":"hello_ok","version":1,"min_version":1,"max_version":1,"server":null,"server_version":null}"#;
++        assert!(decode::<ServerMessage>(h.as_bytes()).is_ok());
++    }
++
++    #[test]
++    fn list_shape_errors_reject_instead_of_clearing() {
++        for bad in [
++            r#"{"v":1,"type":"peers","peers":{"id":"1"}}"#,
++            r#"{"v":1,"type":"peers","peers":null}"#,
++            r#"{"v":1,"type":"peers","peers":[5,{"alias":"x"}]}"#,
++            r#"{"v":1,"type":"status","status":{"inbound_sessions":{"peer_id":"9"}}}"#,
++            r#"{"v":1,"type":"status","status":{"inbound_sessions":"none"}}"#,
++        ] {
++            assert!(decode::<ServerMessage>(bad.as_bytes()).is_err(), "{bad}");
++        }
++        for ok in [
++            r#"{"v":1,"type":"peers","peers":[]}"#,
++            r#"{"v":1,"type":"peers","peers":[5,{"id":"1"}]}"#,
++            r#"{"v":1,"type":"status","status":{"inbound_sessions":null}}"#,
++            r#"{"v":1,"type":"status","status":{}}"#,
++        ] {
++            assert!(decode::<ServerMessage>(ok.as_bytes()).is_ok(), "{ok}");
++        }
++    }
++
++    #[test]
++    fn decode_errors_never_carry_received_values() {
++        let line = br#"{"v":1,"id":2,"type":"connect","peer_id":{"password":"hunter2"}}"#;
++        let (e, _) = decode::<Request>(line).err().unwrap();
++        let d = e.describe(line.len());
++        assert!(!d.contains("hunter2") && !d.contains("password"), "{d}");
++        assert!(d.contains("unparseable JSON"));
++            }
++
++    #[test]
++    fn negotiation_rule() {
++        assert_eq!(negotiate(1, 1, 1, 1), Some(1));
++        assert_eq!(negotiate(1, 3, 2, 5), Some(3));
++        assert_eq!(negotiate(1, 1, 2, 3), None);
++        assert_eq!(negotiate(4, 5, 1, 3), None);
++        assert_eq!(negotiate(1, 2, 2, 2), Some(2));
++    }
++
++    #[tokio::test]
++    async fn bounded_reader_handles_oversize_and_eof() {
++        let mut data = Vec::new();
++        data.extend_from_slice(b"short\n");
++        data.extend(std::iter::repeat(b'x').take(50));
++        data.extend_from_slice(b"\nafter\npartial");
++        let mut r = tokio::io::BufReader::with_capacity(8, &data[..]);
++        assert_eq!(
++            read_line_bounded(&mut r, 20).await.unwrap(),
++            LineRead::Line(b"short".to_vec())
++        );
++        assert_eq!(
++            read_line_bounded(&mut r, 20).await.unwrap(),
++            LineRead::TooLong
++        );
++        assert_eq!(
++            read_line_bounded(&mut r, 20).await.unwrap(),
++            LineRead::Line(b"after".to_vec())
++        );
++        assert_eq!(read_line_bounded(&mut r, 20).await.unwrap(), LineRead::Eof);
++    }
++
++    #[tokio::test]
++    async fn bounded_reader_exact_boundary() {
++        // max=6: a 5-byte line fits (5 + newline = 6 bytes would be >= max? line len < max).
++        let data = b"12345\n123456\n".to_vec();
++        let mut r = tokio::io::BufReader::with_capacity(3, &data[..]);
++        assert_eq!(
++            read_line_bounded(&mut r, 6).await.unwrap(),
++            LineRead::Line(b"12345".to_vec())
++        );
++        assert_eq!(
++            read_line_bounded(&mut r, 6).await.unwrap(),
++            LineRead::TooLong
++        );
++    }
++}
+diff --git a/src/remotesmith/readiness.rs b/src/remotesmith/readiness.rs
+new file mode 100644
+index 000000000000..11ad439d9166
+--- /dev/null
++++ b/src/remotesmith/readiness.rs
+@@ -0,0 +1,411 @@
++//! Readiness checks (§6.3, AC-55): each one only reads state; none changes a setting.
++//! All of them may block (subprocesses, TCC queries) and run on the collector's readiness thread.
++
++#[cfg(target_os = "macos")]
++use super::protocol::{Permission, PermState};
++use super::protocol::{PermissionStatus, PowerStatus, PrebootStatus, ServiceStatus};
++#[cfg(any(target_os = "macos", windows))]
++use std::process::Command;
++
++#[cfg(target_os = "macos")]
++fn granted(ok: bool) -> PermState {
++    if ok {
++        PermState::Granted
++    } else {
++        PermState::Missing
++    }
++}
++
++/// macOS TCC state of this process, with the same calls upstream uses for its own permission
++/// checks (`is_process_trusted`, `is_can_screen_recording`, `is_can_input_monitoring`), never
++/// prompting. Empty elsewhere.
++pub fn permissions() -> Vec<PermissionStatus> {
++    #[cfg(target_os = "macos")]
++    {
++        use crate::platform::macos;
++        let screen = macos::is_can_screen_recording(false);
++        let audio_detail = if cfg!(feature = "screencapturekit") {
++            "system audio is captured with ScreenCaptureKit, covered by the Screen & System Audio Recording grant"
++        } else {
++            "this build captures no system audio; reported with the Screen Recording grant"
++        };
++        return vec![
++            PermissionStatus {
++                name: Permission::Accessibility,
++                state: granted(macos::is_process_trusted(false)),
++                detail: None,
++            },
++            PermissionStatus {
++                name: Permission::ScreenRecording,
++                state: granted(screen),
++                detail: None,
++            },
++            PermissionStatus {
++                name: Permission::InputMonitoring,
++                state: granted(macos::is_can_input_monitoring(false)),
++                detail: None,
++            },
++            PermissionStatus {
++                name: Permission::SystemAudioRecording,
++                state: granted(screen),
++                detail: Some(audio_detail.into()),
++            },
++        ];
++    }
++    #[allow(unreachable_code)]
++    Vec::new()
++}
++
++/// Is the RemoteSmith service (macOS LaunchDaemon / Windows service) running?
++pub fn service() -> ServiceStatus {
++    #[cfg(target_os = "macos")]
++    {
++        let label = format!("{}_service", crate::get_full_name());
++        return match Command::new("/bin/launchctl").args(["print", "system"]).output() {
++            Ok(out) if out.status.success() => {
++                let text = String::from_utf8_lossy(&out.stdout);
++                match launchd_pid(&text, &label) {
++                    Some(pid) if pid > 0 => ServiceStatus {
++                        running: true,
++                        detail: None,
++                    },
++                    Some(_) => ServiceStatus {
++                        running: false,
++                        detail: Some(format!("{label} is loaded but not running")),
++                    },
++                    None => ServiceStatus {
++                        running: false,
++                        detail: Some(format!("{label} is not installed")),
++                    },
++                }
++            }
++            _ => ServiceStatus {
++                running: false,
++                detail: Some("could not query launchd".into()),
++            },
++        };
++    }
++    #[cfg(windows)]
++    {
++        let running = crate::platform::is_self_service_running();
++        return ServiceStatus {
++            running,
++            detail: (!running).then(|| format!("{} service is not running", crate::get_app_name())),
++        };
++    }
++    #[allow(unreachable_code)]
++    ServiceStatus::default()
++}
++
++/// The pid column of `label` in `launchctl print system`'s services table (0 = not running).
++pub fn launchd_pid(text: &str, label: &str) -> Option<i64> {
++    let mut in_services = false;
++    for line in text.lines() {
++        let t = line.trim();
++        if t.starts_with("services = {") {
++            in_services = true;
++            continue;
++        }
++        if in_services {
++            if t == "}" {
++                break;
++            }
++            let mut f = t.split_whitespace();
++            let pid = f.next();
++            let name = f.last();
++            if name == Some(label) {
++                return pid.and_then(|p| p.parse().ok());
++            }
++        }
++    }
++    None
++}
++
++/// Never sleeps on AC power?
++pub fn power() -> PowerStatus {
++    #[cfg(target_os = "macos")]
++    {
++        return match Command::new("/usr/bin/pmset").args(["-g", "custom"]).output() {
++            Ok(out) if out.status.success() => {
++                parse_pmset_ac_sleep(&String::from_utf8_lossy(&out.stdout))
++            }
++            _ => PowerStatus {
++                sleep_disabled: None,
++                detail: Some("could not run pmset".into()),
++            },
++        };
++    }
++    #[cfg(windows)]
++    {
++        let q = |setting: &str| -> Option<u64> {
++            let out = Command::new("powercfg")
++                .args(["/query", "SCHEME_CURRENT", "SUB_SLEEP", setting])
++                .creation_flags(CREATE_NO_WINDOW)
++                .output()
++                .ok()?;
++            if !out.status.success() {
++                return None;
++            }
++            parse_powercfg_ac(&String::from_utf8_lossy(&out.stdout))
++        };
++        // HibernateEnabled = 0 means hibernation is off system-wide, so the hibernate timer
++        // cannot fire. Missing or unreadable: unknown.
++        let hibernate_enabled = {
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            RegKey::predef(HKEY_LOCAL_MACHINE)
++                .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Power")
++                .and_then(|k| k.get_value::<u32, _>("HibernateEnabled"))
++                .ok()
++                .map(|v| v != 0)
++        };
++        return windows_power(q("STANDBYIDLE"), q("HIBERNATEIDLE"), hibernate_enabled);
++    }
++    #[allow(unreachable_code)]
++    PowerStatus::default()
++}
++
++/// Windows AC power: "never sleeps" only when the sleep timer is positively 0 **and** the
++/// hibernate timer is positively 0 or hibernation is positively disabled. Anything unread is
++/// unknown (fail closed).
++#[cfg_attr(not(windows), allow(dead_code))]
++pub fn windows_power(
++    standby: Option<u64>,
++    hibernate: Option<u64>,
++    hibernate_enabled: Option<bool>,
++) -> PowerStatus {
++    let unknown = |d: &str| PowerStatus {
++        sleep_disabled: None,
++        detail: Some(d.into()),
++    };
++    let Some(s) = standby else {
++        return unknown("could not read the sleep timer (powercfg)");
++    };
++    if s > 0 {
++        return PowerStatus {
++            sleep_disabled: Some(false),
++            detail: Some(format!("on AC the PC sleeps after {} min", s / 60)),
++        };
++    }
++    match (hibernate, hibernate_enabled) {
++        (Some(0), _) | (_, Some(false)) => PowerStatus {
++            sleep_disabled: Some(true),
++            detail: None,
++        },
++        (Some(h), _) => PowerStatus {
++            sleep_disabled: Some(false),
++            detail: Some(format!("on AC the PC hibernates after {} min", h / 60)),
++        },
++        (None, _) => unknown("could not read the hibernate timer (powercfg)"),
++    }
++}
++
++#[cfg(windows)]
++use std::os::windows::process::CommandExt;
++#[cfg(windows)]
++const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++
++/// `pmset -g custom`: the `sleep` value of the "AC Power:" section (desktops list only that one).
++pub fn parse_pmset_ac_sleep(text: &str) -> PowerStatus {
++    let mut section = "";
++    for line in text.lines() {
++        if !line.starts_with(' ') && line.trim_end().ends_with(':') {
++            section = line.trim_end();
++            continue;
++        }
++        if section != "AC Power:" {
++            continue;
++        }
++        let mut f = line.split_whitespace();
++        if f.next() == Some("sleep") {
++            return match f.next().and_then(|v| v.parse::<u64>().ok()) {
++                Some(0) => PowerStatus {
++                    sleep_disabled: Some(true),
++                    detail: None,
++                },
++                Some(m) => PowerStatus {
++                    sleep_disabled: Some(false),
++                    detail: Some(format!("on AC power the Mac sleeps after {m} min idle")),
++                },
++                None => break,
++            };
++        }
++    }
++    PowerStatus {
++        sleep_disabled: None,
++        detail: Some("no AC sleep setting in pmset output".into()),
++    }
++}
++
++#[cfg_attr(not(windows), allow(dead_code))]
++/// `powercfg /query ... <setting>`: the AC value. The labels are localized, so take the
++/// second-to-last hex value of the output, which is always "Current AC Power Setting Index"
++/// (followed by the DC one).
++pub fn parse_powercfg_ac(text: &str) -> Option<u64> {
++    let vals: Vec<u64> = text
++        .lines()
++        .filter_map(|l| {
++            let i = l.rfind("0x")?;
++            let hex = l[i + 2..].trim();
++            (!hex.is_empty() && hex.len() <= 16)
++                .then(|| u64::from_str_radix(hex, 16).ok())
++                .flatten()
++        })
++        .collect();
++    (vals.len() >= 2).then(|| vals[vals.len() - 2])
++}
++
++/// Would a restart stop at a pre-boot unlock (ASM-1)? macOS: FileVault on (Apple silicon asks
++/// for the password before macOS and RustDesk start). Windows: a BitLocker OS-volume protector
++/// that needs a PIN, password or startup key.
++pub fn preboot() -> PrebootStatus {
++    #[cfg(target_os = "macos")]
++    {
++        return match Command::new("/usr/bin/fdesetup").arg("status").output() {
++            Ok(out) => parse_fdesetup(&String::from_utf8_lossy(&out.stdout)),
++            Err(_) => PrebootStatus {
++                detected: None,
++                detail: Some("could not run fdesetup".into()),
++            },
++        };
++    }
++    #[cfg(windows)]
++    {
++        // Get-BitLockerVolume needs admin: this runs in the SYSTEM server (host facts).
++        // Get-BitLockerVolume needs admin (this runs in the SYSTEM server, via the host facts)
++        // and is missing where the BitLocker module is not installed (e.g. Windows Home); the
++        // WMI class behind it answers there too, and its absence means no BitLocker at all.
++        // KeyProtectorType numbers: docs for Win32_EncryptableVolume.GetKeyProtectorType.
++        let script = r#"$ErrorActionPreference='Stop'
++try {
++  $v = Get-BitLockerVolume -MountPoint $env:SystemDrive
++  "status=$($v.ProtectionStatus)"
++  $v.KeyProtector | ForEach-Object { "protector=$($_.KeyProtectorType)" }
++} catch [System.Management.Automation.CommandNotFoundException] {
++  try {
++    $w = Get-CimInstance -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'"
++  } catch {
++    # Only a missing namespace/class proves BitLocker is absent; anything else is a failure.
++    $c = "$($_.Exception.NativeErrorCode)"
++    if ($c -eq 'InvalidNamespace' -or $c -eq 'InvalidClass') { "status=Absent" } else { "status=Error" }
++    exit 0
++  }
++  if (-not $w) { "status=Error"; exit 0 }
++  $r = Invoke-CimMethod -InputObject $w -MethodName GetProtectionStatus
++  if ($r.ReturnValue -ne 0) { "status=Error"; exit 0 }
++  switch ([int]$r.ProtectionStatus) { 0 { "status=Off" } 1 { "status=On" } default { "status=Unknown" } }
++  $names = @{1='Tpm';2='ExternalKey';3='RecoveryPassword';4='TpmPin';5='TpmStartupKey';6='TpmPinStartupKey';7='PublicKey';8='Password';9='TpmNetworkKey';10='AdAccountOrGroup'}
++  $k = Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectors -Arguments @{KeyProtectorType=[uint32]0}
++  if ($k.ReturnValue -ne 0) { "protector=QueryFailed"; exit 0 }
++  foreach ($i in $k.VolumeKeyProtectorID) {
++    $t = Invoke-CimMethod -InputObject $w -MethodName GetKeyProtectorType -Arguments @{VolumeKeyProtectorID=$i}
++    if ($t.ReturnValue -ne 0) { "protector=QueryFailed"; continue }
++    $n = $names[[int]$t.KeyProtectorType]
++    if ($n) { "protector=$n" } else { "protector=Type$($t.KeyProtectorType)" }
++  }
++}"#;
++        return match Command::new("powershell")
++            .args(["-NoProfile", "-NonInteractive", "-Command", script])
++            .creation_flags(CREATE_NO_WINDOW)
++            .output()
++        {
++            Ok(out) if out.status.success() => {
++                parse_bitlocker(&String::from_utf8_lossy(&out.stdout))
++            }
++            _ => PrebootStatus {
++                detected: None,
++                detail: Some("could not read BitLocker state (Get-BitLockerVolume)".into()),
++            },
++        };
++    }
++    #[allow(unreachable_code)]
++    PrebootStatus::default()
++}
++
++pub fn parse_fdesetup(text: &str) -> PrebootStatus {
++    if text.contains("FileVault is On") {
++        PrebootStatus {
++            detected: Some(true),
++            detail: Some(
++                "FileVault is on: after a restart the Mac waits for a password before RemoteSmith starts"
++                    .into(),
++            ),
++        }
++    } else if text.contains("FileVault is Off") {
++        PrebootStatus {
++            detected: Some(false),
++            detail: None,
++        }
++    } else {
++        PrebootStatus {
++            detected: None,
++            detail: Some("unrecognised fdesetup output".into()),
++        }
++    }
++}
++
++#[cfg_attr(not(windows), allow(dead_code))]
++/// Output of the PowerShell above: `status=On|Off|Absent|Unknown|Error` and one
++/// `protector=<KeyProtectorType>` per protector (enum names, not localized).
++///
++/// Fail closed: "no pre-boot unlock" needs positive evidence. BitLocker off or absent, or
++/// protection on with a TPM-only protector and no protector that prompts before boot. A volume
++/// with only recovery/network/unrecognised protectors, a failed query or an unknown status is
++/// unknown.
++pub fn parse_bitlocker(text: &str) -> PrebootStatus {
++    const BLOCKING: [&str; 5] = ["TpmPin", "TpmPinStartupKey", "TpmStartupKey", "Password", "ExternalKey"];
++    const AUXILIARY: [&str; 4] = ["RecoveryPassword", "PublicKey", "AdAccountOrGroup", "TpmNetworkKey"];
++    let mut status = None;
++    let mut protectors: Vec<String> = Vec::new();
++    for line in text.lines().map(str::trim) {
++        if let Some(s) = line.strip_prefix("status=") {
++            status = Some(s.to_owned());
++        } else if let Some(p) = line.strip_prefix("protector=") {
++            protectors.push(p.to_owned());
++        }
++    }
++    let unknown = |d: String| PrebootStatus {
++        detected: None,
++        detail: Some(d),
++    };
++    match status.as_deref() {
++        Some("Absent") => PrebootStatus {
++            detected: Some(false),
++            detail: Some("BitLocker is not available on this edition".into()),
++        },
++        Some("Off") => PrebootStatus {
++            detected: Some(false),
++            detail: None,
++        },
++        Some("On") => {
++            let blocking: Vec<&str> = protectors
++                .iter()
++                .map(String::as_str)
++                .filter(|p| BLOCKING.contains(p))
++                .collect();
++            if !blocking.is_empty() {
++                return PrebootStatus {
++                    detected: Some(true),
++                    detail: Some(format!(
++                        "BitLocker asks for {} before Windows starts",
++                        blocking.join(" + ")
++                    )),
++                };
++            }
++            if let Some(odd) = protectors
++                .iter()
++                .find(|p| *p != "Tpm" && !AUXILIARY.contains(&p.as_str()))
++            {
++                return unknown(format!("unrecognised BitLocker protector ({odd})"));
++            }
++            if protectors.iter().any(|p| p == "Tpm") {
++                PrebootStatus {
++                    detected: Some(false),
++                    detail: Some("BitLocker unlocks with the TPM alone".into()),
++                }
++            } else {
++                unknown("BitLocker has no TPM-only protector: a restart may need a recovery key".into())
++            }
++        }
++        _ => unknown("could not read the BitLocker state".into()),
++    }
++}
+diff --git a/src/remotesmith/relay.rs b/src/remotesmith/relay.rs
+new file mode 100644
+index 000000000000..13d2c513ed6d
+--- /dev/null
++++ b/src/remotesmith/relay.rs
+@@ -0,0 +1,119 @@
++//! Windows `--tray`: fetch the host facts from the SYSTEM `--server` over RustDesk's main IPC
++//! (`Data::RemoteSmithHost`), the same way upstream's tray polls `ControlledSessionCount`.
++//! Polled every 250 ms so an inbound session starting or ending reaches the sidecar well inside
++//! the 500 ms of docs/IPC.md §6.2.
++
++use super::host::HostFacts;
++use super::sessions;
++use crate::ipc::Data;
++use hbb_common::config::{Config, Config2};
++use hbb_common::{log, tokio};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++const POLL: Duration = Duration::from_millis(250);
++/// Facts older than this count as "service not answering".
++const STALE: Duration = Duration::from_secs(3);
++
++#[derive(Clone)]
++pub struct Relay {
++    latest: Arc<Mutex<Option<(Instant, HostFacts)>>>,
++}
++
++impl Relay {
++    pub fn facts(&self) -> Option<HostFacts> {
++        let l = self.latest.lock().unwrap_or_else(|e| e.into_inner());
++        l.as_ref()
++            .filter(|(at, _)| at.elapsed() < STALE)
++            .map(|(_, f)| f.clone())
++    }
++}
++
++pub fn start() -> Relay {
++    let relay = Relay {
++        latest: Default::default(),
++    };
++    let latest = relay.latest.clone();
++    let spawned = std::thread::Builder::new()
++        .name("remotesmith-relay".into())
++        .spawn(move || {
++            let rt = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(e) => {
++                    log::error!("remotesmith relay: no runtime: {e}");
++                    return;
++                }
++            };
++            rt.block_on(run(latest));
++        });
++    if let Err(e) = spawned {
++        log::error!("remotesmith relay: cannot start: {e}");
++    }
++    relay
++}
++
++fn set(latest: &Mutex<Option<(Instant, HostFacts)>>, facts: Option<HostFacts>) {
++    let mut l = latest.lock().unwrap_or_else(|e| e.into_inner());
++    let changed = l.as_ref().map(|(_, f)| f) != facts.as_ref();
++    *l = facts.map(|f| (Instant::now(), f));
++    drop(l);
++    if changed {
++        sessions::poke();
++    }
++}
++
++async fn run(latest: Arc<Mutex<Option<(Instant, HostFacts)>>>) {
++    loop {
++        match crate::ipc::connect(1000, "").await {
++            Ok(mut c) => {
++                // Sync the user-side config copy (ID, rendezvous server: used by the presence
++                // query) once per connection, as upstream's UI does at start.
++                if c.send(&Data::SyncConfig(None)).await.is_err() {
++                    set(&latest, None);
++                    tokio::time::sleep(Duration::from_secs(1)).await;
++                    continue;
++                }
++                'conn: loop {
++                    if c.send(&Data::RemoteSmithHost(None)).await.is_err() {
++                        break 'conn;
++                    }
++                    let deadline = Instant::now() + Duration::from_secs(1);
++                    loop {
++                        let left = deadline.saturating_duration_since(Instant::now());
++                        if left.is_zero() {
++                            // A slow answer (or an older server without the handler): keep the
++                            // last facts; `Relay::facts` drops them once they are 3 s old.
++                            break;
++                        }
++                        match c.next_timeout2(left.as_millis().max(1) as u64).await {
++                            Some(Ok(Some(Data::RemoteSmithHost(Some(json))))) => {
++                                match HostFacts::from_json(&json) {
++                                    Some(f) => set(&latest, Some(f)),
++                                    None => log::warn!("remotesmith relay: unreadable host facts"),
++                                }
++                                break;
++                            }
++                            Some(Ok(Some(Data::SyncConfig(Some(configs))))) => {
++                                let (config, config2) = *configs;
++                                Config::set(config);
++                                Config2::set(config2);
++                            }
++                            // Other traffic, or a message this build cannot parse.
++                            Some(Ok(_)) => {}
++                            // Timed out: the deadline check above handles it.
++                            None => {}
++                            Some(Err(_)) => break 'conn,
++                        }
++                    }
++                    tokio::time::sleep(POLL).await;
++                }
++            }
++            Err(e) => log::debug!("remotesmith relay: service IPC not reachable: {e}"),
++        }
++        set(&latest, None);
++        tokio::time::sleep(Duration::from_secs(1)).await;
++    }
++}
+diff --git a/src/remotesmith/server.rs b/src/remotesmith/server.rs
+new file mode 100644
+index 000000000000..9ad63a500f76
+--- /dev/null
++++ b/src/remotesmith/server.rs
+@@ -0,0 +1,551 @@
++//! The endpoint itself (docs/IPC.md §2-§10), ported from the sidecar's reference server
++//! (`sidecar/src/fake_fork.rs`): hello first, version negotiation, per-connection isolation,
++//! bounded reads and writes, malformed-input handling, client cap, peer-uid check on macOS and a
++//! user-only DACL on Windows.
++
++use super::collect::{Shared, Snapshot};
++use super::protocol::{
++    decode, encode, negotiate, read_line_bounded, DecodeError, ErrorBody, ErrorCode, LineRead,
++    Peer, Request, ServerMessage, Status, Topic, MAX_LINE,
++};
++use hbb_common::log;
++use hbb_common::tokio::{
++    self,
++    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
++    sync::{mpsc, Semaphore},
++};
++use std::io;
++use std::sync::Arc;
++use std::time::Duration;
++
++/// Versions this fork speaks.
++pub const MIN_VERSION: u32 = 1;
++pub const MAX_VERSION: u32 = 1;
++
++#[derive(Debug, Clone)]
++pub struct ServerConfig {
++    pub hello_deadline: Duration,
++    pub idle_timeout: Duration,
++    pub write_timeout: Duration,
++    pub max_clients: usize,
++    pub max_malformed: u32,
++    /// Actually start session windows (tests turn this off).
++    pub launch: bool,
++}
++
++impl Default for ServerConfig {
++    fn default() -> Self {
++        Self {
++            hello_deadline: Duration::from_secs(5),
++            idle_timeout: Duration::from_secs(60),
++            write_timeout: Duration::from_secs(5),
++            max_clients: 8,
++            max_malformed: 20,
++            launch: true,
++        }
++    }
++}
++
++// ---------------------------------------------------------------- listener (per OS)
++
++#[cfg(unix)]
++pub struct Listener {
++    inner: tokio::net::UnixListener,
++    path: std::path::PathBuf,
++    /// (dev, ino) of the socket we bound, so Drop never unlinks a successor's socket.
++    ident: (u64, u64),
++}
++
++#[cfg(unix)]
++impl Drop for Listener {
++    fn drop(&mut self) {
++        use std::os::unix::fs::MetadataExt;
++        if let Ok(m) = std::fs::symlink_metadata(&self.path) {
++            if (m.dev(), m.ino()) == self.ident {
++                let _ = std::fs::remove_file(&self.path);
++            }
++        }
++    }
++}
++
++#[cfg(unix)]
++pub fn euid() -> u32 {
++    // SAFETY: geteuid has no preconditions and cannot fail.
++    unsafe { hbb_common::libc::geteuid() }
++}
++
++/// `dir` must be a real directory (not a symlink) owned by us with no group/other access.
++#[cfg(unix)]
++pub fn check_private_dir(dir: &std::path::Path) -> io::Result<()> {
++    use std::os::unix::fs::MetadataExt;
++    let meta = std::fs::symlink_metadata(dir)?;
++    if !meta.file_type().is_dir() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("{} is not a directory", dir.display()),
++        ));
++    }
++    if meta.uid() != euid() || meta.mode() & 0o077 != 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            format!(
++                "{} must be owned by uid {} with mode 0700 (is uid {}, mode {:o}); refusing",
++                dir.display(),
++                euid(),
++                meta.uid(),
++                meta.mode() & 0o7777
++            ),
++        ));
++    }
++    Ok(())
++}
++
++/// Bind the endpoint: the parent directory must be private to this user (created 0700 if
++/// missing), a stale socket of ours is replaced, a live one is never stolen.
++#[cfg(unix)]
++pub async fn bind(endpoint: &str) -> io::Result<Listener> {
++    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
++    let path = std::path::PathBuf::from(endpoint);
++    let dir = path
++        .parent()
++        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no parent"))?;
++    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
++        Ok(()) => {}
++        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
++        Err(e) => return Err(e),
++    }
++    check_private_dir(dir)?;
++    if let Ok(meta) = std::fs::symlink_metadata(&path) {
++        if meta.uid() != euid() {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "endpoint owned by another user",
++            ));
++        }
++        if tokio::net::UnixStream::connect(&path).await.is_ok() {
++            return Err(io::Error::new(
++                io::ErrorKind::AddrInUse,
++                "another server is listening",
++            ));
++        }
++        std::fs::remove_file(&path)?;
++    }
++    let inner = tokio::net::UnixListener::bind(&path)?;
++    // The 0700 directory already keeps other users out; 0600 is belt and braces.
++    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++    let m = std::fs::symlink_metadata(&path)?;
++    Ok(Listener {
++        inner,
++        path,
++        ident: (m.dev(), m.ino()),
++    })
++}
++
++#[cfg(unix)]
++impl Listener {
++    async fn accept(&mut self) -> io::Result<tokio::net::UnixStream> {
++        loop {
++            let (s, _) = self.inner.accept().await?;
++            // Peer-credential check: only our own user may talk to us.
++            match s.peer_cred() {
++                Ok(c) if c.uid() == euid() => return Ok(s),
++                Ok(c) => log::warn!("remotesmith ipc: rejected client with uid {}", c.uid()),
++                Err(e) => log::warn!("remotesmith ipc: rejected client without peer credentials ({e})"),
++            }
++        }
++    }
++}
++
++#[cfg(windows)]
++pub struct Listener {
++    name: String,
++    next: tokio::net::windows::named_pipe::NamedPipeServer,
++}
++
++#[cfg(windows)]
++fn create_pipe(
++    name: &str,
++    first: bool,
++) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
++    use tokio::net::windows::named_pipe::ServerOptions;
++    static SA: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    let sa = match SA.get() {
++        Some(p) => *p,
++        None => {
++            let p = super::winsec::user_only_security_attributes()? as usize;
++            *SA.get_or_init(|| p)
++        }
++    };
++    let mut opts = ServerOptions::new();
++    opts.first_pipe_instance(first).reject_remote_clients(true);
++    // SAFETY: `sa` points to a leaked, valid SECURITY_ATTRIBUTES.
++    unsafe { opts.create_with_security_attributes_raw(name, sa as *mut std::ffi::c_void) }
++}
++
++/// Create the pipe. `FILE_FLAG_FIRST_PIPE_INSTANCE`: if someone squatted the name, this fails.
++#[cfg(windows)]
++pub async fn bind(endpoint: &str) -> io::Result<Listener> {
++    Ok(Listener {
++        name: endpoint.to_string(),
++        next: create_pipe(endpoint, true)?,
++    })
++}
++
++#[cfg(windows)]
++impl Listener {
++    async fn accept(&mut self) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
++        if let Err(e) = self.next.connect().await {
++            // e.g. ERROR_NO_DATA: the client left before we connected. Start a fresh instance.
++            self.next = create_pipe(&self.name, false)?;
++            return Err(e);
++        }
++        let fresh = create_pipe(&self.name, false)?;
++        Ok(std::mem::replace(&mut self.next, fresh))
++    }
++}
++
++// ---------------------------------------------------------------- serving
++
++/// Serve forever. Each connection runs in its own task; one misbehaving client can never affect
++/// another, nor anything outside this thread (DEC-5, AC-25).
++pub async fn serve(mut listener: Listener, cfg: ServerConfig, shared: Shared) {
++    let slots = Arc::new(Semaphore::new(cfg.max_clients));
++    let mut conns = tokio::task::JoinSet::new();
++    loop {
++        let stream = tokio::select! {
++            s = listener.accept() => match s {
++                Ok(s) => s,
++                Err(e) => {
++                    // Transient (EMFILE, ECONNABORTED, a client that vanished): never let one
++                    // failed accept take the endpoint down for good.
++                    log::warn!("remotesmith ipc: accept failed: {e}");
++                    tokio::time::sleep(Duration::from_millis(100)).await;
++                    continue;
++                }
++            },
++            Some(_) = conns.join_next(), if !conns.is_empty() => continue,
++        };
++        let Ok(permit) = slots.clone().try_acquire_owned() else {
++            drop(stream); // over the client cap: close immediately
++            continue;
++        };
++        let (cfg, shared) = (cfg.clone(), shared.clone());
++        conns.spawn(async move {
++            if let Err(e) = handle_conn(stream, cfg, shared).await {
++                log::debug!("remotesmith ipc: client ended: {e}");
++            }
++            drop(permit);
++        });
++    }
++}
++
++async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str, t: Duration) -> io::Result<()> {
++    debug_assert!(line.len() <= MAX_LINE);
++    match tokio::time::timeout(t, w.write_all(line.as_bytes())).await {
++        Ok(r) => r,
++        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "client not reading")),
++    }
++}
++
++fn err(code: ErrorCode, msg: impl Into<String>) -> ServerMessage {
++    ServerMessage::Error {
++        error: ErrorBody::new(code, msg),
++    }
++}
++
++/// Encode a message within [`MAX_LINE`] (docs/IPC.md §3): an over-long peer list is truncated
++/// to the longest prefix that fits, an over-long session list likewise (keeping the oldest
++/// sessions, so the badge never disappears); anything else that cannot fit becomes `internal`.
++pub fn encode_bounded(v: u32, id: Option<u64>, msg: ServerMessage) -> String {
++    let line = encode(v, id, &msg);
++    if line.len() <= MAX_LINE {
++        return line;
++    }
++    let fits = |m: &ServerMessage| encode(v, id, m).len() <= MAX_LINE;
++    // Largest n in [0, len] with fits(make(n)), by binary search (fits is monotone in n).
++    fn largest<F: Fn(usize) -> bool>(len: usize, ok: F) -> usize {
++        let (mut lo, mut hi) = (0usize, len);
++        while lo < hi {
++            let mid = (lo + hi + 1) / 2;
++            if ok(mid) {
++                lo = mid;
++            } else {
++                hi = mid - 1;
++            }
++        }
++        lo
++    }
++    match msg {
++        ServerMessage::Peers { peers } => {
++            let make = |n: usize| ServerMessage::Peers {
++                peers: peers[..n].to_vec(),
++            };
++            let n = largest(peers.len(), |n| fits(&make(n)));
++            log::warn!("remotesmith ipc: peer list truncated to {n} of {}", peers.len());
++            encode(v, id, make(n))
++        }
++        ServerMessage::Status { status } => {
++            let make = |n: usize| {
++                let mut s: Status = (*status).clone();
++                s.inbound_sessions.truncate(n);
++                ServerMessage::Status {
++                    status: Box::new(s),
++                }
++            };
++            let n = largest(status.inbound_sessions.len(), |n| fits(&make(n)));
++            let m = make(n);
++            if fits(&m) {
++                encode(v, id, m)
++            } else {
++                encode(v, id, err(ErrorCode::Internal, "status too large"))
++            }
++        }
++        _ => encode(v, id, err(ErrorCode::Internal, "reply too large")),
++    }
++}
++
++/// Last values pushed to one client, so events go out only for the topic that changed.
++#[derive(Default)]
++struct Pushed {
++    status: Option<Status>,
++    peers: Option<Vec<Peer>>,
++}
++
++async fn push<W: AsyncWrite + Unpin>(
++    w: &mut W,
++    v: u32,
++    topics: &[Topic],
++    s: &Snapshot,
++    pushed: &mut Pushed,
++    force: bool,
++    t: Duration,
++) -> io::Result<()> {
++    if topics.contains(&Topic::Status) && (force || pushed.status.as_ref() != Some(&s.status)) {
++        let m = ServerMessage::Status {
++            status: Box::new(s.status.clone()),
++        };
++        write_line(w, &encode_bounded(v, None, m), t).await?;
++        pushed.status = Some(s.status.clone());
++    }
++    if topics.contains(&Topic::Peers) && (force || pushed.peers.as_ref() != Some(&s.peers)) {
++        let m = ServerMessage::Peers {
++            peers: s.peers.clone(),
++        };
++        write_line(w, &encode_bounded(v, None, m), t).await?;
++        pushed.peers = Some(s.peers.clone());
++    }
++    Ok(())
++}
++
++/// A peer id that is safe to put on a command line (it must also be one of our saved peers).
++pub fn valid_peer_id(id: &str) -> bool {
++    !id.is_empty()
++        && id.len() <= 64
++        && !id.starts_with('-')
++        && id
++            .chars()
++            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
++}
++
++/// Open a normal outgoing session window, exactly as `<App> --connect <id>` does: it hands the
++/// request to the running main window (or becomes it). No credential is passed: the session
++/// uses the saved one (docs/IPC.md §1.2).
++///
++/// macOS: through LaunchServices (`open -n -a <bundle> --args ...`), so the app is never a child
++/// of the per-user server's launchd job (a restart of that job would take the window with it).
++fn launch_session(peer_id: &str) -> io::Result<()> {
++    #[cfg(target_os = "macos")]
++    let child = {
++        let exe = std::env::current_exe()?;
++        let bundle = exe
++            .ancestors()
++            .find(|p| p.extension().map_or(false, |e| e == "app"))
++            .map(|p| p.to_path_buf());
++        match bundle {
++            Some(b) => std::process::Command::new("/usr/bin/open")
++                .arg("-n")
++                .arg("-a")
++                .arg(&b)
++                .args(["--args", "--connect", peer_id])
++                .spawn()?,
++            None => crate::run_me(vec!["--connect", peer_id])?,
++        }
++    };
++    #[cfg(not(target_os = "macos"))]
++    let child = crate::run_me(vec!["--connect", peer_id])?;
++    let mut child = child;
++    // Reap it (`open`, or a process that hands the request to a running window, exits at once).
++    std::thread::Builder::new()
++        .name("remotesmith-connect".into())
++        .spawn(move || {
++            child.wait().ok();
++        })?;
++    Ok(())
++}
++
++async fn handle_connect(peer_id: String, cfg: &ServerConfig, shared: &Shared) -> ServerMessage {
++    let peer = shared.snap.borrow().peers.iter().find(|p| p.id == peer_id).cloned();
++    let Some(peer) = peer else {
++        return err(ErrorCode::PeerUnknown, format!("no peer {}", clamp_id(&peer_id)));
++    };
++    if !valid_peer_id(&peer.id) {
++        return err(ErrorCode::PeerUnavailable, "peer id is not usable");
++    }
++    // Always open the session window for a saved peer, whatever the presence guess says: the
++    // window runs RustDesk's own LAN-first/ID/relay attempts and shows the real outcome, and
++    // the tray already shows the presence reason (docs/IPC.md §5, §6.2).
++    if cfg.launch {
++        let id = peer.id.clone();
++        match tokio::task::spawn_blocking(move || launch_session(&id)).await {
++            Ok(Ok(())) => {}
++            Ok(Err(e)) => {
++                log::error!("remotesmith ipc: cannot start a session window: {e}");
++                return err(ErrorCode::Internal, "could not start a session window");
++            }
++            Err(_) => return err(ErrorCode::Internal, "could not start a session window"),
++        }
++    }
++    log::info!("remotesmith ipc: connect {} started", peer.id);
++    ServerMessage::ConnectStarted { peer_id: peer.id }
++}
++
++fn clamp_id(s: &str) -> String {
++    s.chars().take(64).collect()
++}
++
++async fn handle_conn<S>(stream: S, cfg: ServerConfig, shared: Shared) -> io::Result<()>
++where
++    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
++{
++    let (rd, mut wr) = tokio::io::split(stream);
++    let (tx, mut lines) = mpsc::channel::<LineRead>(16);
++    let reader = tokio::spawn(async move {
++        let mut rd = BufReader::new(rd);
++        loop {
++            let r = read_line_bounded(&mut rd, MAX_LINE)
++                .await
++                .unwrap_or(LineRead::Eof);
++            let eof = r == LineRead::Eof;
++            if tx.send(r).await.is_err() || eof {
++                return;
++            }
++        }
++    });
++    struct Abort(tokio::task::JoinHandle<()>);
++    impl Drop for Abort {
++        fn drop(&mut self) {
++            self.0.abort();
++        }
++    }
++    let _abort = Abort(reader);
++
++    let wt = cfg.write_timeout;
++    let mut snap = shared.snap.clone();
++    let mut version: Option<u32> = None;
++    let mut topics: Vec<Topic> = Vec::new();
++    let mut pushed = Pushed::default();
++    let mut malformed = 0u32;
++    let hello_deadline = tokio::time::Instant::now() + cfg.hello_deadline;
++    let mut idle_deadline = tokio::time::Instant::now() + cfg.idle_timeout;
++
++    loop {
++        tokio::select! {
++            line = lines.recv() => {
++                idle_deadline = tokio::time::Instant::now() + cfg.idle_timeout;
++                let v = version.unwrap_or(1);
++                let bytes = match line {
++                    None | Some(LineRead::Eof) => return Ok(()),
++                    Some(LineRead::TooLong) => {
++                        malformed += 1;
++                        write_line(&mut wr, &encode(v, None, err(ErrorCode::LineTooLong, "line exceeds 1 MiB")), wt).await?;
++                        if malformed >= cfg.max_malformed { return Ok(()); }
++                        continue;
++                    }
++                    Some(LineRead::Line(b)) => b,
++                };
++                let env = match decode::<Request>(&bytes) {
++                    Ok(e) => e,
++                    Err((e, id)) => {
++                        malformed += 1;
++                        let code = if e == DecodeError::TooLong { ErrorCode::LineTooLong } else { ErrorCode::BadRequest };
++                        write_line(&mut wr, &encode(v, id, err(code, "malformed request")), wt).await?;
++                        if malformed >= cfg.max_malformed { return Ok(()); }
++                        continue;
++                    }
++                };
++                if let Some(v) = version {
++                    if env.v != v {
++                        malformed += 1;
++                        write_line(&mut wr, &encode(v, env.id, err(ErrorCode::BadRequest, format!("negotiated v{v}, got v{}", env.v))), wt).await?;
++                        if malformed >= cfg.max_malformed { return Ok(()); }
++                        continue;
++                    }
++                }
++                let id = env.id;
++                match (version, env.body) {
++                    (Some(v), Request::Hello { .. }) => {
++                        write_line(&mut wr, &encode(v, id, err(ErrorCode::BadRequest, "already negotiated")), wt).await?;
++                    }
++                    (None, Request::Hello { min_version, max_version, .. }) => {
++                        match negotiate(min_version, max_version, MIN_VERSION, MAX_VERSION) {
++                            Some(chosen) => {
++                                version = Some(chosen);
++                                write_line(&mut wr, &encode(chosen, id, ServerMessage::HelloOk {
++                                    version: chosen,
++                                    min_version: MIN_VERSION,
++                                    max_version: MAX_VERSION,
++                                    server: "RemoteSmith".into(),
++                                    server_version: crate::VERSION.to_owned(),
++                                }), wt).await?;
++                            }
++                            None => {
++                                let mut e = ErrorBody::new(ErrorCode::VersionMismatch, format!(
++                                    "server speaks {MIN_VERSION}-{MAX_VERSION}, client {min_version}-{max_version}"));
++                                e.min_version = Some(MIN_VERSION);
++                                e.max_version = Some(MAX_VERSION);
++                                write_line(&mut wr, &encode(1, id, ServerMessage::Error { error: e }), wt).await?;
++                                return Ok(());
++                            }
++                        }
++                    }
++                    (None, _) => {
++                        write_line(&mut wr, &encode(1, id, err(ErrorCode::HelloRequired, "send hello first")), wt).await?;
++                    }
++                    (Some(v), Request::GetStatus) => {
++                        let status = snap.borrow().status.clone();
++                        write_line(&mut wr, &encode_bounded(v, id, ServerMessage::Status { status: Box::new(status) }), wt).await?;
++                    }
++                    (Some(v), Request::ListPeers) => {
++                        let peers = snap.borrow().peers.clone();
++                        write_line(&mut wr, &encode_bounded(v, id, ServerMessage::Peers { peers }), wt).await?;
++                    }
++                    (Some(v), Request::Ping) => write_line(&mut wr, &encode(v, id, ServerMessage::Pong), wt).await?,
++                    (Some(v), Request::Subscribe { topics: t }) => {
++                        let mut t: Vec<Topic> = t.into_iter().filter(|t| *t != Topic::Unknown).collect();
++                        t.dedup();
++                        topics = t;
++                        write_line(&mut wr, &encode(v, id, ServerMessage::Subscribed { topics: topics.clone() }), wt).await?;
++                        let s = snap.borrow_and_update().clone();
++                        push(&mut wr, v, &topics, &s, &mut pushed, true, wt).await?;
++                    }
++                    (Some(v), Request::Connect { peer_id }) => {
++                        // Extra fields (e.g. a password) were dropped by the decoder: the fork
++                        // never reads credentials from IPC.
++                        let reply = handle_connect(peer_id, &cfg, &shared).await;
++                        write_line(&mut wr, &encode(v, id, reply), wt).await?;
++                    }
++                    (Some(v), Request::Unknown) => {
++                        write_line(&mut wr, &encode(v, id, err(ErrorCode::UnknownType, "unknown request type")), wt).await?;
++                    }
++                }
++            }
++            changed = snap.changed(), if version.is_some() && !topics.is_empty() => {
++                if changed.is_err() { return Ok(()); }
++                let s = snap.borrow_and_update().clone();
++                push(&mut wr, version.unwrap_or(1), &topics, &s, &mut pushed, false, wt).await?;
++            }
++            _ = tokio::time::sleep_until(hello_deadline), if version.is_none() => return Ok(()),
++            _ = tokio::time::sleep_until(idle_deadline) => return Ok(()),
++        }
++    }
++}
+diff --git a/src/remotesmith/sessions.rs b/src/remotesmith/sessions.rs
+new file mode 100644
+index 000000000000..a7498aff1785
+--- /dev/null
++++ b/src/remotesmith/sessions.rs
+@@ -0,0 +1,380 @@
++//! Inbound-session registry (§6.2a, AC-60) and the cold-boot ledger (§6.3, AC-55).
++//!
++//! `server::connection` calls [`opened`] when a connection is authorized and [`closed`] when it
++//! goes away (the `AuthedConnID` RAII guard). Both take one short mutex and wake whoever waits
++//! in [`wait_change`]; they never block on I/O. Anything slow (deciding whether the connection
++//! is a cold-boot login-screen connection and persisting it) runs on a recorder thread.
++
++use hbb_common::log;
++use serde_derive::{Deserialize, Serialize};
++use std::sync::{Condvar, Mutex};
++use std::time::Duration;
++
++/// An authorized inbound connection.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Inbound {
++    pub conn_id: i32,
++    /// The controlling peer's RustDesk ID, as it logged in.
++    pub peer_id: String,
++    /// The name it logged in with (its user/host name).
++    pub name: String,
++    /// Unix seconds.
++    pub since: u64,
++    /// Full remote control (as opposed to file transfer, terminal, camera, port forward).
++    pub remote: bool,
++}
++
++struct Registry {
++    sessions: Vec<Inbound>,
++    generation: u64,
++}
++
++static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
++    sessions: Vec::new(),
++    generation: 0,
++});
++static CHANGED: Condvar = Condvar::new();
++
++pub fn now_secs() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++fn lock() -> std::sync::MutexGuard<'static, Registry> {
++    // A poisoned registry still holds valid data (pushes and retains cannot half-apply).
++    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// An inbound connection was authorized. Every kind counts as an inbound session for the badge
++/// (over-reporting is the safe side of a security indicator); only `remote` ones count for the
++/// cold-boot ledger.
++pub fn opened(conn_id: i32, remote: bool, peer_id: &str, name: &str) {
++    let entry = Inbound {
++        conn_id,
++        peer_id: peer_id.to_owned(),
++        name: name.to_owned(),
++        since: now_secs(),
++        remote,
++    };
++    {
++        let mut r = lock();
++        r.sessions.retain(|s| s.conn_id != conn_id);
++        r.sessions.push(entry.clone());
++        r.generation = r.generation.wrapping_add(1);
++    }
++    CHANGED.notify_all();
++    if remote {
++        ledger::on_remote_session(entry);
++    }
++}
++
++/// The connection's authorization guard dropped.
++pub fn closed(conn_id: i32) {
++    {
++        let mut r = lock();
++        let before = r.sessions.len();
++        r.sessions.retain(|s| s.conn_id != conn_id);
++        if r.sessions.len() == before {
++            return;
++        }
++        r.generation = r.generation.wrapping_add(1);
++    }
++    CHANGED.notify_all();
++}
++
++/// Current sessions, oldest first, and the registry generation.
++pub fn snapshot() -> (Vec<Inbound>, u64) {
++    let r = lock();
++    (r.sessions.clone(), r.generation)
++}
++
++/// Wait until the registry generation differs from `seen`, or `timeout` passes. Returns the
++/// current generation.
++pub fn wait_change(seen: u64, timeout: Duration) -> u64 {
++    let r = lock();
++    if r.generation != seen {
++        return r.generation;
++    }
++    let (r, _) = CHANGED
++        .wait_timeout_while(r, timeout, |r| r.generation == seen)
++        .unwrap_or_else(|e| e.into_inner());
++    r.generation
++}
++
++/// Bump the generation without a session change, so a waiter in [`wait_change`] re-collects now
++/// (readiness or presence changed).
++pub fn poke() {
++    {
++        let mut r = lock();
++        r.generation = r.generation.wrapping_add(1);
++    }
++    CHANGED.notify_all();
++}
++
++/// The cold-boot ledger: "the host received an authenticated inbound remote session within
++/// [`COLD_BOOT_WINDOW`] after boot, while the machine was at the login screen". Persisted, so
++/// the tray can show "Unattended ready" after any later restart of the app (AC-55).
++pub mod ledger {
++    use super::*;
++
++    /// How long after boot a login-screen connection still proves the unattended path.
++    pub const COLD_BOOT_WINDOW: Duration = Duration::from_secs(15 * 60);
++    pub const FILE_NAME: &str = "remotesmith-unattended.json";
++
++    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
++    pub struct Record {
++        /// Unix seconds when the connection was authorized.
++        pub verified_at: u64,
++        /// Unix seconds of the boot it followed.
++        pub boot_time: u64,
++        /// Seconds from boot to the connection.
++        pub after_boot_secs: u64,
++        pub peer_id: String,
++        /// Prerequisites checked (and passing) in the serving process when it was recorded.
++        #[serde(default)]
++        pub prerequisites_passed: Vec<String>,
++    }
++
++    /// Pure decision, separated for tests: is a connection at `now` a cold-boot login-screen one?
++    pub fn qualifies(boot_time: Option<u64>, now: u64, at_login_screen: bool) -> Option<u64> {
++        let boot = boot_time?;
++        if !at_login_screen || now < boot {
++            return None;
++        }
++        let after = now - boot;
++        (after <= COLD_BOOT_WINDOW.as_secs()).then_some(after)
++    }
++
++    pub(super) fn on_remote_session(entry: Inbound) {
++        use std::sync::mpsc;
++        use std::sync::OnceLock;
++        static TX: OnceLock<Option<Mutex<mpsc::Sender<Inbound>>>> = OnceLock::new();
++        let tx = TX.get_or_init(|| {
++            let (tx, rx) = mpsc::channel::<Inbound>();
++            let spawned = std::thread::Builder::new()
++                .name("remotesmith-ledger".into())
++                .spawn(move || {
++                    while let Ok(e) = rx.recv() {
++                        record_if_cold_boot(&e);
++                    }
++                });
++            match spawned {
++                Ok(_) => Some(Mutex::new(tx)),
++                Err(err) => {
++                    log::error!("remotesmith: cannot start the cold-boot recorder: {err}");
++                    None
++                }
++            }
++        });
++        if let Some(tx) = tx {
++            if let Ok(tx) = tx.lock() {
++                tx.send(entry).ok();
++            }
++        }
++    }
++
++    fn record_if_cold_boot(e: &Inbound) {
++        // Only a quick check first: most sessions happen long after boot.
++        let boot = boot_time();
++        let now = now_secs();
++        if qualifies(boot, now, true).is_none() {
++            return;
++        }
++        let at_login = at_login_screen();
++        let Some(after) = qualifies(boot, now, at_login) else {
++            log::info!("remotesmith: session {} soon after boot, but not at the login screen", e.conn_id);
++            return;
++        };
++        // docs/IPC.md §7: the connection only counts with every other prerequisite passing at
++        // that moment, as seen by the process that served it. Fail closed.
++        let passed = match prerequisites_at_recording() {
++            Ok(p) => p,
++            Err(failing) => {
++                log::warn!(
++                    "remotesmith: cold-boot login-screen connection NOT recorded; failing prerequisites: {}",
++                    failing.join(", ")
++                );
++                return;
++            }
++        };
++        let rec = Record {
++            verified_at: now,
++            boot_time: boot.unwrap_or_default(),
++            after_boot_secs: after,
++            peer_id: e.peer_id.clone(),
++            prerequisites_passed: passed,
++        };
++        match write(&rec) {
++            Ok(path) => log::info!(
++                "remotesmith: recorded cold-boot login-screen connection ({after}s after boot) in {path}"
++            ),
++            Err(err) => log::error!("remotesmith: cannot record the cold-boot connection: {err}"),
++        }
++    }
++
++    /// `Ok(names checked)` when every prerequisite positively passes, else `Err(failing)`.
++    fn prerequisites_at_recording() -> Result<Vec<String>, Vec<String>> {
++        #[cfg(any(target_os = "macos", windows))]
++        {
++            let s = crate::remotesmith::collect::prerequisites_now();
++            let failing = crate::remotesmith::collect::failing_checks(&s);
++            if failing.is_empty() {
++                let mut names = vec!["service", "power", "preboot_unlock", "server"];
++                if cfg!(target_os = "macos") {
++                    names.extend([
++                        "accessibility",
++                        "screen_recording",
++                        "input_monitoring",
++                        "system_audio_recording",
++                    ]);
++                }
++                return Ok(names.into_iter().map(String::from).collect());
++            }
++            return Err(failing.into_iter().map(String::from).collect());
++        }
++        #[allow(unreachable_code)]
++        Err(vec!["platform".into()])
++    }
++
++    /// Where the record lives: written only by the privileged process that sees the login
++    /// screen (root on macOS, SYSTEM on Windows), readable by the user's processes, and not
++    /// writable by them, so a user process cannot fake "Unattended ready".
++    /// macOS: `/Library/Application Support/<App>/remotesmith-unattended.json` (that parent is
++    /// root-only). Windows: registry value `HKLM\SOFTWARE\<App>\RemoteSmith\Unattended`
++    /// (ProgramData is user-writable, so no file there).
++    #[cfg(target_os = "macos")]
++    pub fn path() -> Option<std::path::PathBuf> {
++        Some(
++            std::path::Path::new("/Library/Application Support")
++                .join(crate::get_app_name())
++                .join(FILE_NAME),
++        )
++    }
++
++    #[cfg(windows)]
++    fn reg_key() -> String {
++        format!("SOFTWARE\\{}\\RemoteSmith", crate::get_app_name())
++    }
++    #[cfg(windows)]
++    const REG_VALUE: &str = "Unattended";
++
++    fn write(rec: &Record) -> std::io::Result<String> {
++        let json = serde_json::to_string(rec).map_err(std::io::Error::other)?;
++        #[cfg(target_os = "macos")]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            let path = path().unwrap_or_default();
++            let dir = path.parent().unwrap_or(std::path::Path::new("/"));
++            std::fs::create_dir_all(dir)?;
++            let tmp = dir.join(format!("{FILE_NAME}.tmp"));
++            std::fs::remove_file(&tmp).ok();
++            // create_new: never follows or reuses an existing entry.
++            let mut f = std::fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&tmp)?;
++            std::io::Write::write_all(&mut f, json.as_bytes())?;
++            drop(f);
++            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
++            std::fs::rename(&tmp, &path)?;
++            return Ok(path.display().to_string());
++        }
++        #[cfg(windows)]
++        {
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(reg_key())?;
++            key.set_value(REG_VALUE, &json)?;
++            return Ok(format!("HKLM\\{}\\{REG_VALUE}", reg_key()));
++        }
++        #[allow(unreachable_code)]
++        {
++            let _ = json;
++            Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "no ledger location on this platform",
++            ))
++        }
++    }
++
++    /// The persisted record, if any.
++    pub fn read() -> Option<Record> {
++        #[cfg(target_os = "macos")]
++        {
++            use std::os::unix::fs::MetadataExt;
++            let path = path()?;
++            let meta = std::fs::symlink_metadata(&path).ok()?;
++            if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
++                return None;
++            }
++            // Only root writes it; anything else is not trusted.
++            if meta.uid() != 0 {
++                log::warn!("remotesmith: ignoring {} (not owned by root)", path.display());
++                return None;
++            }
++            return serde_json::from_slice(&std::fs::read(&path).ok()?).ok();
++        }
++        #[cfg(windows)]
++        {
++            use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
++            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
++                .open_subkey(reg_key())
++                .ok()?;
++            let json: String = key.get_value(REG_VALUE).ok()?;
++            return serde_json::from_str(&json).ok();
++        }
++        #[allow(unreachable_code)]
++        None
++    }
++
++    /// Unix seconds of the current boot.
++    pub fn boot_time() -> Option<u64> {
++        #[cfg(target_os = "macos")]
++        {
++            use hbb_common::libc;
++            let mut tv = libc::timeval {
++                tv_sec: 0,
++                tv_usec: 0,
++            };
++            let mut len = std::mem::size_of::<libc::timeval>();
++            let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
++            // SAFETY: sysctl writes at most `len` bytes into `tv`, which is that size.
++            let rc = unsafe {
++                libc::sysctl(
++                    mib.as_mut_ptr(),
++                    2,
++                    &mut tv as *mut _ as *mut libc::c_void,
++                    &mut len,
++                    std::ptr::null_mut(),
++                    0,
++                )
++            };
++            return (rc == 0 && tv.tv_sec > 0).then_some(tv.tv_sec as u64);
++        }
++        #[cfg(windows)]
++        {
++            // SAFETY: no preconditions.
++            let up_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
++            return now_secs().checked_sub(up_ms / 1000);
++        }
++        #[cfg(target_os = "linux")]
++        {
++            let s = std::fs::read_to_string("/proc/uptime").ok()?;
++            let up: f64 = s.split_whitespace().next()?.parse().ok()?;
++            return now_secs().checked_sub(up as u64);
++        }
++        #[allow(unreachable_code)]
++        None
++    }
++
++    /// Is the console at the login screen (no user logged in)? Uses upstream's own check.
++    fn at_login_screen() -> bool {
++        #[cfg(not(any(target_os = "android", target_os = "ios")))]
++        {
++            return crate::platform::is_prelogin();
++        }
++        #[allow(unreachable_code)]
++        false
++    }
++}
+diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
+new file mode 100644
+index 000000000000..be24f643574d
+--- /dev/null
++++ b/src/remotesmith/tests.rs
+@@ -0,0 +1,1008 @@
++//! Tests for the RemoteSmith endpoint: the shared protocol fixture, the server against a raw
++//! client (handshake, malformed input, limits, pushes, connect), the listener's permission
++//! rules, and the pure readiness/presence/ledger logic.
++
++use super::protocol::*;
++use super::sessions::{self, ledger};
++use hbb_common::tokio;
++
++/// docs/ipc-fixtures/v1.jsonl in the RemoteSmith superproject, also decoded by the sidecar.
++const FIXTURE: &str = include_str!(concat!(
++    env!("CARGO_MANIFEST_DIR"),
++    "/../../docs/ipc-fixtures/v1.jsonl"
++));
++
++#[derive(serde_derive::Deserialize)]
++struct Sample {
++    to: String,
++    valid: bool,
++    #[serde(rename = "type")]
++    ty: Option<String>,
++    note: String,
++    line: String,
++}
++
++fn samples() -> Vec<Sample> {
++    FIXTURE
++        .lines()
++        .filter(|l| !l.trim().is_empty())
++        .map(|l| serde_json::from_str(l).expect("fixture line"))
++        .collect()
++}
++
++fn wire_type<T: serde::Serialize>(body: &T) -> String {
++    let v = serde_json::to_value(body).unwrap();
++    v["type"].as_str().unwrap_or("").to_owned()
++}
++
++#[test]
++fn shared_fixture_decodes_like_the_sidecar() {
++    let all = samples();
++    assert!(all.len() >= 30, "fixture too small: {}", all.len());
++    for s in &all {
++        match s.to.as_str() {
++            "server" => match decode::<Request>(s.line.as_bytes()) {
++                Ok(env) => {
++                    assert!(s.valid, "{}: decoded but should fail", s.note);
++                    assert_eq!(Some(wire_type(&env.body)), s.ty, "{}", s.note);
++                    // Re-encoding drops unknown fields (credentials never round-trip).
++                    let re = encode(env.v, env.id, &env.body);
++                    assert!(!re.contains("hunter2"), "{}", s.note);
++                    let back: Envelope<Request> = decode(re.trim_end().as_bytes()).unwrap();
++                    assert_eq!(back.body, env.body, "{}", s.note);
++                }
++                Err(_) => assert!(!s.valid, "{}: rejected but should decode", s.note),
++            },
++            "client" => match decode::<ServerMessage>(s.line.as_bytes()) {
++                Ok(env) => {
++                    assert!(s.valid, "{}: decoded but should fail", s.note);
++                    assert_eq!(Some(wire_type(&env.body)), s.ty, "{}", s.note);
++                    let re = encode(env.v, env.id, &env.body);
++                    let back: Envelope<ServerMessage> = decode(re.trim_end().as_bytes()).unwrap();
++                    assert_eq!(back.body, env.body, "{}", s.note);
++                }
++                Err(_) => assert!(!s.valid, "{}: rejected but should decode", s.note),
++            },
++            other => panic!("bad fixture direction {other}"),
++        }
++    }
++}
++
++#[test]
++fn fork_output_matches_the_documented_shapes() {
++    // Everything the fork itself emits must decode on the client side with all fields intact.
++    let status = Status {
++        app_version: "1.5.0".into(),
++        platform: Platform::Macos,
++        my_id: Some("123".into()),
++        key_fingerprint: Some("ab cd".into()),
++        service: ServiceStatus {
++            running: true,
++            detail: None,
++        },
++        permissions: vec![PermissionStatus {
++            name: Permission::SystemAudioRecording,
++            state: PermState::Granted,
++            detail: Some("d".into()),
++        }],
++        power: PowerStatus {
++            sleep_disabled: Some(false),
++            detail: Some("x".into()),
++        },
++        preboot_unlock: PrebootStatus {
++            detected: None,
++            detail: None,
++        },
++        server: ServerStatus {
++            state: RegState::NotConfigured,
++            host: None,
++            detail: None,
++        },
++        unattended: UnattendedStatus {
++            ready: false,
++            cold_boot_verified_at: Some(5),
++        },
++        inbound_sessions: vec![InboundSession {
++            conn_id: 3,
++            peer_id: "9".into(),
++            alias: None,
++            kind: SessionKind::Human,
++            since: Some(1),
++        }],
++    };
++    let line = encode(1, None, ServerMessage::Status { status: Box::new(status.clone()) });
++    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
++    // v1 output carries every Status field (docs/IPC.md §7).
++    for k in [
++        "app_version",
++        "platform",
++        "my_id",
++        "key_fingerprint",
++        "service",
++        "permissions",
++        "power",
++        "preboot_unlock",
++        "server",
++        "unattended",
++        "inbound_sessions",
++    ] {
++        assert!(v["status"].get(k).is_some(), "missing {k}");
++    }
++    assert_eq!(v["status"]["permissions"][0]["name"], "system_audio_recording");
++    assert_eq!(v["status"]["server"]["state"], "not_configured");
++    assert_eq!(v["status"]["inbound_sessions"][0]["kind"], "human");
++    let env: Envelope<ServerMessage> = decode(line.trim_end().as_bytes()).unwrap();
++    assert_eq!(
++        env.body,
++        ServerMessage::Status {
++            status: Box::new(status)
++        }
++    );
++}
++
++// ------------------------------------------------------------------ pure logic
++
++#[test]
++fn ledger_window() {
++    let boot = 1_000_000;
++    assert_eq!(ledger::qualifies(Some(boot), boot + 60, true), Some(60));
++    assert_eq!(ledger::qualifies(Some(boot), boot + 15 * 60, true), Some(900));
++    assert_eq!(ledger::qualifies(Some(boot), boot + 15 * 60 + 1, true), None);
++    assert_eq!(ledger::qualifies(Some(boot), boot + 60, false), None);
++    assert_eq!(ledger::qualifies(None, boot, true), None);
++    assert_eq!(ledger::qualifies(Some(boot), boot - 1, true), None);
++}
++
++#[test]
++fn boot_time_is_sane() {
++    let b = ledger::boot_time().expect("boot time");
++    assert!(b > 1_500_000_000 && b <= sessions::now_secs());
++}
++
++#[test]
++fn session_registry_open_close_and_wake() {
++    use std::time::{Duration, Instant};
++    let (_, g0) = sessions::snapshot();
++    let waiter = std::thread::spawn(move || {
++        let t = Instant::now();
++        let g = sessions::wait_change(g0, Duration::from_secs(5));
++        (g, t.elapsed())
++    });
++    std::thread::sleep(Duration::from_millis(50));
++    sessions::opened(-4242, false, "555", "bob");
++    let (g1, waited) = waiter.join().unwrap();
++    assert_ne!(g1, g0);
++    assert!(waited < Duration::from_secs(1), "woke after {waited:?}");
++    let (list, _) = sessions::snapshot();
++    let s = list.iter().find(|s| s.conn_id == -4242).expect("registered");
++    assert_eq!((s.peer_id.as_str(), s.name.as_str(), s.remote), ("555", "bob", false));
++    sessions::closed(-4242);
++    assert!(!sessions::snapshot().0.iter().any(|s| s.conn_id == -4242));
++    // Closing an unknown id is a no-op.
++    let (_, g2) = sessions::snapshot();
++    sessions::closed(-4242);
++    assert_eq!(sessions::snapshot().1, g2);
++}
++
++#[test]
++fn host_facts_round_trip() {
++    let f = super::host::HostFacts {
++        sessions: vec![sessions::Inbound {
++            conn_id: 1,
++            peer_id: "2".into(),
++            name: "n".into(),
++            since: 3,
++            remote: true,
++        }],
++        online_state: 27,
++        rendezvous_servers: vec!["rs.example:21116".into()],
++        my_id: "4".into(),
++        key_fingerprint: Some("aa".into()),
++        preboot: Some(PrebootStatus {
++            detected: Some(true),
++            detail: None,
++        }),
++        cold_boot: Some(ledger::Record {
++            verified_at: 9,
++            boot_time: 8,
++            after_boot_secs: 1,
++            peer_id: "2".into(),
++            prerequisites_passed: vec!["service".into()],
++        }),
++    };
++    assert_eq!(super::host::HostFacts::from_json(&f.to_json()), Some(f));
++    // An older/newer server with other fields still parses.
++    assert!(super::host::HostFacts::from_json(r#"{"online_state":1,"new":true}"#).is_some());
++}
++
++#[cfg(any(target_os = "macos", windows))]
++mod endpoint {
++    use super::super::collect::{self, Readiness, SavedPeer, Shared, Snapshot};
++    use super::super::presence::{self, Entry, Table};
++    use super::super::readiness;
++    use super::super::server::{self, encode_bounded, ServerConfig};
++    use super::*;
++    use std::time::Duration;
++
++    // -------------------------------------------------------------- readiness parsers
++
++    #[test]
++    fn pmset_parsing() {
++        let laptop = "Battery Power:\n sleep                1\n displaysleep         2\nAC Power:\n Sleep On Power Button 1\n sleep                0\n disksleep            10\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(laptop).sleep_disabled, Some(true));
++        let desktop = "AC Power:\n standby              1\n sleep                10\n";
++        let p = readiness::parse_pmset_ac_sleep(desktop);
++        assert_eq!(p.sleep_disabled, Some(false));
++        assert!(p.detail.unwrap().contains("10 min"));
++        // "Sleep On Power Button" must not be mistaken for the sleep timer.
++        let odd = "AC Power:\n Sleep On Power Button 0\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(odd).sleep_disabled, None);
++        assert_eq!(readiness::parse_pmset_ac_sleep("").sleep_disabled, None);
++        // Only the battery section says "never": AC is unknown, not passing.
++        let batt = "Battery Power:\n sleep                0\nAC Power:\n displaysleep         10\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(batt).sleep_disabled, None);
++        let garbled = "AC Power:\n sleep                never\n";
++        assert_eq!(readiness::parse_pmset_ac_sleep(garbled).sleep_disabled, None);
++    }
++
++    #[test]
++    fn fdesetup_parsing() {
++        assert_eq!(readiness::parse_fdesetup("FileVault is On.\n").detected, Some(true));
++        assert_eq!(readiness::parse_fdesetup("FileVault is Off.\n").detected, Some(false));
++        assert_eq!(readiness::parse_fdesetup("huh").detected, None);
++    }
++
++    #[test]
++    fn powercfg_parsing() {
++        let out = "Power Setting GUID: 29f6c1db-86da-48c5-9fdb-f2b67b1f44da  (Sleep after)\n  GUID Alias: STANDBYIDLE\n  Minimum Possible Setting: 0x00000000\n  Maximum Possible Setting: 0xffffffff\n  Possible Settings increment: 0x00000001\n  Possible Settings units: Seconds\nCurrent AC Power Setting Index: 0x00000000\nCurrent DC Power Setting Index: 0x00000384\n";
++        assert_eq!(readiness::parse_powercfg_ac(out), Some(0));
++        let de = out.replace("Current AC Power Setting Index", "Aktueller Wechselstrom-Einstellungsindex")
++            .replace("0x00000000\nCurrent DC", "0x00000708\nCurrent DC");
++        assert_eq!(readiness::parse_powercfg_ac(&de), Some(0x708));
++        assert_eq!(readiness::parse_powercfg_ac("nothing"), None);
++    }
++
++    #[test]
++    fn bitlocker_parsing() {
++        assert_eq!(readiness::parse_bitlocker("status=Off\n").detected, Some(false));
++        assert_eq!(
++            readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=RecoveryPassword\n").detected,
++            Some(false)
++        );
++        let pin = readiness::parse_bitlocker("status=On\nprotector=TpmPin\nprotector=RecoveryPassword\n");
++        assert_eq!(pin.detected, Some(true));
++        assert!(pin.detail.unwrap().contains("TpmPin"));
++        assert_eq!(readiness::parse_bitlocker("").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Absent\n").detected, Some(false));
++        // Fail closed: no positive evidence of a TPM-only unlock.
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=RecoveryPassword\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=TpmNetworkKey\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=QueryFailed\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=Type42\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Unknown\nprotector=Tpm\n").detected, None);
++        assert_eq!(readiness::parse_bitlocker("status=Error\n").detected, None);
++        // A blocking protector wins even next to a TPM one.
++        assert_eq!(readiness::parse_bitlocker("status=On\nprotector=Tpm\nprotector=ExternalKey\n").detected, Some(true));
++    }
++
++    #[test]
++    fn windows_power_fails_closed() {
++        let p = readiness::windows_power;
++        assert_eq!(p(Some(0), Some(0), None).sleep_disabled, Some(true));
++        assert_eq!(p(Some(0), None, Some(false)).sleep_disabled, Some(true), "hibernation off");
++        assert_eq!(p(Some(0), Some(3600), Some(false)).sleep_disabled, Some(true), "hibernation off");
++        assert_eq!(p(Some(0), None, None).sleep_disabled, None, "hibernate timer unread");
++        assert_eq!(p(Some(0), None, Some(true)).sleep_disabled, None, "hibernate timer unread");
++        assert_eq!(p(Some(0), Some(3600), Some(true)).sleep_disabled, Some(false));
++        assert_eq!(p(Some(0), Some(3600), None).sleep_disabled, Some(false));
++        assert_eq!(p(Some(600), Some(0), Some(false)).sleep_disabled, Some(false));
++        assert_eq!(p(None, Some(0), Some(false)).sleep_disabled, None);
++    }
++
++    #[test]
++    fn launchd_parsing() {
++        let out = "system = {\n\tservices = {\n\t\t     179      - \tcom.apple.runningboardd\n\t\t       0      - \tcom.carriez.RustDesk_service\n\t\t     501      - \tai.johnnycode.RemoteSmith_service\n\t}\n\tother = {\n\t\t 7 x com.carriez.RustDesk_service\n\t}\n}\n";
++        assert_eq!(readiness::launchd_pid(out, "ai.johnnycode.RemoteSmith_service"), Some(501));
++        assert_eq!(readiness::launchd_pid(out, "com.carriez.RustDesk_service"), Some(0));
++        assert_eq!(readiness::launchd_pid(out, "nope"), None);
++    }
++
++    #[test]
++    fn readiness_reads_this_machine_without_changing_it() {
++        // Smoke test against the real Mac: every check answers, none prompts or panics.
++        let _ = readiness::service();
++        let p = readiness::power();
++        assert!(p.sleep_disabled.is_some() || p.detail.is_some());
++        let _ = readiness::preboot();
++        #[cfg(target_os = "macos")]
++        assert_eq!(readiness::permissions().len(), 4);
++    }
++
++    // -------------------------------------------------------------- snapshot logic
++
++    #[test]
++    fn server_status_mapping() {
++        let s = |v: &[&str], o| collect::server_status(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>(), o);
++        assert_eq!(s(&[], 10).state, RegState::NotConfigured);
++        assert_eq!(s(&[" "], 10).state, RegState::NotConfigured);
++        let r = s(&["rs.johnnycode.ai:21116"], 27);
++        assert_eq!((r.state, r.host.as_deref()), (RegState::Registered, Some("rs.johnnycode.ai")));
++        assert_eq!(s(&["rs.johnnycode.ai"], 0).state, RegState::Registering);
++        assert_eq!(s(&["[::1]:21116"], -1).host.as_deref(), Some("::1"));
++        assert_eq!(s(&["h:1"], -1).state, RegState::Failed);
++    }
++
++    fn ready_status() -> Status {
++        Status {
++            platform: Platform::Macos,
++            service: ServiceStatus {
++                running: true,
++                detail: None,
++            },
++            permissions: [
++                Permission::Accessibility,
++                Permission::ScreenRecording,
++                Permission::InputMonitoring,
++                Permission::SystemAudioRecording,
++            ]
++            .into_iter()
++            .map(|name| PermissionStatus {
++                name,
++                state: PermState::Granted,
++                detail: None,
++            })
++            .collect(),
++            power: PowerStatus {
++                sleep_disabled: Some(true),
++                detail: None,
++            },
++            preboot_unlock: PrebootStatus {
++                detected: Some(false),
++                detail: None,
++            },
++            server: ServerStatus {
++                state: RegState::Registered,
++                host: Some("h".into()),
++                detail: None,
++            },
++            unattended: UnattendedStatus {
++                ready: false,
++                cold_boot_verified_at: Some(1),
++            },
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn unattended_ready_needs_every_prerequisite() {
++        assert!(collect::unattended_ready(&ready_status()));
++        let mut s = ready_status();
++        s.unattended.cold_boot_verified_at = None;
++        assert!(!collect::unattended_ready(&s), "no cold-boot record");
++        let mut s = ready_status();
++        s.permissions[1].state = PermState::Missing;
++        assert!(!collect::unattended_ready(&s), "missing permission");
++        let mut s = ready_status();
++        s.permissions.pop();
++        assert!(!collect::unattended_ready(&s), "absent permission counts as failing");
++        let mut s = ready_status();
++        s.power.sleep_disabled = None;
++        assert!(!collect::unattended_ready(&s), "unknown sleep");
++        let mut s = ready_status();
++        s.preboot_unlock.detected = Some(true);
++        assert!(!collect::unattended_ready(&s), "pre-boot unlock");
++        let mut s = ready_status();
++        s.service.running = false;
++        assert!(!collect::unattended_ready(&s), "service down");
++        let mut s = ready_status();
++        s.server.state = RegState::Registering;
++        assert!(!collect::unattended_ready(&s), "not registered");
++    }
++
++    #[test]
++    fn failing_checks_name_each_prerequisite() {
++        assert!(collect::failing_checks(&ready_status()).is_empty());
++        let none = Status {
++            platform: Platform::Macos,
++            ..Default::default()
++        };
++        let f = collect::failing_checks(&none);
++        for n in ["service", "accessibility", "screen_recording", "input_monitoring", "system_audio_recording", "power", "preboot_unlock", "server"] {
++            assert!(f.contains(&n), "{n} missing from {f:?}");
++        }
++        let win = Status {
++            platform: Platform::Windows,
++            ..ready_status()
++        };
++        assert!(collect::failing_checks(&win).is_empty(), "no TCC on Windows");
++        let other = Status {
++            platform: Platform::Other,
++            ..ready_status()
++        };
++        assert_eq!(collect::failing_checks(&other), ["platform"]);
++    }
++
++    #[test]
++    fn lan_pongs_only_from_saved_peers() {
++        use hbb_common::protobuf::Message as _;
++        use hbb_common::rendezvous_proto::{PeerDiscovery, RendezvousMessage};
++        let pkt = |cmd: &str, id: &str| {
++            let mut m = RendezvousMessage::new();
++            m.set_peer_discovery(PeerDiscovery {
++                cmd: cmd.into(),
++                id: id.into(),
++                ..Default::default()
++            });
++            m.write_to_bytes().unwrap()
++        };
++        let saved: std::collections::HashSet<String> = ["222".to_string()].into_iter().collect();
++        assert_eq!(presence::accept_pong(&pkt("pong", "222"), &saved), Some("222".into()));
++        assert_eq!(presence::accept_pong(&pkt("pong", "999"), &saved), None, "not a saved peer");
++        assert_eq!(presence::accept_pong(&pkt("ping", "222"), &saved), None);
++        assert_eq!(presence::accept_pong(b"garbage", &saved), None);
++    }
++
++    #[test]
++    fn lan_round_has_an_absolute_deadline() {
++        let none = std::collections::HashSet::new();
++        let t = std::time::Instant::now();
++        assert!(presence::discover_lan(&none).is_empty());
++        assert!(t.elapsed() < Duration::from_millis(100), "no saved peers: no round");
++        let saved: std::collections::HashSet<String> = ["no-such-peer".to_string()].into_iter().collect();
++        let t = std::time::Instant::now();
++        assert!(presence::discover_lan(&saved).is_empty());
++        let took = t.elapsed();
++        assert!(took >= presence::LAN_ROUND && took < presence::LAN_ROUND + Duration::from_millis(500), "{took:?}");
++    }
++
++    #[test]
++    fn presence_mapping() {
++        let e = |lan, id: Option<bool>, probed| Entry {
++            lan,
++            id_online: id,
++            probed,
++            last_seen: Some(7),
++        };
++        assert_eq!(presence::presence_of(&e(false, None, false), true), Presence::Checking);
++        assert_eq!(
++            presence::presence_of(&e(true, Some(false), true), true),
++            Presence::Reachable { route: Route::Lan }
++        );
++        assert_eq!(
++            presence::presence_of(&e(false, Some(true), true), true),
++            Presence::Reachable { route: Route::Id }
++        );
++        assert_eq!(
++            presence::presence_of(&e(false, Some(false), true), true),
++            Presence::Unavailable {
++                reason: Reason::Offline,
++                detail: None,
++                last_seen: Some(7)
++            }
++        );
++        // An "offline" answer from a server we are not registered with is not trusted.
++        assert!(matches!(
++            presence::presence_of(&e(false, Some(false), true), false),
++            Presence::Unavailable {
++                reason: Reason::ServerUnreachable,
++                ..
++            }
++        ));
++        assert!(matches!(
++            presence::presence_of(&e(false, None, true), true),
++            Presence::Unavailable {
++                reason: Reason::ServerUnreachable,
++                last_seen: Some(7),
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn build_snapshot() {
++        let table: Table = Default::default();
++        table.lock().unwrap().insert(
++            "222".into(),
++            Entry {
++                lan: true,
++                id_online: None,
++                probed: true,
++                last_seen: Some(1),
++            },
++        );
++        let saved = vec![
++            SavedPeer {
++                id: "111".into(),
++                alias: Some("me".into()),
++                platform: Some(Platform::Macos),
++                saved_at: None,
++            },
++            SavedPeer {
++                id: "222".into(),
++                alias: Some("Scott-PC".into()),
++                platform: Some(Platform::Windows),
++                saved_at: Some(5),
++            },
++            SavedPeer {
++                id: "333".into(),
++                alias: None,
++                platform: None,
++                saved_at: None,
++            },
++        ];
++        let facts = super::super::host::HostFacts {
++            sessions: vec![sessions::Inbound {
++                conn_id: 7,
++                peer_id: "222".into(),
++                name: "scott".into(),
++                since: 10,
++                remote: true,
++            }],
++            online_state: 5,
++            rendezvous_servers: vec!["rs.johnnycode.ai".into()],
++            my_id: "111".into(),
++            ..Default::default()
++        };
++        let snap = collect::build(Some(&facts), &Readiness::default(), &saved, &table);
++        // This machine is never in its own peer list.
++        assert_eq!(snap.peers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["222", "333"]);
++        assert_eq!(snap.peers[0].presence, Presence::Reachable { route: Route::Lan });
++        assert_eq!(snap.peers[1].presence, Presence::Checking);
++        assert_eq!(snap.status.my_id.as_deref(), Some("111"));
++        assert_eq!(snap.status.server.state, RegState::Registered);
++        let s = &snap.status.inbound_sessions[0];
++        assert_eq!((s.conn_id, s.peer_id.as_str(), s.alias.as_deref()), (7, "222", Some("Scott-PC")));
++        assert_eq!(s.kind, SessionKind::Human);
++        assert!(!snap.status.unattended.ready);
++        // No facts (Windows service not answering): no sessions, server unknown.
++        let snap = collect::build(None, &Readiness::default(), &saved, &table);
++        assert!(snap.status.inbound_sessions.is_empty());
++        assert_eq!(snap.status.server.state, RegState::Unknown);
++    }
++
++    #[test]
++    fn output_lines_never_exceed_max_line() {
++        let peers: Vec<Peer> = (0..20_000)
++            .map(|i| Peer {
++                id: format!("{i:09}"),
++                alias: Some("x".repeat(60)),
++                platform: Some(Platform::Windows),
++                presence: Presence::Unavailable {
++                    reason: Reason::Offline,
++                    detail: Some("y".repeat(20)),
++                    last_seen: Some(1),
++                },
++            })
++            .collect();
++        let line = encode_bounded(1, Some(3), ServerMessage::Peers { peers: peers.clone() });
++        assert!(line.len() <= MAX_LINE, "{}", line.len());
++        let env: Envelope<ServerMessage> = decode(line.trim_end().as_bytes()).unwrap();
++        let ServerMessage::Peers { peers: got } = env.body else { panic!() };
++        assert!(got.len() > 1000 && got.len() < peers.len());
++        assert_eq!(got[..], peers[..got.len()]);
++        // Small messages are untouched.
++        let small = encode_bounded(1, None, ServerMessage::Pong);
++        assert_eq!(small, encode(1, None, ServerMessage::Pong));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn endpoint_path_with_the_remotesmith_app_name() {
++        // Nothing is hardcoded: the path follows APP_NAME, so after the branding rename it is
++        // exactly docs/IPC.md's /tmp/RemoteSmith-<uid>/remotesmith-ipc.sock.
++        let app = hbb_common::config::APP_NAME.read().unwrap().clone();
++        *hbb_common::config::APP_NAME.write().unwrap() = "RemoteSmith".to_owned();
++        let got = if std::env::var(super::super::ENV_IPC_PATH).is_ok() {
++            None
++        } else {
++            Some(super::super::endpoint())
++        };
++        *hbb_common::config::APP_NAME.write().unwrap() = app;
++        if let Some(got) = got {
++            assert_eq!(got, format!("/tmp/RemoteSmith-{}/remotesmith-ipc.sock", unsafe { hbb_common::libc::geteuid() }));
++        }
++    }
++
++    #[test]
++    fn peer_files() {
++        let f = "password = [1, 2]\n[options]\nalias = 'Scott-PC'\n[info]\nusername = 'scott'\nhostname = 'SCOTT-PC'\nplatform = 'Windows'\n";
++        let p = collect::parse_peer_file("123".into(), Some(5), f).unwrap();
++        assert_eq!((p.id.as_str(), p.alias.as_deref(), p.platform, p.saved_at), ("123", Some("Scott-PC"), Some(Platform::Windows), Some(5)));
++        let f = "[info]\nhostname = 'mac-mini'\nplatform = 'Mac OS'\n";
++        let p = collect::parse_peer_file("9".into(), None, f).unwrap();
++        assert_eq!((p.alias.as_deref(), p.platform), (Some("mac-mini"), Some(Platform::Macos)));
++        // Upstream hides peers whose info has not arrived yet; so do we (and never delete them).
++        assert!(collect::parse_peer_file("1".into(), None, "[options]\nalias='x'\n").is_none());
++        assert!(collect::parse_peer_file("1".into(), None, "not toml [[[").is_none());
++    }
++
++    #[test]
++    fn peer_ids_safe_for_the_command_line() {
++        assert!(server::valid_peer_id("123456789"));
++        assert!(server::valid_peer_id("my-host_1"));
++        assert!(!server::valid_peer_id(""));
++        assert!(!server::valid_peer_id("--password"));
++        assert!(!server::valid_peer_id("1 2"));
++        assert!(!server::valid_peer_id(&"9".repeat(65)));
++    }
++
++    // -------------------------------------------------------------- server over a socket
++
++    #[cfg(unix)]
++    mod socket {
++        use super::*;
++        use hbb_common::tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++        use hbb_common::tokio::net::UnixStream;
++        use hbb_common::tokio::sync::watch;
++        use std::os::unix::fs::PermissionsExt;
++
++        struct Dir(std::path::PathBuf);
++        impl Drop for Dir {
++            fn drop(&mut self) {
++                std::fs::remove_dir_all(&self.0).ok();
++            }
++        }
++
++        fn private_dir() -> Dir {
++            use std::sync::atomic::{AtomicU32, Ordering};
++            static N: AtomicU32 = AtomicU32::new(0);
++            let p = std::path::PathBuf::from(format!(
++                "/tmp/rs-ipc-test-{}-{}",
++                std::process::id(),
++                N.fetch_add(1, Ordering::SeqCst)
++            ));
++            std::fs::remove_dir_all(&p).ok();
++            std::fs::create_dir(&p).unwrap();
++            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
++            Dir(p)
++        }
++
++        fn snapshot() -> Snapshot {
++            Snapshot {
++                status: Status {
++                    app_version: "test".into(),
++                    platform: Platform::Macos,
++                    ..Default::default()
++                },
++                peers: vec![
++                    Peer {
++                        id: "222".into(),
++                        alias: Some("PC".into()),
++                        platform: Some(Platform::Windows),
++                        presence: Presence::Reachable { route: Route::Lan },
++                    },
++                    Peer {
++                        id: "333".into(),
++                        alias: None,
++                        platform: None,
++                        presence: Presence::Unavailable {
++                            reason: Reason::Offline,
++                            detail: None,
++                            last_seen: Some(1),
++                        },
++                    },
++                ],
++            }
++        }
++
++        struct Harness {
++            _dir: Dir,
++            path: String,
++            tx: watch::Sender<Snapshot>,
++            task: tokio::task::JoinHandle<()>,
++        }
++
++        impl Drop for Harness {
++            fn drop(&mut self) {
++                self.task.abort();
++            }
++        }
++
++        fn test_cfg() -> ServerConfig {
++            ServerConfig {
++                hello_deadline: Duration::from_millis(400),
++                write_timeout: Duration::from_millis(300),
++                launch: false,
++                ..ServerConfig::default()
++            }
++        }
++
++        async fn start(cfg: ServerConfig) -> Harness {
++            let dir = private_dir();
++            let path = dir.0.join("s.sock").to_string_lossy().into_owned();
++            let listener = server::bind(&path).await.unwrap();
++            let (tx, rx) = watch::channel(snapshot());
++            let shared = Shared { snap: rx };
++            let task = tokio::spawn(server::serve(listener, cfg, shared));
++            Harness {
++                _dir: dir,
++                path,
++                tx,
++                task,
++            }
++        }
++
++        struct Client {
++            r: BufReader<tokio::net::unix::OwnedReadHalf>,
++            w: tokio::net::unix::OwnedWriteHalf,
++        }
++
++        impl Client {
++            async fn new(path: &str) -> Client {
++                let (r, w) = UnixStream::connect(path).await.unwrap().into_split();
++                Client {
++                    r: BufReader::new(r),
++                    w,
++                }
++            }
++            async fn send(&mut self, line: &str) {
++                self.w.write_all(line.as_bytes()).await.unwrap();
++                self.w.write_all(b"\n").await.unwrap();
++            }
++            async fn recv(&mut self) -> serde_json::Value {
++                self.try_recv(Duration::from_secs(3)).await.expect("no line")
++            }
++            async fn try_recv(&mut self, t: Duration) -> Option<serde_json::Value> {
++                let mut s = String::new();
++                match tokio::time::timeout(t, self.r.read_line(&mut s)).await {
++                    Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(&s).expect("server sent JSON")),
++                    _ => None,
++                }
++            }
++            /// Has the server closed the connection (EOF) within `t`?
++            async fn closed_within(&mut self, t: Duration) -> bool {
++                let mut s = String::new();
++                loop {
++                    match tokio::time::timeout(t, self.r.read_line(&mut s)).await {
++                        Ok(Ok(0)) | Ok(Err(_)) => return true,
++                        Ok(Ok(_)) => s.clear(),
++                        Err(_) => return false,
++                    }
++                }
++            }
++            async fn hello(&mut self) -> serde_json::Value {
++                self.send(r#"{"v":1,"id":1,"type":"hello","min_version":1,"max_version":1,"client":"t","client_version":"0"}"#).await;
++                self.recv().await
++            }
++        }
++
++        #[tokio::test]
++        async fn handshake_and_requests() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            // Anything before hello is refused, connection kept.
++            c.send(r#"{"v":1,"id":7,"type":"get_status"}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["type"].as_str(), r["id"].as_u64()), (Some("error"), Some(7)));
++            assert_eq!(r["error"]["code"], "hello_required");
++            let ok = c.hello().await;
++            assert_eq!(ok["type"], "hello_ok");
++            assert_eq!((ok["version"].as_u64(), ok["id"].as_u64()), (Some(1), Some(1)));
++            assert_eq!(ok["server"], "RemoteSmith");
++            c.send(r#"{"v":1,"id":2,"type":"get_status"}"#).await;
++            let st = c.recv().await;
++            assert_eq!((st["type"].as_str(), st["status"]["app_version"].as_str()), (Some("status"), Some("test")));
++            c.send(r#"{"v":1,"id":3,"type":"list_peers"}"#).await;
++            let p = c.recv().await;
++            assert_eq!(p["peers"].as_array().unwrap().len(), 2);
++            c.send(r#"{"v":1,"id":4,"type":"ping"}"#).await;
++            assert_eq!(c.recv().await["type"], "pong");
++            c.send(r#"{"v":1,"id":5,"type":"format_disk"}"#).await;
++            assert_eq!(c.recv().await["error"]["code"], "unknown_type");
++            c.send(r#"{"v":1,"id":6,"type":"hello","min_version":1,"max_version":1,"client":"t","client_version":"0"}"#).await;
++            assert_eq!(c.recv().await["error"]["code"], "bad_request");
++            c.send(r#"{"v":2,"id":8,"type":"ping"}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["error"]["code"].as_str(), r["id"].as_u64()), (Some("bad_request"), Some(8)));
++        }
++
++        #[tokio::test]
++        async fn version_mismatch_closes() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            c.send(r#"{"v":1,"id":1,"type":"hello","min_version":2,"max_version":3,"client":"t","client_version":"0"}"#).await;
++            let r = c.recv().await;
++            assert_eq!(r["error"]["code"], "version_mismatch");
++            assert_eq!((r["error"]["min_version"].as_u64(), r["error"]["max_version"].as_u64()), (Some(1), Some(1)));
++            assert!(c.closed_within(Duration::from_secs(1)).await);
++        }
++
++        #[tokio::test]
++        async fn silent_client_is_closed_after_hello_deadline() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            assert!(c.closed_within(Duration::from_secs(2)).await);
++        }
++
++        #[tokio::test]
++        async fn malformed_input_is_answered_and_survived() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            c.hello().await;
++            c.send("this is not json").await;
++            let r = c.recv().await;
++            assert_eq!(r["error"]["code"], "bad_request");
++            assert!(r.get("id").is_none());
++            c.send(r#"{"v":1,"id":9,"type":"connect","peer_id":5}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["error"]["code"].as_str(), r["id"].as_u64()), (Some("bad_request"), Some(9)));
++            c.w.write_all(&[0xff, 0xfe, b'\n']).await.unwrap();
++            assert_eq!(c.recv().await["error"]["code"], "bad_request");
++            // A line over 1 MiB is discarded, not buffered, and answered.
++            let big = vec![b'x'; MAX_LINE + 100];
++            c.w.write_all(&big).await.unwrap();
++            c.w.write_all(b"\n").await.unwrap();
++            assert_eq!(c.recv().await["error"]["code"], "line_too_long");
++            // Still usable.
++            c.send(r#"{"v":1,"id":10,"type":"ping"}"#).await;
++            assert_eq!(c.recv().await["id"], 10);
++            // 20 malformed lines close this connection only.
++            let mut other = Client::new(&h.path).await;
++            other.hello().await;
++            for _ in 0..20 {
++                c.send("{").await;
++            }
++            assert!(c.closed_within(Duration::from_secs(2)).await);
++            other.send(r#"{"v":1,"id":2,"type":"ping"}"#).await;
++            assert_eq!(other.recv().await["type"], "pong");
++        }
++
++        #[tokio::test]
++        async fn eof_mid_line_closes_only_that_client() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            c.hello().await;
++            c.w.write_all(br#"{"v":1,"id":2,"ty"#).await.unwrap();
++            drop(c);
++            let mut d = Client::new(&h.path).await;
++            assert_eq!(d.hello().await["type"], "hello_ok");
++        }
++
++        #[tokio::test]
++        async fn subscribe_pushes_snapshot_then_changed_topic_only() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            c.hello().await;
++            c.send(r#"{"v":1,"id":2,"type":"subscribe","topics":["status","peers","desk_mode"]}"#).await;
++            let s = c.recv().await;
++            assert_eq!(s["type"], "subscribed");
++            assert_eq!(s["topics"], serde_json::json!(["status", "peers"]));
++            let a = c.recv().await;
++            let b = c.recv().await;
++            assert_eq!((a["type"].as_str(), b["type"].as_str()), (Some("status"), Some("peers")));
++            assert!(a.get("id").is_none() && b.get("id").is_none());
++            // An inbound session starts: only a status event, within 500 ms.
++            let t = std::time::Instant::now();
++            h.tx.send_modify(|s| {
++                s.status.inbound_sessions.push(InboundSession {
++                    conn_id: 1,
++                    peer_id: "222".into(),
++                    alias: Some("PC".into()),
++                    kind: SessionKind::Human,
++                    since: Some(1),
++                })
++            });
++            let e = c.recv().await;
++            assert!(t.elapsed() < Duration::from_millis(500));
++            assert_eq!(e["type"], "status");
++            assert_eq!(e["status"]["inbound_sessions"][0]["peer_id"], "222");
++            assert!(c.try_recv(Duration::from_millis(200)).await.is_none(), "no peers event");
++            // It ends: pushed again, badge clears.
++            h.tx.send_modify(|s| s.status.inbound_sessions.clear());
++            let e = c.recv().await;
++            assert_eq!(e["status"]["inbound_sessions"], serde_json::json!([]));
++            // A presence change: peers event only.
++            h.tx.send_modify(|s| s.peers[0].presence = Presence::Checking);
++            let e = c.recv().await;
++            assert_eq!(e["type"], "peers");
++            assert_eq!(e["peers"][0]["presence"]["state"], "checking");
++        }
++
++        #[tokio::test]
++        async fn connect_rules() {
++            let h = start(test_cfg()).await;
++            let mut c = Client::new(&h.path).await;
++            c.hello().await;
++            c.send(r#"{"v":1,"id":2,"type":"connect","peer_id":"999"}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["error"]["code"].as_str(), r["id"].as_u64()), (Some("peer_unknown"), Some(2)));
++            // Known and reachable; an extra credential field is ignored, never echoed.
++            c.send(r#"{"v":1,"id":3,"type":"connect","peer_id":"222","password":"hunter2"}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["type"].as_str(), r["peer_id"].as_str()), (Some("connect_started"), Some("222")));
++            assert!(!r.to_string().contains("hunter2"));
++            // Known but shown offline: the session window still opens (it runs RustDesk's own
++            // LAN/ID/relay attempts and reports the real outcome).
++            c.send(r#"{"v":1,"id":4,"type":"connect","peer_id":"333"}"#).await;
++            let r = c.recv().await;
++            assert_eq!((r["type"].as_str(), r["id"].as_u64()), (Some("connect_started"), Some(4)));
++        }
++
++        #[tokio::test]
++        async fn client_cap() {
++            let cfg = ServerConfig {
++                max_clients: 2,
++                ..test_cfg()
++            };
++            let h = start(cfg).await;
++            let mut a = Client::new(&h.path).await;
++            let mut b = Client::new(&h.path).await;
++            a.hello().await;
++            b.hello().await;
++            let mut c = Client::new(&h.path).await;
++            assert!(c.closed_within(Duration::from_secs(1)).await, "third client refused");
++            drop(a);
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            let mut d = Client::new(&h.path).await;
++            assert_eq!(d.hello().await["type"], "hello_ok", "slot freed");
++        }
++
++        #[tokio::test]
++        async fn a_client_that_stops_reading_blocks_nobody() {
++            let h = start(test_cfg()).await;
++            let mut slow = Client::new(&h.path).await;
++            slow.hello().await;
++            slow.send(r#"{"v":1,"id":2,"type":"subscribe","topics":["peers"]}"#).await;
++            // Big peer lists, many changes, never read.
++            for i in 0..200u32 {
++                h.tx.send_modify(|s| {
++                    s.peers = (0..2000)
++                        .map(|j| Peer {
++                            id: format!("{i}-{j}"),
++                            alias: Some("a".repeat(100)),
++                            platform: None,
++                            presence: Presence::Checking,
++                        })
++                        .collect()
++                });
++                tokio::time::sleep(Duration::from_millis(2)).await;
++            }
++            let mut fast = Client::new(&h.path).await;
++            let t = std::time::Instant::now();
++            assert_eq!(fast.hello().await["type"], "hello_ok");
++            fast.send(r#"{"v":1,"id":2,"type":"ping"}"#).await;
++            assert_eq!(fast.recv().await["type"], "pong");
++            assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
++            // The stuck one is dropped by the write timeout.
++            tokio::time::sleep(Duration::from_millis(500)).await;
++            assert!(slow.closed_within(Duration::from_secs(3)).await);
++        }
++
++        #[tokio::test]
++        async fn bind_rules() {
++            // Refuses a directory other users can enter.
++            let d = private_dir();
++            std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o755)).unwrap();
++            let p = d.0.join("s.sock").to_string_lossy().into_owned();
++            assert!(server::bind(&p).await.is_err());
++            // Refuses a symlinked directory.
++            let real = private_dir();
++            let link = std::path::PathBuf::from(format!("{}-link", real.0.display()));
++            std::os::unix::fs::symlink(&real.0, &link).unwrap();
++            let lp = link.join("s.sock").to_string_lossy().into_owned();
++            let r = server::bind(&lp).await;
++            std::fs::remove_file(&link).ok();
++            assert!(r.is_err());
++            // Creates a missing directory 0700, socket 0600.
++            let parent = private_dir();
++            let sub = parent.0.join("sub");
++            let sp = sub.join("s.sock").to_string_lossy().into_owned();
++            let l = server::bind(&sp).await.unwrap();
++            use std::os::unix::fs::MetadataExt;
++            assert_eq!(std::fs::metadata(&sub).unwrap().mode() & 0o777, 0o700);
++            assert_eq!(std::fs::symlink_metadata(&sp).unwrap().mode() & 0o777, 0o600);
++            // Never steals a live socket.
++            assert_eq!(server::bind(&sp).await.err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
++            // Drop unlinks our own socket only.
++            drop(l);
++            assert!(std::fs::symlink_metadata(&sp).is_err());
++            // Replaces a stale socket of ours.
++            let stale = std::os::unix::net::UnixListener::bind(&sp).unwrap();
++            drop(stale); // file stays, nobody listening
++            assert!(std::fs::symlink_metadata(&sp).is_ok());
++            let l2 = server::bind(&sp).await.unwrap();
++            drop(l2);
++        }
++    }
++}
+diff --git a/src/remotesmith/winsec.rs b/src/remotesmith/winsec.rs
+new file mode 100644
+index 000000000000..437fa8e4c863
+--- /dev/null
++++ b/src/remotesmith/winsec.rs
+@@ -0,0 +1,44 @@
++//! The pipe's security descriptor (docs/IPC.md §2): GENERIC_ALL for the token user of this
++//! process only, i.e. the logged-in user whose `--tray` creates it.
++
++use std::io;
++use windows::core::PCWSTR;
++use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
++use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
++
++const SDDL_REVISION_1: u32 = 1;
++
++/// SDDL `D:P(A;;GA;;;<user SID>)`: protected DACL, one ACE for the current user.
++pub fn user_only_sddl() -> io::Result<String> {
++    let sid = crate::platform::windows::current_process_user_sid_string()
++        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("no user SID: {e}")))?;
++    if !(sid.starts_with("S-1-") && sid.bytes().all(|b| b.is_ascii_digit() || b == b'-')) {
++        return Err(io::Error::new(io::ErrorKind::Other, "malformed user SID"));
++    }
++    Ok(format!("D:P(A;;GA;;;{sid})"))
++}
++
++/// SECURITY_ATTRIBUTES from [`user_only_sddl`]. Leaked on purpose: it must outlive every pipe
++/// instance created from it.
++pub fn user_only_security_attributes() -> io::Result<*mut SECURITY_ATTRIBUTES> {
++    let sddl = user_only_sddl()?;
++    let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
++    let mut sd = PSECURITY_DESCRIPTOR::default();
++    // SAFETY: `wide` is NUL-terminated and outlives the call; on success `sd` is a LocalAlloc'd
++    // descriptor that we keep for the life of the process.
++    unsafe {
++        ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            PCWSTR(wide.as_ptr()),
++            SDDL_REVISION_1,
++            &mut sd,
++            None,
++        )
++    }
++    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SDDL {sddl}: {e}")))?;
++    let sa = Box::new(SECURITY_ATTRIBUTES {
++        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
++        lpSecurityDescriptor: sd.0,
++        bInheritHandle: false.into(),
++    });
++    Ok(Box::leak(sa) as *mut SECURITY_ATTRIBUTES)
++}
+diff --git a/src/server.rs b/src/server.rs
+index 88341631b477..0c9d012b7150 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -681,6 +681,9 @@ pub async fn start_server(is_server: bool, no_server: bool) {
+                 std::process::exit(-1);
+             }
+         });
++        // RemoteSmith sidecar endpoint; runs on its own thread and never blocks the server.
++        #[cfg(any(target_os = "macos", windows))]
++        crate::remotesmith::start_local();
+         // Warm the DRM availability cache before any client connects, so the first connection does
+         // not race a cold `_drm` probe and ship an empty display list ("No displays" + retry).
+         // X11 is skipped -- probing there makes the root service open DRM readers for a path this

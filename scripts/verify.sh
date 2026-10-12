@@ -36,6 +36,31 @@ if [[ "$(uname)" == Darwin && -f vendor/rustdesk/src/bridge_generated.rs ]] \
 else
   echo "== rustdesk patch unit tests: skipped (needs apply-patches.sh, the Mac build env and the generated bridge)"
 fi
+# The fork's RemoteSmith unit tests (patch 0400: IPC endpoint, shared fixture, readiness logic).
+# They need the patched checkout and the bootstrapped Mac toolchain (scripts/bootstrap-mac.sh)
+# plus the generated bridge files from a scripts/build-mac.sh run; skipped otherwise.
+if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
+      && -f vendor/rustdesk/src/bridge_generated.rs && -L vendor/rustdesk/target ]]; then
+  echo "== fork: RemoteSmith unit tests (cargo test --lib remotesmith, Rust 1.81)"
+  (
+    # shellcheck source=scripts/lib/mac-env.sh
+    source scripts/lib/mac-env.sh
+    cd vendor/rustdesk
+    RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" cargo test --locked --lib \
+      --features flutter,hwcodec,unix-file-copy-paste,screencapturekit remotesmith
+  )
+else
+  echo "== fork: RemoteSmith unit tests skipped (needs scripts/apply-patches.sh + scripts/build-mac.sh first)"
+fi
+# The fork's RemoteSmith Flutter tests (patch 0502), with the pinned Flutter from bootstrap-mac.sh.
+if compgen -G "vendor/rustdesk/flutter/test/remotesmith_*_test.dart" >/dev/null \
+   && [[ -x "${REMOTESMITH_CACHE:-$HOME/.cache/remotesmith}/flutter-3.24.5/bin/flutter" ]]; then
+  echo "== fork: RemoteSmith Flutter tests"
+  (cd vendor/rustdesk/flutter && "${REMOTESMITH_CACHE:-$HOME/.cache/remotesmith}/flutter-3.24.5/bin/flutter" \
+     --suppress-analytics test test/remotesmith_*_test.dart)
+else
+  echo "== fork: RemoteSmith Flutter tests skipped (needs the patched checkout and scripts/bootstrap-mac.sh)"
+fi
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done

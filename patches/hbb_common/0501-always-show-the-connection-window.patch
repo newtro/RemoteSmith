@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:35:40 -0400
+Subject: remotesmith(0501): always show the connection window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream hides the connection manager when approve-mode=password,
+verification=permanent password and allow-hide-cm=Y. The first two are
+RemoteSmith's hardened defaults, so a single option would remove the
+host-side session indicator. RemoteSmith requires the indicator during every
+inbound session (§6.2a, AC-60): hide_cm() is always false.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/password_security.rs | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/password_security.rs b/src/password_security.rs
+index 3f5f32430a97..0a6a7800f372 100644
+--- a/src/password_security.rs
++++ b/src/password_security.rs
+@@ -86,9 +86,10 @@ pub fn approve_mode() -> ApproveMode {
+ }
+ 
+ pub fn hide_cm() -> bool {
+-    approve_mode() == ApproveMode::Password
+-        && verification_method() == VerificationMethod::OnlyUsePermanentPassword
+-        && crate::config::option2bool("allow-hide-cm", &Config::get_option("allow-hide-cm"))
++    // RemoteSmith (§6.2a, AC-60): the host always shows the connection window during an inbound
++    // session. RemoteSmith's hardened defaults (password approval, permanent password only) are
++    // exactly upstream's preconditions for honouring "allow-hide-cm", so that option is ignored.
++    false
+ }
+ 
+ const VERSION_LEN: usize = 2;
