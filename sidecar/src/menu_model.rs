@@ -125,7 +125,8 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
             s.alias
                 .clone()
                 .filter(|a| !a.is_empty())
-                .unwrap_or_else(|| s.peer_id.clone())
+                .or_else(|| Some(s.peer_id.clone()).filter(|p| !p.is_empty()))
+                .unwrap_or_else(|| "unknown peer".into())
         };
         let any_agent = sessions.iter().any(|s| s.kind == SessionKind::Agent);
         for s in sessions {
@@ -134,11 +135,12 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
             } else {
                 ""
             };
-            items.push(Item::Label(format!(
-                "Connected: {} ({}){agent}",
-                name(s),
-                s.peer_id
-            )));
+            let id = if s.peer_id.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", s.peer_id)
+            };
+            items.push(Item::Label(format!("Connected: {}{id}{agent}", name(s))));
         }
         let mut b = format!("● {}", name(&sessions[0]));
         if sessions.len() > 1 {
@@ -210,7 +212,11 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
             let title = if r.unattended_ready {
                 "Readiness: Unattended ready".to_string()
             } else {
-                format!("Readiness: {} to fix", failing.len().max(1))
+                if failing.is_empty() {
+                    "Readiness: awaiting confirmation".to_string()
+                } else {
+                    format!("Readiness: {} to fix", failing.len())
+                }
             };
             let mut sub: Vec<Item> = failing
                 .iter()

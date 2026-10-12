@@ -29,16 +29,18 @@ Keywords MUST, SHOULD and MAY are used in the RFC 2119 sense.
 
 | | macOS | Windows |
 |---|---|---|
-| Endpoint | Unix domain stream socket `/tmp/RemoteSmith/remotesmith-ipc-<uid>.sock` (`<uid>` = numeric uid of the logged-in user, e.g. `501`) | Named pipe `\\.\pipe\RemoteSmith-ipc-<username>` (`<username>` = `%USERNAME%`), byte mode |
+| Endpoint | Unix domain stream socket `/tmp/RemoteSmith-<uid>/remotesmith-ipc.sock` (`<uid>` = numeric effective uid of the logged-in user, e.g. `501`). The directory is the per-user IPC directory the fork already uses for its own IPC (hbb_common `ipc_parent_dir_for_uid`, created mode `0700` by `ensure_secure_ipc_parent_dir`) | Named pipe `\\.\pipe\RemoteSmith-ipc-<username>` (`<username>` = `%USERNAME%`), byte mode |
 | Who listens | the user's fork process (the UI/`--server` process running as that user, not the root service) | the user's fork process in the user's session (not the SYSTEM service) |
-| Permissions | socket file mode `0600`, owned by the user. The directory `/tmp/RemoteSmith` is shared with the fork's own IPC and is not trusted on its own | DACL grants `GENERIC_ALL` to the current user's SID only (SDDL `D:P(A;;GA;;;<user SID>)`); created with `FILE_FLAG_FIRST_PIPE_INSTANCE` so another process cannot pre-create the name; remote clients rejected (`PIPE_REJECT_REMOTE_CLIENTS`) |
-| Stale endpoint | before binding, the server removes an existing socket file only if it is owned by the same uid and a connect to it fails | n/a (pipes vanish with their last handle) |
-| Client checks | the client MUST refuse a socket whose owner uid is not its own effective uid | the ACL plus first-instance flag cover squatting (see §10, deferred client-side SID check) |
-| Concurrency | the server SHOULD accept at least 4 and MAY cap at 8 simultaneous clients; extra clients are closed immediately | same; a new pipe instance is created for each connection |
+| Server: endpoint permissions | the directory MUST be a real directory (not a symlink) owned by the user with no group/other access (`mode & 077 == 0`); create it `0700` if missing, refuse to bind otherwise. Socket file mode `0600` | DACL grants `GENERIC_ALL` to the current user's SID only (SDDL `D:P(A;;GA;;;<user SID>)`); `PIPE_REJECT_REMOTE_CLIENTS`; first instance created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so if the name already exists (someone squatted it) the fork's create fails and it logs an error rather than sharing the name |
+| Server: client check | after `accept`, the server MUST check the peer credentials (`getpeereid` / tokio `peer_cred()`) and close any client whose uid is not its own | the DACL keeps other users out |
+| Stale endpoint | before binding, the server removes an existing socket only if it is owned by the same uid and a connect to it fails; a live one is never stolen. On exit it unlinks the socket only if it is still the inode it bound | n/a (pipes vanish with their last handle) |
+| Client checks | `lstat` the socket (must be a socket, not a symlink); the parent directory must pass the same private-directory check; after connecting, the server's peer credentials MUST equal the client's effective uid. The last check is authoritative and immune to path races | after opening, `GetNamedPipeServerProcessId` → that process's token user SID MUST equal the client's SID; otherwise disconnect. This defeats a process that created the pipe name before the fork |
+| Concurrency | the server SHOULD accept at least 4 and MAY cap at 8 simultaneous clients; extra clients are closed immediately. A failed `accept` is logged and retried after a short pause; it never ends the endpoint | same; a new pipe instance is created for each connection, and after a failed `ConnectNamedPipe` (e.g. `ERROR_NO_DATA`) a fresh instance replaces it |
 
 The `<uid>` / `<username>` suffix keeps two logged-in users (fast user switching) from colliding.
 For tests and the dev tool, both sides honour the environment variable `REMOTESMITH_IPC_PATH`,
-which replaces the whole endpoint path (socket path or `\\.\pipe\...` name).
+which replaces the whole endpoint path (socket path or `\\.\pipe\...` name); the
+private-directory rules still apply to an overridden socket path.
 
 ## 3. Framing and limits
 
@@ -54,8 +56,15 @@ which replaces the whole endpoint path (socket path or `\\.\pipe\...` name).
   **with** `id` is the response to that request; a server message **without** `id` is a pushed
   event. Every request gets exactly one response (success type or `error`).
 - `"type"` (string, snake_case) names the message.
-- Unknown fields MUST be ignored by both sides. JSON `null` and an absent optional field mean the
-  same thing.
+- Unknown fields MUST be ignored by both sides.
+- **Leniency inside objects.** Fields marked *required* below (`id` of a peer, `name` of a
+  permission, the top-level `status` / `peers` of their messages, `version`/`min_version`/
+  `max_version` of `hello_ok`, `code` of an error) must be present with the right type, or the
+  element / message is rejected. For every other field, an absent value, JSON `null`, a wrong
+  JSON type or an unrecognised shape is treated as that field's default (shown in brackets in §7
+  and §8) rather than rejecting the whole message, and an array element that cannot be read is
+  dropped while the rest of the array is kept. A receiver must never keep showing stale state
+  because one field of a fresh message was odd.
 
 ## 4. Version negotiation
 
@@ -116,6 +125,10 @@ belong to the fork). The response only says whether the attempt was started:
   DEF-9 coalescing).
 - `error` with `peer_unknown` (not in the fork's peer list), `peer_unavailable` (fork already knows
   it cannot connect; `message` says why), or `internal`.
+
+A Connect click made while the link is not up fails immediately in the tray with the reason
+(nothing is queued for later). One made while the handshake is in progress is sent right after
+`hello_ok`, within the 5 s request timeout.
 
 The final outcome MAY be pushed later as a `connect_result` event. Failures are always also shown
 in the fork's own session window — the sidecar is never the only place an error appears.
@@ -194,7 +207,7 @@ brackets) so additive changes stay compatible. Timestamps are integer **Unix sec
 | `my_id` | string? | this machine's RustDesk ID (shown in tray for TOFU checks, §7 of PLAN) |
 | `key_fingerprint` | string? | fingerprint of this host's **public** key, same format the client's TOFU prompt shows |
 | `service.running` | bool [false] | the RemoteSmith service (macOS LaunchDaemon / Windows service) is running |
-| `permissions[]` | array [[]] | macOS TCC state; empty on Windows. `name`: `accessibility`, `screen_recording`, `input_monitoring`, `system_audio_recording`, or another string. `state`: `granted` \| `missing` \| `unknown` (other strings → `unknown`). `detail` string? |
+| `permissions[]` | array [[]] | macOS TCC state; empty on Windows. On macOS the fork MUST report all four names below; the sidecar treats any of the four that is missing from the list as `unknown` (failing). `name` is required. `name`: `accessibility`, `screen_recording`, `input_monitoring`, `system_audio_recording`, or another string. `state`: `granted` \| `missing` \| `unknown` (other strings → `unknown`). `detail` string? |
 | `power.sleep_disabled` | bool? | true when the machine is set never to sleep on AC power; null = could not determine |
 | `preboot_unlock.detected` | bool? | true when a pre-boot unlock would block unattended reboot (FileVault on macOS without auto-unlock, BitLocker with PIN on Windows; ASM-1); null = unknown |
 | `server.state` | `registered` \| `registering` \| `not_configured` \| `failed` \| other [`unknown`] | registration with hbbs; `host` string?, `detail` string? |
@@ -202,13 +215,14 @@ brackets) so additive changes stay compatible. Timestamps are integer **Unix sec
 | `unattended.cold_boot_verified_at` | u64? | when that cold-boot connection was recorded |
 | `inbound_sessions[]` | array [[]] | every active **inbound** session (someone controlling this machine) |
 | `.conn_id` | u64 | fork-local connection id, unique while the session lives |
-| `.peer_id` | string | controlling peer's ID |
+| `.peer_id` | string [""] | controlling peer's ID (a session with an unreadable id is still shown, as "unknown peer", so the badge never silently disappears) |
 | `.alias` | string? | its alias/hostname if known |
 | `.kind` | `human` \| `agent` (other → `human`) | `agent` while an MCP agent holds the control grant on that connection (v3; always `human` in v1) |
 | `.since` | u64? | session start |
 
 **Readiness (§6.3, AC-55).** The sidecar derives one check per prerequisite: service running; each
-macOS permission granted; sleep disabled; no pre-boot unlock; server registered; cold-boot
+of the four macOS permissions granted (on `platform` other than `macos`/`windows`, an extra
+"Platform" check is unknown); sleep disabled; no pre-boot unlock; server registered; cold-boot
 connection recorded. Any `false`, `missing` or `null`/`unknown` value is a failing (or unknown)
 check, named in the tray. The tray shows **"Unattended ready"** only when `unattended.ready` is true
 **and** every derived check passes — the sidecar re-checks rather than trusting the flag alone.
@@ -260,8 +274,8 @@ or another string (displayed verbatim). Used by `unavailable` presence and `conn
 | stale link | no line received for 12 s → link considered dead: peers unknown, reconnect | client |
 | idle client | server MAY close a client silent for 60 s (pings keep it alive) | server |
 | reconnect backoff | 250 ms doubling to 5 s max; reset after a successful `hello_ok`; 30 s after a version mismatch | client |
-| slow reader | per-connection outbound queue of 256 messages; when full the server drops that client rather than block | server |
-| write | a single write blocked for 5 s → drop the client | server |
+| slow reader | the server MUST NOT let a client that stops reading block anything but that client's own task: either a bounded per-connection queue (e.g. 256 messages; drop the client when full) or a per-write timeout. The reference server uses the timeout | server |
+| write | a single write blocked for 5 s → drop the client | both |
 
 ## 10. Malformed input
 
@@ -292,7 +306,7 @@ Receivers are hostile-input safe:
 
 ## 12. Known gaps (deferred)
 
-- Windows client-side server identity check (`GetNamedPipeServerProcessId` → token SID equals ours).
-  The server-side DACL and `FILE_FLAG_FIRST_PIPE_INSTANCE` are the v1 defence; the data at risk is
-  non-secret (peer IDs, presence) and `connect` carries no credentials.
+- Windows has no text next to the tray icon: the session badge appears as a different icon, the
+  tooltip ("RemoteSmith — <peer> · agent") and the first menu rows. macOS shows the text in the
+  menu bar.
 - v2 adds Deskflow state (desk-mode topic) as an additive change within v1 or as v2.

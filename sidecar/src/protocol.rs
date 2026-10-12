@@ -71,15 +71,16 @@ pub enum ServerMessage {
         version: u32,
         min_version: u32,
         max_version: u32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "lenient")]
         server: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "lenient")]
         server_version: String,
     },
     Status {
         status: Box<Status>,
     },
     Peers {
+        #[serde(deserialize_with = "lenient_vec")]
         peers: Vec<Peer>,
     },
     ConnectStarted {
@@ -88,12 +89,21 @@ pub enum ServerMessage {
     ConnectResult {
         peer_id: String,
         ok: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
         reason: Option<Reason>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
         detail: Option<String>,
     },
     Subscribed {
+        #[serde(default, deserialize_with = "lenient_vec")]
         topics: Vec<Topic>,
     },
     Pong,
@@ -108,12 +118,20 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: ErrorCode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub message: String,
     /// Only on `version_mismatch`: the server's supported range.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_version: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_version: Option<u32>,
 }
 
@@ -158,32 +176,49 @@ pub enum Platform {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Status {
+    #[serde(deserialize_with = "lenient")]
     pub app_version: String,
+    #[serde(deserialize_with = "lenient")]
     pub platform: Platform,
+    #[serde(deserialize_with = "lenient")]
     pub my_id: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     pub key_fingerprint: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     pub service: ServiceStatus,
+    #[serde(deserialize_with = "lenient_vec")]
     pub permissions: Vec<PermissionStatus>,
+    #[serde(deserialize_with = "lenient")]
     pub power: PowerStatus,
+    #[serde(deserialize_with = "lenient")]
     pub preboot_unlock: PrebootStatus,
+    #[serde(deserialize_with = "lenient")]
     pub server: ServerStatus,
+    #[serde(deserialize_with = "lenient")]
     pub unattended: UnattendedStatus,
+    #[serde(deserialize_with = "lenient_vec")]
     pub inbound_sessions: Vec<InboundSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ServiceStatus {
+    #[serde(deserialize_with = "lenient")]
     pub running: bool,
+    #[serde(deserialize_with = "lenient")]
     pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionStatus {
     pub name: Permission,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub state: PermState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<String>,
 }
 
@@ -223,22 +258,29 @@ pub enum PermState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PowerStatus {
+    #[serde(deserialize_with = "lenient")]
     pub sleep_disabled: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
     pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PrebootStatus {
+    #[serde(deserialize_with = "lenient")]
     pub detected: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
     pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ServerStatus {
+    #[serde(deserialize_with = "lenient")]
     pub state: RegState,
+    #[serde(deserialize_with = "lenient")]
     pub host: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     pub detail: Option<String>,
 }
 
@@ -257,20 +299,23 @@ pub enum RegState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct UnattendedStatus {
+    #[serde(deserialize_with = "lenient")]
     pub ready: bool,
+    #[serde(deserialize_with = "lenient")]
     pub cold_boot_verified_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboundSession {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub conn_id: u64,
+    #[serde(default, deserialize_with = "lenient")]
     pub peer_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub alias: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub kind: SessionKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub since: Option<u64>,
 }
 
@@ -287,11 +332,11 @@ pub enum SessionKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub alias: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub platform: Option<Platform>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub presence: Presence,
 }
 
@@ -301,13 +346,23 @@ pub struct Peer {
 pub enum Presence {
     Checking,
     Reachable {
+        #[serde(default, deserialize_with = "lenient")]
         route: Route,
     },
     Unavailable {
+        #[serde(default, deserialize_with = "lenient")]
         reason: Reason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
         detail: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "lenient",
+            skip_serializing_if = "Option::is_none"
+        )]
         last_seen: Option<u64>,
     },
     /// The sidecar's own state; also the fallback for any unrecognised state.
@@ -363,6 +418,46 @@ impl Reason {
             Reason::Cancelled => "cancelled".into(),
             Reason::Other(s) => s.clone(),
         }
+    }
+}
+
+// ---- leniency (docs/IPC.md §3, §11) -------------------------------------------------------
+// null, a wrong JSON type or an unrecognised shape in a defaulted field yields that field's
+// default, and a bad element of a list is dropped, instead of rejecting the whole message
+// (which would leave stale state on screen).
+
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(T::deserialize(v).unwrap_or_default())
+}
+
+fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|e| T::deserialize(e).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Route::Other("unknown route".into())
+    }
+}
+
+impl Default for Reason {
+    fn default() -> Self {
+        Reason::Other("unspecified".into())
     }
 }
 
@@ -723,6 +818,67 @@ mod tests {
                 .unwrap();
         let re = encode(1, env.id, env.body);
         assert!(!re.contains("hunter2"));
+    }
+
+    #[test]
+    fn nulls_wrong_types_and_bad_elements_do_not_reject_the_message() {
+        let st = r#"{"v":1,"type":"status","status":{"app_version":null,"platform":null,"service":null,
+            "permissions":[{"name":"accessibility","state":null},{"state":"granted"},7,{"name":"screen_recording","state":"granted"}],
+            "power":{"sleep_disabled":"yes"},"server":null,"unattended":{"ready":null},
+            "inbound_sessions":[{"conn_id":null,"kind":null,"peer_id":"9"},{"alias":"x"},"junk"]}}"#
+            .replace('\n', "");
+        let env: Envelope<ServerMessage> = decode(st.as_bytes()).unwrap();
+        let ServerMessage::Status { status } = env.body else {
+            panic!()
+        };
+        assert_eq!(status.platform, Platform::Other);
+        assert!(!status.service.running);
+        // Element without a name is dropped; others kept.
+        assert_eq!(status.permissions.len(), 2);
+        assert_eq!(status.permissions[0].state, PermState::Unknown);
+        assert_eq!(status.power.sleep_disabled, None);
+        assert_eq!(status.server.state, RegState::Unknown);
+        assert!(!status.unattended.ready);
+        // Sessions stay visible even when malformed (badge must not silently clear).
+        assert_eq!(status.inbound_sessions.len(), 2);
+        assert_eq!(status.inbound_sessions[0].peer_id, "9");
+        assert_eq!(status.inbound_sessions[1].peer_id, "");
+
+        let peers = r#"{"v":1,"type":"peers","peers":[{"id":"1","presence":null},{"id":"2","alias":5,
+            "presence":{"state":"reachable"}},{"id":"3","presence":{"state":"unavailable","last_seen":"x"}},{"alias":"no id"}]}"#
+            .replace('\n', "");
+        let env: Envelope<ServerMessage> = decode(peers.as_bytes()).unwrap();
+        let ServerMessage::Peers { peers } = env.body else {
+            panic!()
+        };
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].presence, Presence::Unknown);
+        assert_eq!(peers[1].alias, None);
+        assert_eq!(
+            peers[1].presence,
+            Presence::Reachable {
+                route: Route::Other("unknown route".into())
+            }
+        );
+        assert_eq!(
+            peers[2].presence,
+            Presence::Unavailable {
+                reason: Reason::Other("unspecified".into()),
+                detail: None,
+                last_seen: None
+            }
+        );
+
+        let e = r#"{"v":1,"id":1,"type":"error","error":{"code":"version_mismatch","message":null,"min_version":2,"max_version":3}}"#;
+        let env: Envelope<ServerMessage> = decode(e.as_bytes()).unwrap();
+        let ServerMessage::Error { error } = env.body else {
+            panic!()
+        };
+        assert_eq!(error.code, ErrorCode::VersionMismatch);
+        assert_eq!((error.min_version, error.max_version), (Some(2), Some(3)));
+
+        let h = r#"{"v":1,"id":1,"type":"hello_ok","version":1,"min_version":1,"max_version":1,"server":null,"server_version":null}"#;
+        assert!(decode::<ServerMessage>(h.as_bytes()).is_ok());
     }
 
     #[test]

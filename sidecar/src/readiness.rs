@@ -1,6 +1,6 @@
 //! Readiness check derived from the fork's status (§6.3, AC-55).
 
-use crate::protocol::{PermState, RegState, Status};
+use crate::protocol::{PermState, Permission, PermissionStatus, Platform, RegState, Status};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,14 @@ fn with_detail(base: &str, detail: &Option<String>) -> String {
     }
 }
 
+/// macOS permissions RemoteSmith needs (FLOW-1).
+pub const REQUIRED_MACOS_PERMISSIONS: [Permission; 4] = [
+    Permission::Accessibility,
+    Permission::ScreenRecording,
+    Permission::InputMonitoring,
+    Permission::SystemAudioRecording,
+];
+
 pub fn checks_for(status: &Status) -> Vec<Check> {
     let mut out = Vec::new();
     out.push(check(
@@ -60,7 +68,28 @@ pub fn checks_for(status: &Status) -> Vec<Check> {
             Outcome::Fail(with_detail("service not running", &status.service.detail))
         },
     ));
-    for p in &status.permissions {
+    // The sidecar re-checks rather than trusting the fork: on macOS every required permission
+    // must be reported granted; one the fork leaves out counts as unknown (AC-55).
+    let mut perms: Vec<PermissionStatus> = status.permissions.clone();
+    match status.platform {
+        Platform::Macos => {
+            for req in REQUIRED_MACOS_PERMISSIONS {
+                if !perms.iter().any(|p| p.name == req) {
+                    perms.push(PermissionStatus {
+                        name: req,
+                        state: PermState::Unknown,
+                        detail: Some("not reported by RemoteSmith".into()),
+                    });
+                }
+            }
+        }
+        Platform::Windows => {}
+        Platform::Other => out.push(check(
+            "Platform",
+            Outcome::Unknown("RemoteSmith did not report its platform".into()),
+        )),
+    }
+    for p in &perms {
         let label = format!("{} permission", p.name.display_name());
         let outcome = match p.state {
             PermState::Granted => Outcome::Pass,
@@ -263,6 +292,30 @@ mod tests {
         assert!(r.checks.is_none());
         assert!(!r.unattended_ready);
         assert_eq!(r.unknown_reason.as_deref(), Some("app not running"));
+    }
+
+    #[test]
+    fn unreported_macos_permission_blocks_ready() {
+        let mut st = passing_status();
+        st.permissions
+            .retain(|p| p.name != Permission::ScreenRecording);
+        let r = evaluate(&state_with(st.clone()));
+        assert!(!r.unattended_ready);
+        let failing: Vec<_> = r.failing().iter().map(|c| c.label.clone()).collect();
+        assert_eq!(failing, vec!["Screen Recording permission".to_string()]);
+        st.permissions.clear();
+        let r = evaluate(&state_with(st));
+        assert_eq!(r.failing().len(), 4);
+        assert!(!r.unattended_ready);
+    }
+
+    #[test]
+    fn unknown_platform_blocks_ready() {
+        let mut st = passing_status();
+        st.platform = Platform::Other;
+        let r = evaluate(&state_with(st));
+        assert!(!r.unattended_ready);
+        assert_eq!(r.failing()[0].label, "Platform");
     }
 
     #[test]

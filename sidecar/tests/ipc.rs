@@ -23,6 +23,9 @@ fn endpoint() -> Endpoint {
             .prefix("rs")
             .tempdir_in("/tmp")
             .unwrap();
+        // Mirror the fork's private per-user IPC directory (mode 0700).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("ipc.sock").to_string_lossy().into_owned();
         Endpoint {
             path,
@@ -257,7 +260,13 @@ async fn inbound_session_badge_appears_and_clears_quickly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_mismatch_shows_unknown_and_sends_nothing() {
+    // Start with a good fork so peers are cached, then "upgrade" it to an incompatible version.
     let ep = endpoint();
+    let good = start_fork(&ep.path, FakeConfig::default(), snapshot()).await;
+    let mut c = start_client(fast_cfg(&ep.path));
+    c.wait_for("up", reachable).await;
+    good.task.abort();
+    c.wait_for("down", |s| !s.link.is_up()).await;
     let fork = start_fork(
         &ep.path,
         FakeConfig {
@@ -268,7 +277,6 @@ async fn version_mismatch_shows_unknown_and_sends_nothing() {
         snapshot(),
     )
     .await;
-    let mut c = start_client(fast_cfg(&ep.path));
     let s = c
         .wait_for("mismatch", |s| matches!(s.link, Link::Mismatch { .. }))
         .await;
@@ -280,6 +288,7 @@ async fn version_mismatch_shows_unknown_and_sends_nothing() {
         }
     );
     assert!(s.status.is_none());
+    assert!(s.peers.iter().all(|p| p.presence == Presence::Unknown));
     let m = menu_model::build(&s, 0);
     assert!(
         m.texts()
@@ -288,9 +297,15 @@ async fn version_mismatch_shows_unknown_and_sends_nothing() {
         "{:#?}",
         m.texts()
     );
-    // Connect fails locally with the reason; nothing reaches the fork.
-    // (No peers are cached because the link never came up, so seed none and check the log.)
+    assert!(!m.texts().iter().any(|t| t.contains("Unattended ready")));
+    // Connect fails locally with the reason; nothing reaches the mismatched fork.
     c.cmds.send(Command::Connect("1".into())).unwrap();
+    let s = c
+        .wait_for("connect refused locally", |s| {
+            matches!(&s.peers[0].connect, ConnectState::Failed(r) if r.contains("version mismatch"))
+        })
+        .await;
+    assert!(matches!(s.link, Link::Mismatch { .. }));
     tokio::time::sleep(Duration::from_millis(700)).await; // spans at least one re-handshake
     assert!(fork.connects.lock().unwrap().is_empty());
     assert!(
@@ -323,7 +338,7 @@ async fn fork_restart_reconnects() {
     )
     .await;
 
-    // Restart on the same endpoint (stale socket handled) with a changed peer list.
+    // Restart on the same endpoint with a changed peer list.
     let mut snap = snapshot();
     snap.peers.truncate(1);
     snap.peers[0].presence = Presence::Reachable { route: Route::Id };
@@ -371,6 +386,34 @@ async fn hung_fork_is_detected_as_stale() {
     let fork = start_fork(
         &ep.path,
         FakeConfig {
+            silent_after_subscribe: true,
+            ..Default::default()
+        },
+        snapshot(),
+    )
+    .await;
+    let mut c = start_client(fast_cfg(&ep.path));
+    c.wait_for("up", reachable).await;
+    let s = c
+        .wait_for("stale -> down", |s| matches!(s.link, Link::Down { .. }))
+        .await;
+    assert_eq!(
+        s.link,
+        Link::Down {
+            reason: "RemoteSmith stopped responding".into()
+        }
+    );
+    assert!(s.peers.iter().all(|p| p.presence == Presence::Unknown));
+    c.stop().await;
+    fork.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_ignoring_subscribe_times_out() {
+    let ep = endpoint();
+    let fork = start_fork(
+        &ep.path,
+        FakeConfig {
             silent_after_hello: true,
             ..Default::default()
         },
@@ -380,9 +423,14 @@ async fn hung_fork_is_detected_as_stale() {
     let mut c = start_client(fast_cfg(&ep.path));
     c.wait_for("up", |s| s.link.is_up()).await;
     let s = c
-        .wait_for("stale -> down", |s| matches!(s.link, Link::Down { .. }))
+        .wait_for("down", |s| matches!(s.link, Link::Down { .. }))
         .await;
-    assert!(s.link.unknown_reason().is_some());
+    assert_eq!(
+        s.link,
+        Link::Down {
+            reason: "RemoteSmith did not accept subscribe".into()
+        }
+    );
     c.stop().await;
     fork.task.abort();
 }
@@ -469,6 +517,21 @@ async fn server_rejects_bad_input_and_keeps_serving() {
         next(&mut rd, &mut line).await.body,
         ServerMessage::HelloOk { version: 1, .. }
     ));
+    // A second hello and a wrong protocol version are both rejected.
+    wr.write_all(b"{\"v\":1,\"id\":2,\"type\":\"hello\",\"min_version\":1,\"max_version\":1,\"client\":\"t\",\"client_version\":\"0\"}\n")
+        .await
+        .unwrap();
+    assert!(
+        matches!(next(&mut rd, &mut line).await.body, ServerMessage::Error { error } if error.code == ErrorCode::BadRequest)
+    );
+    wr.write_all(b"{\"v\":2,\"id\":3,\"type\":\"ping\"}\n")
+        .await
+        .unwrap();
+    let e = next(&mut rd, &mut line).await;
+    assert_eq!(e.id, Some(3));
+    assert!(
+        matches!(e.body, ServerMessage::Error { error } if error.code == ErrorCode::BadRequest)
+    );
     // Unknown request type.
     wr.write_all(b"{\"v\":1,\"id\":7,\"type\":\"reboot\"}\n")
         .await
@@ -613,6 +676,9 @@ mod unix_raw {
     async fn socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
         let ep = endpoint();
+        // A stale socket left by a crashed fork (std's listener never unlinks) is replaced.
+        drop(std::os::unix::net::UnixListener::bind(&ep.path).unwrap());
+        assert!(std::fs::symlink_metadata(&ep.path).is_ok());
         let fork = start_fork(&ep.path, FakeConfig::default(), snapshot()).await;
         let mode = std::fs::metadata(&ep.path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -622,5 +688,43 @@ mod unix_raw {
             std::io::ErrorKind::AddrInUse
         );
         fork.task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_directory_is_refused_by_both_sides() {
+        use std::os::unix::fs::PermissionsExt;
+        let ep = endpoint();
+        let dir = std::path::Path::new(&ep.path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let fork = start_fork(&ep.path, FakeConfig::default(), snapshot()).await;
+        // Someone loosens the directory: the client must refuse to trust what is inside.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = remotesmith_tray::transport::connect(&ep.path)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        fork.task.abort();
+        assert_eq!(
+            bind(&ep.path).await.err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlinked_socket_is_refused() {
+        let ep = endpoint();
+        let real = start_fork(&ep.path, FakeConfig::default(), snapshot()).await;
+        let link = std::path::Path::new(&ep.path).with_file_name("link.sock");
+        std::os::unix::fs::symlink(&ep.path, &link).unwrap();
+        let e = remotesmith_tray::transport::connect(link.to_str().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        real.task.abort();
     }
 }

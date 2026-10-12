@@ -255,6 +255,9 @@ async fn session<F: FnMut(&AppState)>(
             }
             Some(LineRead::TooLong) => {
                 malformed += 1;
+                if malformed >= cfg.max_malformed {
+                    return fail("too many malformed messages from RemoteSmith".into(), false);
+                }
                 continue;
             }
             Some(LineRead::Line(b)) => b,

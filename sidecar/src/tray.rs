@@ -52,11 +52,17 @@ fn make_icon(active: bool) -> Option<Icon> {
     Icon::from_rgba(icon_rgba(size, active, rgb), size, size).ok()
 }
 
-fn render_items(
-    items: &[Item],
-    actions: &mut HashMap<MenuId, Action>,
-    next: &mut u32,
-) -> Vec<Box<dyn IsMenuItem>> {
+/// Stable menu id for an action, so a click on a menu opened before a rebuild still maps to
+/// the action the user saw (ids never shift with position).
+pub fn action_id(action: &Action) -> String {
+    match action {
+        Action::Connect(peer) => format!("connect:{peer}"),
+        Action::OpenApp => "open".into(),
+        Action::Quit => "quit".into(),
+    }
+}
+
+fn render_items(items: &[Item], actions: &mut HashMap<MenuId, Action>) -> Vec<Box<dyn IsMenuItem>> {
     let mut out: Vec<Box<dyn IsMenuItem>> = Vec::new();
     for item in items {
         match item {
@@ -67,14 +73,20 @@ fn render_items(
                 action,
                 enabled,
             } => {
-                let id = MenuId::new(format!("rs-{next}"));
-                *next += 1;
+                let base = action_id(action);
+                let mut id = base.clone();
+                let mut n = 2;
+                while actions.contains_key(&MenuId::new(&id)) {
+                    id = format!("{base}#{n}");
+                    n += 1;
+                }
+                let id = MenuId::new(id);
                 actions.insert(id.clone(), action.clone());
                 out.push(Box::new(MenuItem::with_id(id, text, *enabled, None)));
             }
             Item::Submenu { text, items } => {
                 let sub = Submenu::new(text, true);
-                for child in render_items(items, actions, next) {
+                for child in render_items(items, actions) {
                     let _ = sub.append(child.as_ref());
                 }
                 out.push(Box::new(sub));
@@ -87,8 +99,7 @@ fn render_items(
 fn render(model: &MenuModel) -> (Menu, HashMap<MenuId, Action>) {
     let menu = Menu::new();
     let mut actions = HashMap::new();
-    let mut next = 0;
-    for item in render_items(&model.items, &mut actions, &mut next) {
+    for item in render_items(&model.items, &mut actions) {
         let _ = menu.append(item.as_ref());
     }
     (menu, actions)
@@ -109,10 +120,9 @@ pub fn run(cfg: ClientConfig) -> ! {
         let _ = proxy.send_event(UserEvent::Menu(e));
     }));
     let proxy = event_loop.create_proxy();
-    let (cmds, ipc_thread) = client::spawn(cfg, move |s: &AppState| {
+    let (cmds, _ipc_thread) = client::spawn(cfg, move |s: &AppState| {
         let _ = proxy.send_event(UserEvent::State(Box::new(s.clone())));
     });
-    let mut ipc_thread = Some(ipc_thread);
 
     let mut tray: Option<TrayIcon> = None;
     let mut state = AppState::default();
@@ -164,10 +174,10 @@ pub fn run(cfg: ClientConfig) -> ! {
                 }
                 Some(Action::Quit) => {
                     log::info!("quit from tray");
+                    // Don't join the IPC thread here: it may sit in a bounded connect/hello/write
+                    // wait, and the menu bar must not freeze. It holds no state worth flushing;
+                    // process exit ends it.
                     let _ = cmds.send(Command::Shutdown);
-                    if let Some(h) = ipc_thread.take() {
-                        let _ = h.join();
-                    }
                     tray.take();
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -202,6 +212,34 @@ pub fn run(cfg: ClientConfig) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_ids_are_stable_and_unique() {
+        use crate::menu_model::Item;
+        assert_eq!(action_id(&Action::Connect("42".into())), "connect:42");
+        let mut actions = HashMap::new();
+        let items = vec![
+            Item::Action {
+                text: "Add".into(),
+                action: Action::OpenApp,
+                enabled: true,
+            },
+            Item::Action {
+                text: "Open".into(),
+                action: Action::OpenApp,
+                enabled: true,
+            },
+            Item::Action {
+                text: "Quit".into(),
+                action: Action::Quit,
+                enabled: true,
+            },
+        ];
+        let _ = render_items(&items, &mut actions);
+        assert_eq!(actions.get(&MenuId::new("open")), Some(&Action::OpenApp));
+        assert_eq!(actions.get(&MenuId::new("open#2")), Some(&Action::OpenApp));
+        assert_eq!(actions.get(&MenuId::new("quit")), Some(&Action::Quit));
+    }
 
     #[test]
     fn icon_shapes() {

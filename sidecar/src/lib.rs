@@ -14,3 +14,5 @@ pub mod readiness;
 pub mod state;
 pub mod transport;
 pub mod tray;
+#[cfg(windows)]
+pub mod winsec;

@@ -141,6 +141,14 @@ pub fn uninstall() -> io::Result<String> {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().ok_or_else(|| io::Error::other("no home directory"))?;
+        // Unload it too, or a loaded agent keeps relaunching the tray until logout.
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let _ = std::process::Command::new("/bin/launchctl")
+            .arg("bootout")
+            .arg(format!("gui/{uid}/{LAUNCH_AGENT_LABEL}"))
+            .stderr(std::process::Stdio::null())
+            .status();
         Ok(if uninstall_launch_agent(&home)? {
             "removed LaunchAgent"
         } else {

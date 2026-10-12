@@ -33,6 +33,8 @@ pub struct FakeConfig {
     pub garbage: bool,
     /// Never answer anything after hello_ok (simulates a hung fork).
     pub silent_after_hello: bool,
+    /// Answer hello and subscribe (with the snapshot), then never send anything again.
+    pub silent_after_subscribe: bool,
     /// Push `connect_result{ok:true}` this long after `connect_started`.
     pub connect_result_after: Option<Duration>,
     pub hello_deadline: Duration,
@@ -48,6 +50,7 @@ impl Default for FakeConfig {
             server_version: "fake-fork".into(),
             garbage: false,
             silent_after_hello: false,
+            silent_after_subscribe: false,
             connect_result_after: None,
             hello_deadline: Duration::from_secs(5),
             max_clients: 8,
@@ -65,29 +68,40 @@ pub type ConnectLog = Arc<Mutex<Vec<String>>>;
 pub struct Listener {
     inner: tokio::net::UnixListener,
     path: std::path::PathBuf,
+    /// (dev, ino) of the socket we bound, so Drop never unlinks a successor's socket.
+    ident: (u64, u64),
 }
 
 #[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::symlink_metadata(&self.path) {
+            if (m.dev(), m.ino()) == self.ident {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
-/// Bind the endpoint (docs/IPC.md §2).
+/// Bind the endpoint (docs/IPC.md §2): the parent directory must be private to this user
+/// (created 0700 if missing), a stale socket of ours is replaced, a live one is never stolen.
 #[cfg(unix)]
 pub async fn bind(endpoint: &str) -> io::Result<Listener> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use crate::transport::{check_private_dir, euid};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let path = std::path::PathBuf::from(endpoint);
-    if let Some(dir) = path.parent() {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-        }
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no parent"))?;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
-    // SAFETY: no preconditions.
-    let me = unsafe { libc::geteuid() };
+    check_private_dir(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if meta.uid() != me {
+        if meta.uid() != euid() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "endpoint owned by another user",
@@ -102,8 +116,14 @@ pub async fn bind(endpoint: &str) -> io::Result<Listener> {
         std::fs::remove_file(&path)?;
     }
     let inner = tokio::net::UnixListener::bind(&path)?;
+    // The 0700 directory already keeps other users out; 0600 is belt and braces.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(Listener { inner, path })
+    let m = std::fs::symlink_metadata(&path)?;
+    Ok(Listener {
+        inner,
+        path,
+        ident: (m.dev(), m.ino()),
+    })
 }
 
 #[cfg(unix)]
@@ -112,10 +132,8 @@ impl Listener {
         loop {
             let (s, _) = self.inner.accept().await?;
             // Peer-credential check: only our own user may talk to us.
-            // SAFETY: no preconditions.
-            let me = unsafe { libc::geteuid() };
             match s.peer_cred() {
-                Ok(c) if c.uid() == me => return Ok(s),
+                Ok(c) if c.uid() == crate::transport::euid() => return Ok(s),
                 Ok(c) => log::warn!("rejected IPC client with uid {}", c.uid()),
                 Err(e) => log::warn!("rejected IPC client: no peer credentials ({e})"),
             }
@@ -130,85 +148,6 @@ pub struct Listener {
 }
 
 #[cfg(windows)]
-mod win_acl {
-    use std::ffi::c_void;
-    use std::io;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-        TOKEN_USER,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    /// String SID of the current process user.
-    fn current_user_sid() -> io::Result<String> {
-        // SAFETY: standard token query sequence; every buffer is sized from the first call and
-        // every handle / allocation is released before returning.
-        unsafe {
-            let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut len = 0u32;
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
-            let mut buf = vec![0u8; len as usize];
-            let ok = GetTokenInformation(
-                token,
-                TokenUser,
-                buf.as_mut_ptr() as *mut c_void,
-                len,
-                &mut len,
-            );
-            CloseHandle(token);
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut wide: *mut u16 = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut wide) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut n = 0;
-            while *wide.add(n) != 0 {
-                n += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(wide, n));
-            LocalFree(wide as _);
-            Ok(s)
-        }
-    }
-
-    /// SECURITY_ATTRIBUTES granting GENERIC_ALL to the current user only. Leaked on purpose:
-    /// it must outlive every pipe instance created from it.
-    pub fn user_only() -> io::Result<&'static mut SECURITY_ATTRIBUTES> {
-        let sddl = format!("D:P(A;;GA;;;{})", current_user_sid()?);
-        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: `wide` is NUL-terminated; on success `sd` is a LocalAlloc'd descriptor we keep.
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                wide.as_ptr(),
-                SDDL_REVISION_1,
-                &mut sd,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Box::leak(Box::new(SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd,
-            bInheritHandle: 0,
-        })))
-    }
-}
-
-#[cfg(windows)]
 fn create_pipe(
     name: &str,
     first: bool,
@@ -218,7 +157,7 @@ fn create_pipe(
     let sa = match SA.get() {
         Some(p) => *p,
         None => {
-            let p = win_acl::user_only()? as *mut _ as usize;
+            let p = crate::winsec::user_only_security_attributes()? as *mut _ as usize;
             *SA.get_or_init(|| p)
         }
     };
@@ -239,7 +178,11 @@ pub async fn bind(endpoint: &str) -> io::Result<Listener> {
 #[cfg(windows)]
 impl Listener {
     async fn accept(&mut self) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-        self.next.connect().await?;
+        if let Err(e) = self.next.connect().await {
+            // e.g. ERROR_NO_DATA: the client left before we connected. Start a fresh instance.
+            self.next = create_pipe(&self.name, false)?;
+            return Err(e);
+        }
         let fresh = create_pipe(&self.name, false)?;
         Ok(std::mem::replace(&mut self.next, fresh))
     }
@@ -260,7 +203,16 @@ pub async fn serve(
     let mut conns = tokio::task::JoinSet::new();
     loop {
         let stream = tokio::select! {
-            s = listener.accept() => s?,
+            s = listener.accept() => match s {
+                Ok(s) => s,
+                Err(e) => {
+                    // Transient (EMFILE, ECONNABORTED, a client that vanished): never let one
+                    // failed accept take the endpoint down for good.
+                    log::warn!("IPC accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
             Some(_) = conns.join_next(), if !conns.is_empty() => continue,
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -321,6 +273,7 @@ where
     let mut version: Option<u32> = None;
     let mut topics: Vec<Topic> = Vec::new();
     let mut malformed = 0u32;
+    let mut silenced = false;
     let hello_deadline = tokio::time::Instant::now() + cfg.hello_deadline;
     let (delayed_tx, mut delayed) = mpsc::unbounded_channel::<String>();
 
@@ -348,8 +301,16 @@ where
                         continue;
                     }
                 };
-                if version.is_some() && cfg.silent_after_hello {
+                if silenced || (version.is_some() && cfg.silent_after_hello) {
                     continue;
+                }
+                if let Some(v) = version {
+                    if env.v != v {
+                        malformed += 1;
+                        write_line(&mut wr, &encode(v, env.id, err(ErrorCode::BadRequest, format!("negotiated v{v}, got v{}", env.v)))).await?;
+                        if malformed >= cfg.max_malformed { return Ok(()); }
+                        continue;
+                    }
                 }
                 if cfg.garbage {
                     write_line(&mut wr, "this is not json\n").await?;
@@ -359,7 +320,10 @@ where
                 }
                 let id = env.id;
                 match (version, env.body) {
-                    (_, Request::Hello { min_version, max_version, .. }) => {
+                    (Some(v), Request::Hello { .. }) => {
+                        write_line(&mut wr, &encode(v, id, err(ErrorCode::BadRequest, "already negotiated"))).await?;
+                    }
+                    (None, Request::Hello { min_version, max_version, .. }) => {
                         match negotiate(min_version, max_version, cfg.min_version, cfg.max_version) {
                             Some(chosen) => {
                                 version = Some(chosen);
@@ -398,6 +362,7 @@ where
                         write_line(&mut wr, &encode(v, id, ServerMessage::Subscribed { topics: topics.clone() })).await?;
                         let s = snap.borrow_and_update().clone();
                         push(&mut wr, v, &topics, &s).await?;
+                        silenced = cfg.silent_after_subscribe;
                     }
                     (Some(v), Request::Connect { peer_id }) => {
                         connects.lock().map(|mut c| c.push(peer_id.clone())).ok();
@@ -427,7 +392,7 @@ where
                     }
                 }
             }
-            changed = snap.changed(), if version.is_some() && !topics.is_empty() && !cfg.silent_after_hello => {
+            changed = snap.changed(), if version.is_some() && !topics.is_empty() && !cfg.silent_after_hello && !silenced => {
                 if changed.is_err() { return Ok(()); }
                 let s = snap.borrow_and_update().clone();
                 push(&mut wr, version.unwrap_or(1), &topics, &s).await?;
