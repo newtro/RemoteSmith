@@ -18,6 +18,24 @@ if [[ -x scripts/apply-patches.sh ]]; then
   echo "== patches apply cleanly"
   scripts/apply-patches.sh --check
 fi
+# Unit tests carried inside RustDesk patches (remotesmith(0201): keyboard::rs_keymap), run when the
+# submodule has the patches applied (scripts/apply-patches.sh) and the Mac build env exists
+# (scripts/bootstrap-mac.sh, plus the bridge files a scripts/build-mac.sh run generates).
+rs_pin="$(git ls-tree HEAD vendor/rustdesk | awk '{print $3}')"
+if [[ "$(uname)" == Darwin && -f vendor/rustdesk/src/bridge_generated.rs ]] \
+   && rustup toolchain list 2>/dev/null | grep -q '^1\.81' \
+   && git -C vendor/rustdesk log --format=%s "$rs_pin..HEAD" 2>/dev/null | grep -q '^remotesmith(0201)'; then
+  echo "== rustdesk patch unit tests (keyboard::rs_keymap)"
+  (
+    # shellcheck disable=SC1091  # sourced relative to the repo root
+    source scripts/lib/mac-env.sh
+    cd vendor/rustdesk
+    RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" CARGO_TARGET_DIR="$CARGO_TARGET_CACHE" \
+      cargo test --lib --features flutter,hwcodec,unix-file-copy-paste,screencapturekit rs_keymap
+  )
+else
+  echo "== rustdesk patch unit tests: skipped (needs apply-patches.sh, the Mac build env and the generated bridge)"
+fi
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done
