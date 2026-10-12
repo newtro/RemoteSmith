@@ -29,11 +29,22 @@ files() {
   return 0
 }
 
+pat=$(mktemp)
+errs=$(mktemp)
+trap 'rm -f "$pat" "$errs"' EXIT
+
 # 1. IP literals.
-# grep exits 1 for a batch without matches; only a real error (>1, xargs 125+) fails.
-ip_raw=$(files | xargs -0 grep -IHnoE '[0-9]+(\.[0-9]+){3,}|[0-9A-Fa-f]{4}(:[0-9A-Fa-f]{0,4}){3,7}') || {
+# xargs exits 123 when any grep batch exits non-zero, and grep exits 1 for "no match",
+# so the exit code can't tell a clean batch from an unreadable file. grep's stderr can:
+# any message there (a file it couldn't read) fails the check.
+ip_raw=$(files | xargs -0 grep -IHnoE '[0-9]+(\.[0-9]+){3,}|[0-9A-Fa-f]{4}(:[0-9A-Fa-f]{0,4}){3,7}' 2>"$errs") || {
   rc=$?; [[ $rc == 1 || $rc == 123 ]] || { echo "check-private: scanning failed (exit $rc)" >&2; exit 2; }
 }
+if [[ -s $errs ]]; then
+  sed 's/^/check-private: /' "$errs" >&2
+  echo "check-private: could not scan every file; failing" >&2
+  exit 2
+fi
 ip_hits=$(printf '%s\n' "$ip_raw" \
   | awk -F: '
     function bad4(a,  p, n) {
@@ -62,8 +73,6 @@ if [[ -n $ip_hits ]]; then
 fi
 
 # 2 + 3. Fixed strings from the local, gitignored files.
-pat=$(mktemp)
-trap 'rm -f "$pat"' EXIT
 if [[ -f deploy/server/site.env ]]; then
   # shellcheck disable=SC1091  # sourced relative to the repo root
   . deploy/server/site-env.sh
@@ -75,7 +84,11 @@ if [[ -f .private-patterns ]]; then
 fi
 if [[ -s $pat ]]; then
   # --untracked: the working tree's tracked files plus untracked, non-ignored ones.
-  hits=$(git grep -IiwnF --untracked -f "$pat" "${scope[@]}" | cut -d: -f1,2 | sort -u) || true
+  # git grep: 0 = matches, 1 = none, anything else (128) = it could not search.
+  raw=$(git grep -IiwnF --untracked -f "$pat" "${scope[@]}" 2>"$errs") || {
+    rc=$?; [[ $rc == 1 ]] || { sed 's/^/check-private: /' "$errs" >&2; echo "check-private: git grep failed (exit $rc)" >&2; exit 2; }
+  }
+  hits=$(printf '%s\n' "$raw" | cut -d: -f1,2 | sed '/^$/d' | sort -u)
   if [[ -n $hits ]]; then
     printf '%s\n' "$hits" | sed 's/$/: names private infrastructure (from site.env or .private-patterns)/'
     fail=1

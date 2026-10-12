@@ -174,7 +174,8 @@ stage_kit() {
   # next run from kit/ would silently re-render with another one. So --host is written
   # into the staged copy (the rest of site.env is kept).
   if [[ -n $HOST_FLAG ]]; then
-    { [[ -f $SCRIPT_DIR/site.env ]] && grep -vE '^[[:space:]]*RS_HOST=' "$SCRIPT_DIR/site.env"
+    # grep -v exits 1 when every line is RS_HOST=; that is not an error.
+    { if [[ -f $SCRIPT_DIR/site.env ]]; then grep -vE '^[[:space:]]*RS_HOST=' "$SCRIPT_DIR/site.env" || true; fi
       printf 'RS_HOST=%s\n' "$RS_HOST"; } > "$STAGE/site.env"
   fi
   render_units "$STAGE"
