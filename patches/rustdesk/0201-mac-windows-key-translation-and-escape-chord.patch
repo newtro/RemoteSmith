@@ -1,0 +1,1243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:30:39 -0400
+Subject: remotesmith(0201): mac-windows key translation and escape chord
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DEC-6 / DEC-22, PLAN §6.1; AC-11, AC-12, AC-13, AC-35, AC-59.
+
+Translation runs on the controller, on the key events upstream already
+built for the peer, so the host stays stock. New module
+src/remotesmith_keymap.rs (declared from keyboard.rs):
+
+- Translated mode, per peer option remotesmith-translate-shortcuts
+  (empty/Y = on when Mac<->Windows, N = raw): Mac -> Windows Cmd->Ctrl,
+  Ctrl->Ctrl, Option->Alt, Cmd+Tab->Alt+Tab; Windows -> Mac Ctrl->Cmd,
+  Win->Ctrl, Alt->Option, Alt+Tab->Cmd+Tab. Map, translate and legacy
+  key events and mouse modifier flags. Raw mode is upstream's map mode.
+- Escape chord Ctrl+Option+Cmd+Esc / Ctrl+Alt+Win+Esc, matched on
+  physical keys before any mapping in both modes: Esc is never
+  forwarded, every held key is released on the host, the grab is
+  dropped and the page is told to give up focus. Session stays up.
+- Mode changes and capture loss release everything the translation
+  holds on the host; capture loss also forgets local modifier state,
+  so the next press of a modifier is not taken for a repeat.
+- The grab loop now sends through the current session
+  (process_event -> process_session_event) so both input sources get
+  the same handling; upstream's Cmd/Ctrl swap is bypassed while the
+  translation is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/keyboard.rs             |   87 ++-
+ src/remotesmith_keymap.rs   | 1016 +++++++++++++++++++++++++++++++++++
+ src/ui_session_interface.rs |   17 +-
+ 3 files changed, 1118 insertions(+), 2 deletions(-)
+ create mode 100644 src/remotesmith_keymap.rs
+
+diff --git a/src/keyboard.rs b/src/keyboard.rs
+index e7bdce9b5439..c61defb06ecf 100644
+--- a/src/keyboard.rs
++++ b/src/keyboard.rs
+@@ -20,6 +20,10 @@ use std::{
+     sync::{Arc, Mutex},
+ };
+ 
++// RemoteSmith (DEC-22, PLAN §6.1): Mac/Windows shortcut translation and the escape chord.
++#[path = "remotesmith_keymap.rs"]
++pub(crate) mod rs_keymap;
++
+ #[cfg(windows)]
+ static mut IS_ALT_GR: bool = false;
+ 
+@@ -315,10 +319,21 @@ pub mod client {
+         }
+         if let Some(to_release) = release_after_unlock {
+             release_remote_keys_for_events(keyboard_mode, to_release);
++            // RemoteSmith (AC-59): also release what the translation holds, and forget local
++            // modifier state, since key-ups after the grab ends are never seen here.
++            release_translation_leftovers(keyboard_mode);
++            reset_modifiers_state();
+         }
+     }
+ 
+     pub fn process_event(keyboard_mode: &str, event: &Event, lock_modes: Option<i32>) {
++        // RemoteSmith: go through the session so the grab loop gets the DEC-22 translation too.
++        // Not physical-key tracking: the grab loop tracks its own events, and this is also the
++        // path for upstream's synthetic key releases.
++        #[cfg(feature = "flutter")]
++        if let Some(session) = flutter::get_cur_session() {
++            return process_session_event(keyboard_mode, event, lock_modes, &session, false);
++        }
+         let keyboard_mode = get_keyboard_mode_enum(keyboard_mode);
+         if is_long_press(&event) {
+             return;
+@@ -335,12 +350,40 @@ pub mod client {
+         lock_modes: Option<i32>,
+         session: &Session<T>,
+     ) {
++        // Flutter-delivered physical keys (input source 2).
++        process_session_event(keyboard_mode, event, lock_modes, session, true);
++    }
++
++    fn process_session_event<T: InvokeUiSession>(
++        keyboard_mode: &str,
++        event: &Event,
++        lock_modes: Option<i32>,
++        session: &Session<T>,
++        physical: bool,
++    ) {
++        let keyboard_mode_name = keyboard_mode;
+         let keyboard_mode = get_keyboard_mode_enum(keyboard_mode);
++        if physical {
++            rs_keymap::track_physical(event);
++        }
+         if is_long_press(&event) {
+             return;
+         }
++        // RemoteSmith (PLAN §6.1): the escape chord comes before any mapping, in every mode, and
++        // its Esc is never forwarded.
++        match rs_keymap::check_escape_chord(event) {
++            rs_keymap::ChordAction::Pass => {}
++            rs_keymap::ChordAction::Consume => return,
++            rs_keymap::ChordAction::Release => {
++                #[cfg(not(any(target_os = "android", target_os = "ios")))]
++                release_capture_for_escape_chord(keyboard_mode_name);
++                return;
++            }
++        }
+         let peer = session.peer_platform().to_lowercase();
+-        for key_event in event_to_key_events(peer, &event, keyboard_mode, lock_modes) {
++        let dir = rs_keymap::session_direction(session);
++        let key_events = event_to_key_events(peer.clone(), &event, keyboard_mode, lock_modes);
++        for key_event in rs_keymap::translate(dir, &peer, keyboard_mode, event, key_events) {
+             session.send_key_event(&key_event);
+         }
+     }
+@@ -619,6 +662,9 @@ fn start_grab_loop() {
+                 return Some(event);
+             }
+ 
++            // RemoteSmith: the escape chord needs physical modifier state, captured or not.
++            rs_keymap::track_physical(&event);
++
+             let _scan_code = event.position_code;
+             let _code = event.platform_code as KeyCode;
+ 
+@@ -755,6 +801,45 @@ pub fn release_remote_keys(keyboard_mode: &str) {
+     release_remote_keys_for_events(keyboard_mode, take_remote_keys());
+ }
+ 
++/// RemoteSmith: key-ups for modifiers the DEC-22 translation holds on the host beyond upstream's
++/// own TO_RELEASE (e.g. the Alt that Cmd+Tab switched to), sent to the current session.
++fn release_translation_leftovers(keyboard_mode: &str) {
++    let mode = get_keyboard_mode_enum(keyboard_mode);
++    let events = rs_keymap::take_release_events(&get_peer_platform(), mode);
++    for key_event in events {
++        send_key_event(&key_event);
++    }
++}
++
++/// RemoteSmith: release every key held on the host: upstream's tracked keys (mapped back through
++/// the translation) and then the translation's own leftovers (AC-13, AC-59).
++pub fn release_all_remote_keys(keyboard_mode: &str) {
++    release_remote_keys_for_events(keyboard_mode, take_remote_keys());
++    release_translation_leftovers(keyboard_mode);
++}
++
++fn reset_modifiers_state() {
++    for v in MODIFIERS_STATE.lock().unwrap().values_mut() {
++        *v = false;
++    }
++}
++
++/// RemoteSmith (AC-13): the escape chord. Release everything held on the host, drop the keyboard
++/// grab now, and tell the session page to give up focus until the next click or pointer re-entry.
++/// The session stays connected.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++fn release_capture_for_escape_chord(keyboard_mode: &str) {
++    log::info!("RemoteSmith escape chord: releasing input capture");
++    release_all_remote_keys(keyboard_mode);
++    reset_modifiers_state();
++    #[cfg(feature = "flutter")]
++    {
++        let session_id = flutter::get_cur_session_id();
++        client::change_grab_status(GrabState::Wait, keyboard_mode, session_id.as_u128());
++        flutter::push_session_event(&session_id, "remotesmith_release_capture", vec![]);
++    }
++}
++
+ pub fn get_keyboard_mode_enum(keyboard_mode: &str) -> KeyboardMode {
+     match keyboard_mode {
+         "map" => KeyboardMode::Map,
+diff --git a/src/remotesmith_keymap.rs b/src/remotesmith_keymap.rs
+new file mode 100644
+index 000000000000..592a329e53f7
+--- /dev/null
++++ b/src/remotesmith_keymap.rs
+@@ -0,0 +1,1016 @@
++//! RemoteSmith key-mapping contract (DEC-6 / DEC-22, PLAN §6.1).
++//!
++//! Translation happens on the controller, on the key events upstream has already built for the
++//! peer (`keyboard::event_to_key_events`), so the host stays stock. Only the modifier keys are
++//! rewritten; every other key is forwarded as upstream built it.
++//!
++//! Translated mode, Mac controller -> Windows host: Cmd->Ctrl, Ctrl->Ctrl, Option->Alt, and
++//! Cmd+Tab->Alt+Tab. Windows controller -> Mac host: Ctrl->Cmd, Win->Ctrl, Alt->Option, and
++//! Alt+Tab->Cmd+Tab. Raw mode (translation off) is upstream's map mode untouched.
++//!
++//! The escape chord (Ctrl+Option+Cmd+Esc on a Mac, Ctrl+Alt+Win+Esc on Windows: the same physical
++//! keys) is matched on physical keys before any mapping, in both modes, and Esc is never forwarded.
++//!
++//! The pure parts (`direction`, `Translator`, `ChordTracker`, `translate_with`) carry the unit
++//! tests; `keyboard.rs` holds the glue that sends events and releases capture.
++
++use base::message_proto::*;
++use hbb_common::protobuf::EnumOrUnknown;
++use rdev::{Event, EventType, Key};
++use std::sync::Mutex;
++
++/// Peer option: "Y" or empty = translate when the OSes differ (the default), "N" = raw keys.
++pub const OPTION_TRANSLATE_SHORTCUTS: &str = "remotesmith-translate-shortcuts";
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub enum Direction {
++    /// Raw keys, or no translation defined for this OS pair.
++    #[default]
++    None,
++    MacToWindows,
++    WindowsToMac,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LocalOs {
++    MacOs,
++    Windows,
++    Other,
++}
++
++pub fn local_os() -> LocalOs {
++    if cfg!(target_os = "macos") {
++        LocalOs::MacOs
++    } else if cfg!(target_os = "windows") {
++        LocalOs::Windows
++    } else {
++        LocalOs::Other
++    }
++}
++
++/// Upstream's peer platform strings ("Mac OS", "Windows") in keyboard.rs's form ("macos", "windows").
++pub fn normalize_peer(peer_platform: &str) -> String {
++    peer_platform
++        .chars()
++        .filter(|c| !c.is_whitespace())
++        .collect::<String>()
++        .to_lowercase()
++}
++
++/// The mapping in force for a session: `option` is the peer's OPTION_TRANSLATE_SHORTCUTS value.
++pub fn direction(local: LocalOs, peer_platform: &str, option: &str) -> Direction {
++    if option == "N" {
++        return Direction::None;
++    }
++    match (local, normalize_peer(peer_platform).as_str()) {
++        (LocalOs::MacOs, "windows") => Direction::MacToWindows,
++        (LocalOs::Windows, "macos") => Direction::WindowsToMac,
++        _ => Direction::None,
++    }
++}
++
++/// The mapping for a session, from its peer platform and peer option.
++pub fn session_direction<T: crate::ui_session_interface::InvokeUiSession>(
++    session: &crate::ui_session_interface::Session<T>,
++) -> Direction {
++    direction(
++        local_os(),
++        &session.peer_platform(),
++        &session.get_option(OPTION_TRANSLATE_SHORTCUTS.to_owned()),
++    )
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum Mod {
++    Ctrl,
++    Alt,
++    Meta,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub enum Side {
++    Left,
++    Right,
++}
++
++/// A Ctrl/Alt/Meta key with its side. Shift is never remapped, so it is not modelled.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub struct ModKey {
++    pub m: Mod,
++    pub side: Side,
++}
++
++impl ModKey {
++    pub const fn new(m: Mod, side: Side) -> Self {
++        Self { m, side }
++    }
++
++    pub fn from_rdev(key: Key) -> Option<Self> {
++        Some(match key {
++            Key::ControlLeft => Self::new(Mod::Ctrl, Side::Left),
++            Key::ControlRight => Self::new(Mod::Ctrl, Side::Right),
++            Key::Alt => Self::new(Mod::Alt, Side::Left),
++            Key::AltGr => Self::new(Mod::Alt, Side::Right),
++            Key::MetaLeft => Self::new(Mod::Meta, Side::Left),
++            Key::MetaRight => Self::new(Mod::Meta, Side::Right),
++            _ => return None,
++        })
++    }
++
++    pub fn to_rdev(self) -> Key {
++        match (self.m, self.side) {
++            (Mod::Ctrl, Side::Left) => Key::ControlLeft,
++            (Mod::Ctrl, Side::Right) => Key::ControlRight,
++            (Mod::Alt, Side::Left) => Key::Alt,
++            (Mod::Alt, Side::Right) => Key::AltGr,
++            (Mod::Meta, Side::Left) => Key::MetaLeft,
++            (Mod::Meta, Side::Right) => Key::MetaRight,
++        }
++    }
++
++    pub fn from_control_key(ck: ControlKey) -> Option<Self> {
++        Some(match ck {
++            ControlKey::Control => Self::new(Mod::Ctrl, Side::Left),
++            ControlKey::RControl => Self::new(Mod::Ctrl, Side::Right),
++            ControlKey::Alt => Self::new(Mod::Alt, Side::Left),
++            ControlKey::RAlt => Self::new(Mod::Alt, Side::Right),
++            ControlKey::Meta => Self::new(Mod::Meta, Side::Left),
++            ControlKey::RWin => Self::new(Mod::Meta, Side::Right),
++            _ => return None,
++        })
++    }
++
++    pub fn to_control_key(self) -> ControlKey {
++        match (self.m, self.side) {
++            (Mod::Ctrl, Side::Left) => ControlKey::Control,
++            (Mod::Ctrl, Side::Right) => ControlKey::RControl,
++            (Mod::Alt, Side::Left) => ControlKey::Alt,
++            (Mod::Alt, Side::Right) => ControlKey::RAlt,
++            (Mod::Meta, Side::Left) => ControlKey::Meta,
++            (Mod::Meta, Side::Right) => ControlKey::RWin,
++        }
++    }
++
++    /// The key code map/translate mode puts in `KeyEvent.chr` for this key on `peer` ("windows"
++    /// scancodes, "macos" virtual key codes), from the same rdev tables upstream maps with.
++    pub fn peer_code(self, peer: &str) -> u32 {
++        let key = self.to_rdev();
++        match peer {
++            "windows" => rdev::win_scancode_from_key(key).unwrap_or_default(),
++            "macos" => rdev::macos_keycode_from_key(key).unwrap_or_default() as u32,
++            _ => rdev::linux_keycode_from_key(key).unwrap_or_default(),
++        }
++    }
++}
++
++/// Translated-mode modifier table (PLAN §6.1).
++pub fn base_mod(dir: Direction, m: Mod) -> Mod {
++    match (dir, m) {
++        (Direction::MacToWindows, Mod::Meta) => Mod::Ctrl,
++        (Direction::WindowsToMac, Mod::Ctrl) => Mod::Meta,
++        (Direction::WindowsToMac, Mod::Meta) => Mod::Ctrl,
++        _ => m,
++    }
++}
++
++/// App switching: (physical modifier the controller's OS switches with, host's switch modifier).
++fn switcher(dir: Direction) -> Option<(Mod, Mod)> {
++    match dir {
++        Direction::MacToWindows => Some((Mod::Meta, Mod::Alt)),
++        Direction::WindowsToMac => Some((Mod::Alt, Mod::Meta)),
++        Direction::None => None,
++    }
++}
++
++/// One modifier transition to send to the host.
++pub type ModOut = (ModKey, bool);
++
++/// Tracks which host modifier each held physical modifier was sent as, with a count per host key
++/// so two physical keys mapped to one host key (Mac Cmd and Ctrl both -> Ctrl) press it once and
++/// release it after the last of them.
++#[derive(Debug, Default)]
++pub struct Translator {
++    dir: Direction,
++    held: Vec<(ModKey, ModKey)>,
++    emitted: Vec<(ModKey, u32)>,
++}
++
++impl Translator {
++    /// Change the mapping. Everything sent under the old mapping is released first (AC-59).
++    pub fn set_direction(&mut self, dir: Direction) -> Vec<ModOut> {
++        if dir == self.dir {
++            return Vec::new();
++        }
++        let out = self.release_all();
++        self.dir = dir;
++        out
++    }
++
++    /// Key-ups for every host modifier still held; forgets all physical state.
++    pub fn release_all(&mut self) -> Vec<ModOut> {
++        self.held.clear();
++        self.emitted
++            .drain(..)
++            .filter(|(_, n)| *n > 0)
++            .map(|(k, _)| (k, false))
++            .collect()
++    }
++
++    #[cfg(test)]
++    pub fn is_idle(&self) -> bool {
++        self.held.is_empty() && self.emitted.is_empty()
++    }
++
++    fn press(&mut self, k: ModKey) -> Option<ModOut> {
++        if let Some((_, n)) = self.emitted.iter_mut().find(|(e, _)| *e == k) {
++            *n += 1;
++            return None;
++        }
++        self.emitted.push((k, 1));
++        Some((k, true))
++    }
++
++    fn release(&mut self, k: ModKey) -> Option<ModOut> {
++        let i = self.emitted.iter().position(|(e, _)| *e == k)?;
++        self.emitted[i].1 -= 1;
++        if self.emitted[i].1 > 0 {
++            return None;
++        }
++        self.emitted.remove(i);
++        Some((k, false))
++    }
++
++    /// A physical modifier went down or up. Returns what to send in its place (possibly nothing).
++    pub fn modifier(&mut self, phys: ModKey, down: bool) -> Vec<ModOut> {
++        let held = self.held.iter().position(|(p, _)| *p == phys);
++        match (down, held) {
++            // Already down (auto-repeat): the host already has it.
++            (true, Some(_)) => Vec::new(),
++            (true, None) => {
++                let e = ModKey::new(base_mod(self.dir, phys.m), phys.side);
++                self.held.push((phys, e));
++                self.press(e).into_iter().collect()
++            }
++            (false, Some(i)) => {
++                let (_, e) = self.held.remove(i);
++                self.release(e).into_iter().collect()
++            }
++            // Never sent (pressed before capture, or released by a mode change): drop it.
++            (false, None) => Vec::new(),
++        }
++    }
++
++    /// Tab went down: while the controller's switch modifier is held, move it to the host's
++    /// switch modifier (Cmd+Tab -> Alt+Tab, Alt+Tab -> Cmd+Tab). It stays there until released.
++    pub fn tab_down(&mut self) -> Vec<ModOut> {
++        let Some((from, to)) = switcher(self.dir) else {
++            return Vec::new();
++        };
++        let mut out = Vec::new();
++        for i in 0..self.held.len() {
++            let (p, e) = self.held[i];
++            if p.m != from || e.m == to {
++                continue;
++            }
++            let new = ModKey::new(to, p.side);
++            out.extend(self.release(e));
++            self.held[i].1 = new;
++            out.extend(self.press(new));
++        }
++        out
++    }
++
++    /// The host modifier class for a local modifier class, for upstream's legacy-mode modifier
++    /// lists: what a held key of that class is currently sent as, else the table.
++    pub fn map_class(&self, m: Mod) -> Mod {
++        self.held
++            .iter()
++            .find(|(p, _)| p.m == m)
++            .map(|(_, e)| e.m)
++            .unwrap_or_else(|| base_mod(self.dir, m))
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum ChordAction {
++    /// Not part of the escape chord: handle normally.
++    Pass,
++    /// The chord's Esc (repeat or release): drop it.
++    Consume,
++    /// The chord completed: drop the Esc, release capture.
++    Release,
++}
++
++/// Physical modifier state for the escape chord. Fed from the grab loop for every key, captured
++/// or not, so it stays right across capture changes; updates are idempotent.
++#[derive(Debug, Default)]
++pub struct ChordTracker {
++    held: Vec<ModKey>,
++    esc_consumed: bool,
++}
++
++impl ChordTracker {
++    pub fn track(&mut self, key: Key, down: bool) {
++        let Some(k) = ModKey::from_rdev(key) else {
++            return;
++        };
++        let pos = self.held.iter().position(|h| *h == k);
++        match (down, pos) {
++            (true, None) => self.held.push(k),
++            (false, Some(i)) => {
++                self.held.remove(i);
++            }
++            _ => {}
++        }
++    }
++
++    fn has(&self, m: Mod) -> bool {
++        self.held.iter().any(|k| k.m == m)
++    }
++
++    pub fn chord_held(&self) -> bool {
++        self.has(Mod::Ctrl) && self.has(Mod::Alt) && self.has(Mod::Meta)
++    }
++
++    #[cfg(test)]
++    pub fn on_key(&mut self, key: Key, down: bool) -> ChordAction {
++        self.track(key, down);
++        if key != Key::Escape {
++            return ChordAction::Pass;
++        }
++        self.on_escape(down)
++    }
++
++    /// Esc went down or up; modifier state comes from `track`.
++    pub fn on_escape(&mut self, down: bool) -> ChordAction {
++        if down {
++            if self.chord_held() {
++                if self.esc_consumed {
++                    return ChordAction::Consume;
++                }
++                self.esc_consumed = true;
++                return ChordAction::Release;
++            }
++            // A fresh Esc: forget a consumed Esc whose release never arrived (capture was gone).
++            self.esc_consumed = false;
++            ChordAction::Pass
++        } else if self.esc_consumed {
++            self.esc_consumed = false;
++            ChordAction::Consume
++        } else {
++            ChordAction::Pass
++        }
++    }
++}
++
++fn event_key(event: &Event) -> Option<(Key, bool)> {
++    match event.event_type {
++        EventType::KeyPress(k) => Some((k, true)),
++        EventType::KeyRelease(k) => Some((k, false)),
++        _ => None,
++    }
++}
++
++/// Windows sends a fake LCtrl (scan code 0x021D) with AltGr; it is not a physical Ctrl.
++fn is_fake_ctrl(event: &Event) -> bool {
++    cfg!(target_os = "windows") && event.position_code == 0x021D
++}
++
++fn set_mod_key(e: &mut KeyEvent, k: ModKey, peer: &str, mode: KeyboardMode) {
++    match e.union {
++        Some(key_event::Union::ControlKey(_)) => e.set_control_key(k.to_control_key()),
++        Some(key_event::Union::Chr(_)) => e.set_chr(k.peer_code(peer)),
++        _ if mode == KeyboardMode::Legacy => e.set_control_key(k.to_control_key()),
++        _ => e.set_chr(k.peer_code(peer)),
++    }
++}
++
++/// A modifier event in the shape upstream would have built for `mode`.
++pub fn build_mod_event(m: ModOut, peer: &str, mode: KeyboardMode) -> KeyEvent {
++    let mut e = KeyEvent::new();
++    e.mode = mode.into();
++    set_mod_key(&mut e, m.0, peer, mode);
++    e.down = m.1;
++    e
++}
++
++fn remap_modifier_list(t: &Translator, e: &mut KeyEvent) {
++    let mut out: Vec<EnumOrUnknown<ControlKey>> = Vec::with_capacity(e.modifiers.len());
++    for ck in e.modifiers.iter() {
++        let ck = match ck.enum_value() {
++            Ok(v) => match ModKey::from_control_key(v) {
++                Some(k) => ModKey::new(t.map_class(k.m), k.side)
++                    .to_control_key()
++                    .into(),
++                None => *ck,
++            },
++            Err(_) => *ck,
++        };
++        if !out.contains(&ck) {
++            out.push(ck);
++        }
++    }
++    e.modifiers = out;
++}
++
++/// Translate the events upstream built for one physical key. Pure apart from `t`.
++pub fn translate_with(
++    t: &mut Translator,
++    dir: Direction,
++    peer: &str,
++    mode: KeyboardMode,
++    event: &Event,
++    events: Vec<KeyEvent>,
++) -> Vec<KeyEvent> {
++    let peer = normalize_peer(peer);
++    let mut out: Vec<KeyEvent> = t
++        .set_direction(dir)
++        .into_iter()
++        .map(|m| build_mod_event(m, &peer, mode))
++        .collect();
++    if dir == Direction::None {
++        // Raw mode / same OS: upstream's events, untouched.
++        out.extend(events);
++        return out;
++    }
++    let Some((key, down)) = event_key(event) else {
++        out.extend(events);
++        return out;
++    };
++    if let Some(phys) = ModKey::from_rdev(key) {
++        // Upstream dropped it (e.g. the fake AltGr LCtrl, or no mapping for this peer).
++        let Some(template) = events.into_iter().next() else {
++            return out;
++        };
++        if is_fake_ctrl(event) {
++            return out;
++        }
++        for m in t.modifier(phys, down) {
++            let mut e = template.clone();
++            set_mod_key(&mut e, m.0, &peer, mode);
++            e.down = m.1;
++            e.press = false;
++            remap_modifier_list(t, &mut e);
++            out.push(e);
++        }
++        return out;
++    }
++    if key == Key::Tab && down {
++        let switched = t.tab_down();
++        out.extend(
++            switched
++                .into_iter()
++                .map(|m| build_mod_event(m, &peer, mode)),
++        );
++    }
++    for mut e in events {
++        remap_modifier_list(t, &mut e);
++        out.push(e);
++    }
++    out
++}
++
++/// Mouse events carry modifier flags (Cmd+click and so on); map them with the same table.
++pub fn map_mouse_modifiers(dir: Direction, mods: &mut Vec<EnumOrUnknown<ControlKey>>) {
++    if dir == Direction::None {
++        return;
++    }
++    let t = Translator {
++        dir,
++        ..Default::default()
++    };
++    let mut e = KeyEvent::new();
++    e.modifiers = std::mem::take(mods);
++    remap_modifier_list(&t, &mut e);
++    *mods = e.modifiers;
++}
++
++// ---- process-wide state (one physical keyboard, like upstream's TO_RELEASE) --------------------
++
++lazy_static::lazy_static! {
++    static ref TRANSLATOR: Mutex<Translator> = Mutex::new(Translator::default());
++    static ref CHORD: Mutex<ChordTracker> = Mutex::new(ChordTracker::default());
++}
++
++/// Record a physical key for the escape chord (the grab loop calls this for every key event).
++pub fn track_physical(event: &Event) {
++    if is_fake_ctrl(event) {
++        return;
++    }
++    if let Some((key, down)) = event_key(event) {
++        CHORD.lock().unwrap().track(key, down);
++    }
++}
++
++/// Escape-chord check for a key about to be forwarded. Runs before any mapping. Modifier state
++/// comes only from `track_physical`, so synthetic releases cannot clear it.
++pub fn check_escape_chord(event: &Event) -> ChordAction {
++    match event_key(event) {
++        Some((Key::Escape, down)) => CHORD.lock().unwrap().on_escape(down),
++        _ => ChordAction::Pass,
++    }
++}
++
++pub fn translate(
++    dir: Direction,
++    peer: &str,
++    mode: KeyboardMode,
++    event: &Event,
++    events: Vec<KeyEvent>,
++) -> Vec<KeyEvent> {
++    translate_with(
++        &mut TRANSLATOR.lock().unwrap(),
++        dir,
++        peer,
++        mode,
++        event,
++        events,
++    )
++}
++
++/// Key-ups for whatever the translation still holds on the host (e.g. the Alt it switched to).
++pub fn take_release_events(peer: &str, mode: KeyboardMode) -> Vec<KeyEvent> {
++    let peer = normalize_peer(peer);
++    TRANSLATOR
++        .lock()
++        .unwrap()
++        .release_all()
++        .into_iter()
++        .map(|m| build_mod_event(m, &peer, mode))
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::SystemTime;
++
++    const CMD: ModKey = ModKey::new(Mod::Meta, Side::Left);
++    const RCMD: ModKey = ModKey::new(Mod::Meta, Side::Right);
++    const CTRL: ModKey = ModKey::new(Mod::Ctrl, Side::Left);
++    const RCTRL: ModKey = ModKey::new(Mod::Ctrl, Side::Right);
++    const ALT: ModKey = ModKey::new(Mod::Alt, Side::Left);
++    const WIN: ModKey = CMD;
++
++    fn tr(dir: Direction) -> Translator {
++        let mut t = Translator::default();
++        assert!(t.set_direction(dir).is_empty());
++        t
++    }
++
++    fn ev(key: Key, down: bool) -> Event {
++        Event {
++            time: SystemTime::now(),
++            unicode: None,
++            platform_code: 0,
++            position_code: 0,
++            event_type: if down {
++                EventType::KeyPress(key)
++            } else {
++                EventType::KeyRelease(key)
++            },
++            usb_hid: 0,
++            #[cfg(any(target_os = "windows", target_os = "macos"))]
++            extra_data: 0,
++        }
++    }
++
++    fn map_ev(code: u32, down: bool) -> KeyEvent {
++        let mut e = KeyEvent::new();
++        e.mode = KeyboardMode::Map.into();
++        e.set_chr(code);
++        e.down = down;
++        e
++    }
++
++    fn chr(e: &KeyEvent) -> (u32, bool) {
++        match e.union {
++            Some(key_event::Union::Chr(c)) => (c, e.down),
++            _ => panic!("not a chr event: {:?}", e),
++        }
++    }
++
++    #[test]
++    fn direction_table() {
++        use Direction::*;
++        assert_eq!(direction(LocalOs::MacOs, "Windows", ""), MacToWindows);
++        assert_eq!(direction(LocalOs::MacOs, "Windows", "Y"), MacToWindows);
++        assert_eq!(direction(LocalOs::MacOs, "Windows", "N"), None);
++        assert_eq!(direction(LocalOs::Windows, "Mac OS", ""), WindowsToMac);
++        assert_eq!(direction(LocalOs::Windows, "Mac OS", "N"), None);
++        assert_eq!(direction(LocalOs::MacOs, "Mac OS", "Y"), None);
++        assert_eq!(direction(LocalOs::Windows, "Windows", ""), None);
++        assert_eq!(direction(LocalOs::MacOs, "Linux", ""), None);
++        assert_eq!(direction(LocalOs::Other, "Windows", ""), None);
++    }
++
++    #[test]
++    fn mac_to_windows_modifiers() {
++        let mut t = tr(Direction::MacToWindows);
++        // AC-11: Cmd+C -> Ctrl+C.
++        assert_eq!(t.modifier(CMD, true), vec![(CTRL, true)]);
++        assert_eq!(t.modifier(CMD, false), vec![(CTRL, false)]);
++        // Right Cmd -> right Ctrl.
++        assert_eq!(t.modifier(RCMD, true), vec![(RCTRL, true)]);
++        assert_eq!(t.modifier(RCMD, false), vec![(RCTRL, false)]);
++        // AC-35: Ctrl stays Ctrl (Ctrl+C interrupts); Option -> Alt.
++        assert_eq!(t.modifier(CTRL, true), vec![(CTRL, true)]);
++        assert_eq!(t.modifier(CTRL, false), vec![(CTRL, false)]);
++        assert_eq!(t.modifier(ALT, true), vec![(ALT, true)]);
++        assert_eq!(t.modifier(ALT, false), vec![(ALT, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn mac_cmd_and_ctrl_share_host_ctrl() {
++        let mut t = tr(Direction::MacToWindows);
++        assert_eq!(t.modifier(CTRL, true), vec![(CTRL, true)]);
++        assert_eq!(t.modifier(CMD, true), vec![]);
++        // Releasing one keeps host Ctrl down while the other is held.
++        assert_eq!(t.modifier(CMD, false), vec![]);
++        assert_eq!(t.modifier(CTRL, false), vec![(CTRL, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn windows_to_mac_modifiers() {
++        let mut t = tr(Direction::WindowsToMac);
++        // AC-11: Ctrl+C -> Cmd+C.
++        assert_eq!(t.modifier(CTRL, true), vec![(CMD, true)]);
++        assert_eq!(t.modifier(CTRL, false), vec![(CMD, false)]);
++        assert_eq!(t.modifier(RCTRL, true), vec![(RCMD, true)]);
++        assert_eq!(t.modifier(RCTRL, false), vec![(RCMD, false)]);
++        // AC-35: Win -> Ctrl (Win+C interrupts a Mac terminal); Alt -> Option.
++        assert_eq!(t.modifier(WIN, true), vec![(CTRL, true)]);
++        assert_eq!(t.modifier(WIN, false), vec![(CTRL, false)]);
++        assert_eq!(t.modifier(ALT, true), vec![(ALT, true)]);
++        assert_eq!(t.modifier(ALT, false), vec![(ALT, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn raw_direction_is_identity() {
++        let mut t = tr(Direction::None);
++        for k in [CMD, CTRL, ALT, RCMD] {
++            assert_eq!(t.modifier(k, true), vec![(k, true)]);
++            assert_eq!(t.modifier(k, false), vec![(k, false)]);
++        }
++        assert!(t.tab_down().is_empty());
++    }
++
++    #[test]
++    fn cmd_tab_becomes_alt_tab() {
++        let mut t = tr(Direction::MacToWindows);
++        assert_eq!(t.modifier(CMD, true), vec![(CTRL, true)]);
++        assert_eq!(t.tab_down(), vec![(CTRL, false), (ALT, true)]);
++        // Further Tabs keep cycling with Alt held.
++        assert_eq!(t.tab_down(), vec![]);
++        assert_eq!(t.modifier(CMD, false), vec![(ALT, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn cmd_tab_with_ctrl_also_held() {
++        let mut t = tr(Direction::MacToWindows);
++        t.modifier(CTRL, true);
++        t.modifier(CMD, true);
++        // Ctrl stays down for the physical Ctrl.
++        assert_eq!(t.tab_down(), vec![(ALT, true)]);
++        assert_eq!(t.modifier(CMD, false), vec![(ALT, false)]);
++        assert_eq!(t.modifier(CTRL, false), vec![(CTRL, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn tab_without_switch_modifier_is_plain() {
++        let mut t = tr(Direction::MacToWindows);
++        assert!(t.tab_down().is_empty());
++        t.modifier(CTRL, true);
++        assert!(t.tab_down().is_empty());
++    }
++
++    #[test]
++    fn alt_tab_becomes_cmd_tab() {
++        let mut t = tr(Direction::WindowsToMac);
++        assert_eq!(t.modifier(ALT, true), vec![(ALT, true)]);
++        assert_eq!(t.tab_down(), vec![(ALT, false), (CMD, true)]);
++        assert_eq!(t.tab_down(), vec![]);
++        assert_eq!(t.modifier(ALT, false), vec![(CMD, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn alt_tab_while_ctrl_held_shares_cmd() {
++        let mut t = tr(Direction::WindowsToMac);
++        assert_eq!(t.modifier(CTRL, true), vec![(CMD, true)]);
++        t.modifier(ALT, true);
++        assert_eq!(t.tab_down(), vec![(ALT, false)]);
++        assert_eq!(t.modifier(ALT, false), vec![]);
++        assert_eq!(t.modifier(CTRL, false), vec![(CMD, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn repeats_and_orphan_releases_send_nothing() {
++        let mut t = tr(Direction::MacToWindows);
++        // Released before it was ever sent (pressed before capture).
++        assert!(t.modifier(CMD, false).is_empty());
++        t.modifier(CMD, true);
++        assert!(t.modifier(CMD, true).is_empty());
++        assert_eq!(t.modifier(CMD, false), vec![(CTRL, false)]);
++    }
++
++    #[test]
++    fn mode_change_releases_everything_held() {
++        // AC-59: toggling translated -> raw with Cmd held and after Cmd+Tab.
++        let mut t = tr(Direction::MacToWindows);
++        t.modifier(CMD, true);
++        t.modifier(ALT, true);
++        t.tab_down();
++        let mut ups = t.set_direction(Direction::None);
++        ups.sort_by_key(|(k, _)| format!("{:?}", k));
++        assert_eq!(ups, vec![(ALT, false)]);
++        assert!(t.is_idle());
++        // The physical releases that follow find nothing held.
++        assert!(t.modifier(CMD, false).is_empty());
++        assert!(t.modifier(ALT, false).is_empty());
++        // And raw -> translated also releases.
++        t.modifier(CTRL, true);
++        assert_eq!(
++            t.set_direction(Direction::MacToWindows),
++            vec![(CTRL, false)]
++        );
++        assert!(t.set_direction(Direction::MacToWindows).is_empty());
++    }
++
++    #[test]
++    fn release_all_on_capture_change() {
++        let mut t = tr(Direction::WindowsToMac);
++        t.modifier(CTRL, true);
++        t.modifier(WIN, true);
++        let mut ups = t.release_all();
++        ups.sort_by_key(|(k, _)| format!("{:?}", k));
++        assert_eq!(ups, vec![(CTRL, false), (CMD, false)]);
++        assert!(t.release_all().is_empty());
++        assert!(t.modifier(CTRL, false).is_empty());
++    }
++
++    #[test]
++    fn escape_chord() {
++        // Same physical keys on both OSes: Ctrl + Option/Alt + Cmd/Win + Esc.
++        let mut c = ChordTracker::default();
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Pass);
++        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Pass);
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            assert_eq!(c.on_key(k, true), ChordAction::Pass);
++        }
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Release);
++        // Auto-repeat and the release of that Esc never reach the host.
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Consume);
++        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Consume);
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            assert_eq!(c.on_key(k, false), ChordAction::Pass);
++        }
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Pass);
++    }
++
++    #[test]
++    fn escape_chord_right_side_and_partial() {
++        let mut c = ChordTracker::default();
++        c.track(Key::ControlRight, true);
++        c.track(Key::AltGr, true);
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Pass);
++        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Pass);
++        c.track(Key::MetaRight, true);
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Release);
++    }
++
++    #[test]
++    fn escape_chord_lost_release_does_not_eat_next_esc() {
++        let mut c = ChordTracker::default();
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            c.track(k, true);
++        }
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Release);
++        // Capture is gone: the Esc release is never seen, the modifiers' releases are (grab loop).
++        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++            c.track(k, false);
++        }
++        assert_eq!(c.on_key(Key::Escape, true), ChordAction::Pass);
++        assert_eq!(c.on_key(Key::Escape, false), ChordAction::Pass);
++    }
++
++    #[test]
++    fn map_mode_events_mac_to_windows() {
++        let lwin = CMD.peer_code("windows");
++        let lctrl = CTRL.peer_code("windows");
++        let lalt = ALT.peer_code("windows");
++        assert_eq!((lwin, lctrl, lalt), (0xE05B, 0x1D, 0x38));
++        let tab = rdev::win_scancode_from_key(Key::Tab).unwrap();
++        let c = rdev::win_scancode_from_key(Key::KeyC).unwrap();
++        let mut t = Translator::default();
++        let d = Direction::MacToWindows;
++        let m = KeyboardMode::Map;
++        let run = |t: &mut Translator, key, down, code| {
++            translate_with(t, d, "Windows", m, &ev(key, down), vec![map_ev(code, down)])
++                .iter()
++                .map(chr)
++                .collect::<Vec<_>>()
++        };
++        // AC-11: Cmd+C reaches Windows as Ctrl+C.
++        assert_eq!(run(&mut t, Key::MetaLeft, true, lwin), vec![(lctrl, true)]);
++        assert_eq!(run(&mut t, Key::KeyC, true, c), vec![(c, true)]);
++        assert_eq!(run(&mut t, Key::KeyC, false, c), vec![(c, false)]);
++        // AC-35: Cmd+Tab reaches Windows as Alt+Tab.
++        assert_eq!(
++            run(&mut t, Key::Tab, true, tab),
++            vec![(lctrl, false), (lalt, true), (tab, true)]
++        );
++        assert_eq!(run(&mut t, Key::Tab, false, tab), vec![(tab, false)]);
++        assert_eq!(run(&mut t, Key::MetaLeft, false, lwin), vec![(lalt, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn map_mode_raw_passes_through() {
++        // AC-12: in raw mode Cmd reaches Windows as Win.
++        let lwin = CMD.peer_code("windows");
++        let mut t = Translator::default();
++        let out = translate_with(
++            &mut t,
++            Direction::None,
++            "Windows",
++            KeyboardMode::Map,
++            &ev(Key::MetaLeft, true),
++            vec![map_ev(lwin, true)],
++        );
++        assert_eq!(out.iter().map(chr).collect::<Vec<_>>(), vec![(lwin, true)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn map_mode_toggle_mid_chord_releases_on_host() {
++        let lwin = CMD.peer_code("windows");
++        let lctrl = CTRL.peer_code("windows");
++        let mut t = Translator::default();
++        let d = KeyboardMode::Map;
++        translate_with(
++            &mut t,
++            Direction::MacToWindows,
++            "Windows",
++            d,
++            &ev(Key::MetaLeft, true),
++            vec![map_ev(lwin, true)],
++        );
++        // Next event arrives under raw mode: the translated Ctrl is released first, then the
++        // event passes through raw.
++        let out = translate_with(
++            &mut t,
++            Direction::None,
++            "Windows",
++            d,
++            &ev(Key::MetaLeft, false),
++            vec![map_ev(lwin, false)],
++        );
++        assert_eq!(
++            out.iter().map(chr).collect::<Vec<_>>(),
++            vec![(lctrl, false), (lwin, false)]
++        );
++    }
++
++    #[test]
++    fn map_mode_events_windows_to_mac() {
++        let cmd = CMD.peer_code("macos");
++        let ctrl = CTRL.peer_code("macos");
++        let opt = ALT.peer_code("macos");
++        assert_eq!((cmd, ctrl, opt), (0x37, 0x3B, 0x3A));
++        let tab = rdev::macos_keycode_from_key(Key::Tab).unwrap() as u32;
++        let mut t = Translator::default();
++        let d = Direction::WindowsToMac;
++        let run = |t: &mut Translator, key, down, code| {
++            translate_with(
++                t,
++                d,
++                "Mac OS",
++                KeyboardMode::Map,
++                &ev(key, down),
++                vec![map_ev(code, down)],
++            )
++            .iter()
++            .map(chr)
++            .collect::<Vec<_>>()
++        };
++        // Upstream maps Windows Ctrl/Win/Alt to Mac Control/Command/Option.
++        assert_eq!(run(&mut t, Key::ControlLeft, true, ctrl), vec![(cmd, true)]);
++        assert_eq!(
++            run(&mut t, Key::ControlLeft, false, ctrl),
++            vec![(cmd, false)]
++        );
++        assert_eq!(run(&mut t, Key::MetaLeft, true, cmd), vec![(ctrl, true)]);
++        assert_eq!(run(&mut t, Key::MetaLeft, false, cmd), vec![(ctrl, false)]);
++        assert_eq!(run(&mut t, Key::Alt, true, opt), vec![(opt, true)]);
++        assert_eq!(
++            run(&mut t, Key::Tab, true, tab),
++            vec![(opt, false), (cmd, true), (tab, true)]
++        );
++        assert_eq!(run(&mut t, Key::Alt, false, opt), vec![(cmd, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn upstream_dropped_modifier_is_not_tracked() {
++        let mut t = Translator::default();
++        let out = translate_with(
++            &mut t,
++            Direction::MacToWindows,
++            "Windows",
++            KeyboardMode::Map,
++            &ev(Key::MetaLeft, true),
++            vec![],
++        );
++        assert!(out.is_empty());
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn legacy_mode_events() {
++        let mut t = Translator::default();
++        let d = Direction::MacToWindows;
++        let mode = KeyboardMode::Legacy;
++        let mut cmd = KeyEvent::new();
++        cmd.mode = mode.into();
++        cmd.set_control_key(ControlKey::Meta);
++        cmd.down = true;
++        let out = translate_with(
++            &mut t,
++            d,
++            "Windows",
++            mode,
++            &ev(Key::MetaLeft, true),
++            vec![cmd],
++        );
++        assert_eq!(out.len(), 1);
++        assert_eq!(out[0].control_key(), ControlKey::Control);
++        assert!(out[0].down);
++        // A letter carries the local modifier state; Meta becomes Control.
++        let mut c = KeyEvent::new();
++        c.mode = mode.into();
++        c.set_chr('c' as u32);
++        c.down = true;
++        c.modifiers = vec![ControlKey::Meta.into(), ControlKey::Shift.into()];
++        let out = translate_with(&mut t, d, "Windows", mode, &ev(Key::KeyC, true), vec![c]);
++        assert_eq!(
++            out[0].modifiers,
++            vec![
++                EnumOrUnknown::new(ControlKey::Control),
++                ControlKey::Shift.into()
++            ]
++        );
++        // Cmd+Tab: Control up, Alt down, then Tab with Alt in its modifier list.
++        let mut tab = KeyEvent::new();
++        tab.mode = mode.into();
++        tab.set_control_key(ControlKey::Tab);
++        tab.down = true;
++        tab.modifiers = vec![ControlKey::Meta.into()];
++        let out = translate_with(&mut t, d, "Windows", mode, &ev(Key::Tab, true), vec![tab]);
++        assert_eq!(out.len(), 3);
++        assert_eq!(
++            (out[0].control_key(), out[0].down),
++            (ControlKey::Control, false)
++        );
++        assert_eq!((out[1].control_key(), out[1].down), (ControlKey::Alt, true));
++        assert_eq!(out[2].control_key(), ControlKey::Tab);
++        assert_eq!(out[2].modifiers, vec![EnumOrUnknown::new(ControlKey::Alt)]);
++    }
++
++    #[test]
++    fn mouse_modifiers() {
++        let mut m: Vec<EnumOrUnknown<ControlKey>> =
++            vec![ControlKey::Meta.into(), ControlKey::Shift.into()];
++        map_mouse_modifiers(Direction::MacToWindows, &mut m);
++        assert_eq!(
++            m,
++            vec![
++                EnumOrUnknown::new(ControlKey::Control),
++                ControlKey::Shift.into()
++            ]
++        );
++        let mut m: Vec<EnumOrUnknown<ControlKey>> =
++            vec![ControlKey::Control.into(), ControlKey::Meta.into()];
++        map_mouse_modifiers(Direction::WindowsToMac, &mut m);
++        assert_eq!(
++            m,
++            vec![
++                EnumOrUnknown::new(ControlKey::Meta),
++                ControlKey::Control.into()
++            ]
++        );
++        let mut m: Vec<EnumOrUnknown<ControlKey>> =
++            vec![ControlKey::Meta.into(), ControlKey::Control.into()];
++        map_mouse_modifiers(Direction::MacToWindows, &mut m);
++        assert_eq!(m, vec![EnumOrUnknown::new(ControlKey::Control)]);
++        let mut m: Vec<EnumOrUnknown<ControlKey>> = vec![ControlKey::Meta.into()];
++        map_mouse_modifiers(Direction::None, &mut m);
++        assert_eq!(m, vec![EnumOrUnknown::new(ControlKey::Meta)]);
++    }
++}
+diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
+index f28752e77d7e..c92c1a36aede 100644
+--- a/src/ui_session_interface.rs
++++ b/src/ui_session_interface.rs
+@@ -640,11 +640,17 @@ impl<T: InvokeUiSession> Session<T> {
+     }
+ 
+     pub fn set_option(&self, k: String, mut v: String) {
++        // RemoteSmith (AC-59): changing the mapping mode releases everything held on the host.
++        let remap = k == keyboard::rs_keymap::OPTION_TRANSLATE_SHORTCUTS;
+         let mut lc = self.lc.write().unwrap();
+         if k.eq("remote_dir") {
+             v = lc.get_all_remote_dir(v);
+         }
+         lc.set_option(k, v);
++        drop(lc);
++        if remap {
++            keyboard::release_all_remote_keys(&self.get_keyboard_mode());
++        }
+     }
+ 
+     #[inline]
+@@ -697,7 +703,10 @@ impl<T: InvokeUiSession> Session<T> {
+ 
+     pub fn swap_modifier_key(&self, msg: &mut KeyEvent) {
+         let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
+-        if allow_swap_key {
++        // RemoteSmith: the DEC-22 translation replaces the swap while it is on.
++        if allow_swap_key
++            && keyboard::rs_keymap::session_direction(self) == keyboard::rs_keymap::Direction::None
++        {
+             if let Some(key_event::Union::ControlKey(ck)) = msg.union {
+                 let ck = ck.enum_value_or_default();
+                 let ck = match ck {
+@@ -1923,6 +1932,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+     }
+ 
+     fn swap_modifier_mouse(&self, msg: &mut base::protos::message::MouseEvent) {
++        // RemoteSmith (DEC-22): Cmd+click on a Mac controller is Ctrl+click on Windows, and so on.
++        let dir = keyboard::rs_keymap::session_direction(self);
++        if dir != keyboard::rs_keymap::Direction::None {
++            keyboard::rs_keymap::map_mouse_modifiers(dir, &mut msg.modifiers);
++            return;
++        }
+         let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
+         if allow_swap_key {
+             msg.modifiers = msg
