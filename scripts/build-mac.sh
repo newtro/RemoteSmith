@@ -151,6 +151,8 @@ if ((have_outputs)) && { ((skip_bridge)) || [[ "$(cat "$bridge_stamp" 2>/dev/nul
   log "bridge: up to date"
 else
   log "bridge: generating with Flutter $BRIDGE_FLUTTER_VERSION + flutter_rust_bridge_codegen $FLUTTER_RUST_BRIDGE_VERSION"
+  [[ -z "$(git status --porcelain -- flutter/pubspec.yaml flutter/pubspec.lock)" ]] \
+    || die "flutter/pubspec.yaml or pubspec.lock changed since the build started; not touching them"
   (
     export PATH="$BRIDGE_FLUTTER_ROOT_DIR/bin:$PATH"
     sed -i '' -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml   # bridge.yml:93
@@ -168,7 +170,11 @@ else
 fi
 
 # --- build.py ----------------------------------------------------------------------------------
-# flutter-build.yml:913-918, aarch64-apple-darwin branch.
+# flutter-build.yml:913-918, aarch64-apple-darwin branch. Re-check that nobody touched the files
+# since the start-of-build check, or the restore below would discard their edit with ours.
+dirty="$(git status --porcelain -- "${CI_EDITED[@]}" "${TOOL_WRITTEN[@]}")"
+[[ -z "$dirty" ]] || die "files changed during the build before its own edits; not touching them:
+$dirty"
 sed -i '' -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
 sed -i '' -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
 sed -i '' -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
