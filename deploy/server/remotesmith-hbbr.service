@@ -1,0 +1,72 @@
+# RemoteSmith relay server: RustDesk hbbr (OSS) 1.1.16.
+# Installed by deploy/server/install.sh. Edit the repo copy, not /etc/systemd/system.
+#
+# Ports (all interfaces, IPv4 and IPv6): TCP 21117 (relay). hbbr also always binds
+# TCP 21119 (WebSocket); ufw and the Lightsail firewall keep it closed (DEF-14).
+
+[Unit]
+Description=RemoteSmith relay server (RustDesk hbbr)
+Documentation=https://github.com/rustdesk/rustdesk-server
+# hbbr must load the keypair hbbs owns. If hbbr started first on a fresh install it
+# would mint a different key of its own and refuse every real client.
+After=network-online.target remotesmith-hbbs.service
+Wants=network-online.target
+ConditionPathExists=/opt/remotesmith-server/bin/hbbr
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=remotesmith
+Group=remotesmith
+# hbbr reads id_ed25519 (and the optional blacklist.txt / blocklist.txt) from its cwd.
+WorkingDirectory=/opt/remotesmith-server/data
+# hbbr fails open on a missing or unreadable key. Refuse to start instead.
+ExecStartPre=/opt/remotesmith-server/libexec/keycheck.sh /opt/remotesmith-server/data
+# -k _ : load the hbbs keypair from data/ and drop relay requests with any other key (AC-5).
+ExecStart=/opt/remotesmith-server/bin/hbbr --port 21117 --key _
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+
+# Measured on 1.1.16 (README "Memory"): ~3 MiB idle, ~25 MiB peak with 300 pending
+# relay requests and then 4 relayed streams moving 800 MB in total. Relay buffers grow
+# with live sessions, so this cap has more room (~5x peak) than hbbs's.
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=256
+
+# --- sandboxing -------------------------------------------------------------
+# hbbr only reads data/: no ReadWritePaths, so it can never write a stray keypair.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

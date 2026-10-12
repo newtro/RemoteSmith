@@ -1,0 +1,74 @@
+# RemoteSmith rendezvous/ID server: RustDesk hbbs (OSS) 1.1.16.
+# Installed by deploy/server/install.sh. Edit the repo copy, not /etc/systemd/system.
+#
+# Ports (all interfaces, IPv4 and IPv6): TCP 21115 (NAT test), TCP+UDP 21116
+# (rendezvous). hbbs also always binds TCP 21118 (WebSocket); it has no switch to turn
+# that off, so ufw and the Lightsail firewall keep 21118 closed (DEF-14).
+
+[Unit]
+Description=RemoteSmith rendezvous server (RustDesk hbbs)
+Documentation=https://github.com/rustdesk/rustdesk-server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/remotesmith-server/bin/hbbs
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=remotesmith
+Group=remotesmith
+# hbbs reads and writes id_ed25519, id_ed25519.pub and db_v2.sqlite3 in its cwd.
+WorkingDirectory=/opt/remotesmith-server/data
+# -k _ : load (first start: create) the keypair in data/ and refuse clients whose key
+#        differs. This is hbbs's default ("-"); it is spelled out so it can't drift.
+# -r   : the relay that hbbs hands to clients.
+ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.johnnycode.ai:21117 --key _
+# hbbs fails open if it can't load or create the key. Fail the unit instead.
+ExecStartPost=/opt/remotesmith-server/libexec/keycheck.sh --wait 20 /opt/remotesmith-server/data
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+
+# Measured on 1.1.16 (README "Memory"): ~5 MiB idle, ~7 MiB peak under 600 concurrent
+# TCP sessions plus 3000 UDP registrations. The cap protects the neighbours on a VM
+# with ~1.6 GiB available; it is ~9x the measured peak.
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=256
+
+# --- sandboxing -------------------------------------------------------------
+# Internet-facing on a box with ~18 other production apps.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/remotesmith-server/data
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
