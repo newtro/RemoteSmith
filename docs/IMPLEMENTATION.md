@@ -23,8 +23,12 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
 ## Thin-fork patch workflow
 
 - **The submodule never carries RemoteSmith commits upstream.** The patches in `patches/` are the fork.
-- **To develop:** run `scripts/apply-patches.sh`, which creates branch `remotesmith` in each submodule with one commit per patch. Commit new work on top inside `vendor/rustdesk` (or `libs/hbb_common`), then run `scripts/export-patches.sh` to regenerate the `.patch` files.
-- **Commit messages:** each patch commit's message is `remotesmith: <topic>` and says which plan item it serves (DEC/DEF/AC IDs).
+- **Pins:** `vendor/rustdesk` is pinned by the superproject's gitlink (index), `libs/hbb_common` by the gitlink inside the pinned rustdesk commit. The scripts read both; nothing hardcodes a sha.
+- **To develop:** run `scripts/apply-patches.sh`, which resets both submodules to their pins and creates branch `remotesmith` in each with one commit per patch (`git am`, applied in file-name order, committer date = author date so the same patches always give the same shas). Commit new work on top inside `vendor/rustdesk` (or `libs/hbb_common`), then run `scripts/export-patches.sh` to regenerate the `.patch` files.
+  - `apply-patches.sh` refuses to run over uncommitted edits or over commits on `remotesmith` whose content (by `git patch-id`) is not in `patches/`; `--force` discards them (it prints the old branch tip so it can be recovered).
+  - `apply-patches.sh --check` test-applies everything in throwaway `git worktree`s and leaves the submodules untouched. `REMOTESMITH_PATCHES_DIR=<dir>` points either script's checks at another patch tree with the same `rustdesk/` and `hbb_common/` layout.
+  - Never commit a change to the `libs/hbb_common` gitlink inside rustdesk; hbb_common changes go in `patches/hbb_common`. `export-patches.sh` rejects such commits.
+- **Commit messages and numbering:** each patch commit's subject is `remotesmith(NNNN): <topic>`, where NNNN is the patch number from your unit's range below; the body says which plan item it serves (DEC/DEF/AC IDs). `export-patches.sh` names the file `NNNN-<topic-slug>.patch`, so re-exporting never renumbers, and `git am` keeps the subject, so the number survives every apply/export round trip. A new commit carries its number from the start; to change a number, reword the commit. Export rejects commits without a number, duplicate numbers and empty commits, test-applies the new set in number order before writing anything, and deletes patch files whose number is no longer on the branch. `--dry-run` shows what would change.
 - **Patch number ranges, one per work unit,** so parallel units never collide:
 
   | Range | Unit |
