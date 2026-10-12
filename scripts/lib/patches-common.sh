@@ -66,3 +66,9 @@ patch_file_ids() {
     git patch-id --stable <"$f" | awk '{print $1}'
   done
 }
+
+# Manifest of the patch files the last apply-patches.sh run applied, one "<file> <patch-id>" line
+# each, kept in the submodule's git dir. export-patches.sh uses it to tell a patch file that changed
+# or appeared since then (another unit's work, pulled from main) from one this branch owns.
+manifest_path() { echo "$(git -C "$1" rev-parse --absolute-git-dir)/remotesmith-applied"; }
+file_patch_id() { git patch-id --stable <"$1" | awk '{print $1}'; }

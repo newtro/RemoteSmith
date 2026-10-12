@@ -140,4 +140,10 @@ echo "== libs/hbb_common: ${#HBB_PATCHES[@]} patch(es) onto ${HBB_PIN:0:12}"
 git -C "$HBB_DIR" checkout --quiet --force -B "$PATCH_BRANCH" "$HBB_PIN"
 am_all "$HBB_DIR" hbb_common ${HBB_PATCHES[@]+"${HBB_PATCHES[@]}"} || die "libs/hbb_common left at the last good patch on branch $PATCH_BRANCH"
 
+write_manifest() { # repo-dir patches...
+  local dir="$1" f; shift
+  for f in "$@"; do echo "$(basename "$f") $(file_patch_id "$f")"; done >"$(manifest_path "$dir")"
+}
+write_manifest "$RUSTDESK_DIR" ${RD_PATCHES[@]+"${RD_PATCHES[@]}"}
+write_manifest "$HBB_DIR" ${HBB_PATCHES[@]+"${HBB_PATCHES[@]}"}
 echo "apply-patches: OK (rustdesk $(git -C "$RUSTDESK_DIR" rev-parse --short HEAD), hbb_common $(git -C "$HBB_DIR" rev-parse --short HEAD))"
