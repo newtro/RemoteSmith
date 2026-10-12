@@ -2,7 +2,7 @@
 //! message pump is tao's event loop. All logic lives in [`crate::menu_model`]; this module only
 //! turns a [`MenuModel`] into native menus and forwards clicks.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use muda::{IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -11,7 +11,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::client::{self, ClientConfig, Command};
-use crate::menu_model::{self, Action, Item, MenuModel};
+use crate::menu_model::{self, Action, Item, MenuModel, NodeKey, Op};
 use crate::state::AppState;
 
 enum UserEvent {
@@ -52,57 +52,134 @@ fn make_icon(active: bool) -> Option<Icon> {
     Icon::from_rgba(icon_rgba(size, active, rgb), size, size).ok()
 }
 
-/// Stable menu id for an action, so a click on a menu opened before a rebuild still maps to
-/// the action the user saw (ids never shift with position).
-pub fn action_id(action: &Action) -> String {
-    match action {
-        Action::Connect(peer) => format!("connect:{peer}"),
-        Action::OpenApp => "open".into(),
-        Action::Quit => "quit".into(),
+/// A rendered row, kept so later models can be applied in place.
+enum Node {
+    Item(MenuItem),
+    Separator(PredefinedMenuItem),
+    Submenu(Submenu, Vec<Node>),
+}
+
+impl Node {
+    fn as_item(&self) -> &dyn IsMenuItem {
+        match self {
+            Node::Item(i) => i,
+            Node::Separator(s) => s,
+            Node::Submenu(s, _) => s,
+        }
     }
 }
 
-fn render_items(items: &[Item], actions: &mut HashMap<MenuId, Action>) -> Vec<Box<dyn IsMenuItem>> {
-    let mut out: Vec<Box<dyn IsMenuItem>> = Vec::new();
-    for item in items {
-        match item {
-            Item::Label(text) => out.push(Box::new(MenuItem::new(text, false, None))),
-            Item::Separator => out.push(Box::new(PredefinedMenuItem::separator())),
-            Item::Action {
-                text,
-                action,
-                enabled,
-            } => {
-                let base = action_id(action);
-                let mut id = base.clone();
-                let mut n = 2;
-                while actions.contains_key(&MenuId::new(&id)) {
-                    id = format!("{base}#{n}");
-                    n += 1;
-                }
-                let id = MenuId::new(id);
-                actions.insert(id.clone(), action.clone());
-                out.push(Box::new(MenuItem::with_id(id, text, *enabled, None)));
+/// The two kinds of container muda rows live in.
+enum Container<'a> {
+    Root(&'a Menu),
+    Sub(&'a Submenu),
+}
+
+impl Container<'_> {
+    fn insert(&self, item: &dyn IsMenuItem, at: usize) {
+        let _ = match self {
+            Container::Root(m) => m.insert(item, at),
+            Container::Sub(s) => s.insert(item, at),
+        };
+    }
+    fn remove_at(&self, at: usize) {
+        match self {
+            Container::Root(m) => drop(m.remove_at(at)),
+            Container::Sub(s) => drop(s.remove_at(at)),
+        }
+    }
+}
+
+fn create(item: &Item, used: &mut HashSet<String>) -> Node {
+    match item {
+        Item::Label(text) => Node::Item(MenuItem::new(text, false, None)),
+        Item::Separator => Node::Separator(PredefinedMenuItem::separator()),
+        Item::Action {
+            text,
+            action,
+            enabled,
+        } => {
+            let base = menu_model::action_id(action);
+            let mut id = base.clone();
+            let mut n = 2;
+            while used.contains(&id) {
+                id = format!("{base}#{n}");
+                n += 1;
             }
-            Item::Submenu { text, items } => {
-                let sub = Submenu::new(text, true);
-                for child in render_items(items, actions) {
-                    let _ = sub.append(child.as_ref());
-                }
-                out.push(Box::new(sub));
+            used.insert(id.clone());
+            Node::Item(MenuItem::with_id(MenuId::new(id), text, *enabled, None))
+        }
+        Item::Submenu { key, text, items } => {
+            let sub = Submenu::with_id(MenuId::new(format!("sub:{key}")), text, true);
+            let mut children = Vec::new();
+            sync(&Container::Sub(&sub), &mut children, items, used);
+            Node::Submenu(sub, children)
+        }
+    }
+}
+
+fn update(node: &mut Node, item: &Item, used: &mut HashSet<String>) {
+    match (node, item) {
+        (Node::Item(m), Item::Label(text)) => {
+            m.set_text(text);
+            m.set_enabled(false);
+        }
+        (Node::Item(m), Item::Action { text, enabled, .. }) => {
+            used.insert(m.id().0.clone());
+            m.set_text(text);
+            m.set_enabled(*enabled);
+        }
+        (Node::Submenu(sub, children), Item::Submenu { text, items, .. }) => {
+            sub.set_text(text);
+            sync(&Container::Sub(sub), children, items, used);
+        }
+        _ => {} // separators have nothing to update; keys guarantee kinds match
+    }
+}
+
+/// Make `nodes` (rendered into `container`) match `items`, mutating rows in place where their
+/// identity is unchanged. The root menu is never replaced, so an open macOS menu stays open
+/// (muda cancels menu tracking when a menu is dropped).
+fn sync(container: &Container, nodes: &mut Vec<Node>, items: &[Item], used: &mut HashSet<String>) {
+    let old: Vec<NodeKey> = nodes.iter().map(node_key).collect();
+    let new: Vec<NodeKey> = items.iter().map(menu_model::key_of).collect();
+    for op in menu_model::plan(&old, &new) {
+        match op {
+            Op::Update { at } => update(&mut nodes[at], &items[at], used),
+            Op::Insert { at } => {
+                let node = create(&items[at], used);
+                container.insert(node.as_item(), at);
+                nodes.insert(at, node);
+            }
+            Op::Remove { at } => {
+                container.remove_at(at);
+                nodes.remove(at);
             }
         }
     }
-    out
 }
 
-fn render(model: &MenuModel) -> (Menu, HashMap<MenuId, Action>) {
-    let menu = Menu::new();
-    let mut actions = HashMap::new();
-    for item in render_items(&model.items, &mut actions) {
-        let _ = menu.append(item.as_ref());
+fn node_key(n: &Node) -> NodeKey {
+    match n {
+        Node::Separator(_) => NodeKey::Separator,
+        Node::Item(m) => {
+            let id = &m.id().0;
+            match menu_model::action_from_id(id) {
+                Some(a) => NodeKey::Action(menu_model::action_id(&a)),
+                None => NodeKey::Label,
+            }
+        }
+        Node::Submenu(s, _) => NodeKey::Submenu(submenu_key(s)),
     }
-    (menu, actions)
+}
+
+/// Submenus are created with their model key as the muda id.
+fn submenu_key(s: &Submenu) -> &'static str {
+    match s.id().0.as_str() {
+        "sub:readiness" => "readiness",
+        "sub:this_machine" => "this_machine",
+        _ => "",
+    }
 }
 
 /// Run the tray until Quit. Never returns.
@@ -127,7 +204,9 @@ pub fn run(cfg: ClientConfig) -> ! {
     let mut tray: Option<TrayIcon> = None;
     let mut state = AppState::default();
     let mut model: Option<MenuModel> = None;
-    let mut actions: HashMap<MenuId, Action> = HashMap::new();
+    // The one root menu, kept for the process lifetime and updated in place.
+    let root = Menu::new();
+    let mut nodes: Vec<Node> = Vec::new();
     let refresh_every = Duration::from_secs(30);
 
     event_loop.run(move |event, _, control_flow| {
@@ -136,10 +215,15 @@ pub fn run(cfg: ClientConfig) -> ! {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 // macOS requires the tray to be created once the event loop is running.
-                let (m, a) = render(&menu_model::build(&state, client::unix_now()));
-                actions = a;
+                let first = menu_model::build(&state, client::unix_now());
+                sync(
+                    &Container::Root(&root),
+                    &mut nodes,
+                    &first.items,
+                    &mut HashSet::new(),
+                );
                 let mut b = TrayIconBuilder::new()
-                    .with_menu(Box::new(m))
+                    .with_menu(Box::new(root.clone()))
                     .with_tooltip("RemoteSmith");
                 if let Some(icon) = make_icon(false) {
                     #[cfg(target_os = "macos")]
@@ -162,7 +246,7 @@ pub fn run(cfg: ClientConfig) -> ! {
                 state = *s;
                 rebuild = true;
             }
-            Event::UserEvent(UserEvent::Menu(e)) => match actions.get(e.id()).cloned() {
+            Event::UserEvent(UserEvent::Menu(e)) => match menu_model::action_from_id(&e.id().0) {
                 Some(Action::Connect(peer)) => {
                     log::info!("connect requested from tray: {peer}");
                     let _ = cmds.send(Command::Connect(peer));
@@ -190,9 +274,12 @@ pub fn run(cfg: ClientConfig) -> ! {
             let new_model = menu_model::build(&state, client::unix_now());
             if model.as_ref() != Some(&new_model) {
                 if let Some(t) = &tray {
-                    let (m, a) = render(&new_model);
-                    t.set_menu(Some(Box::new(m)));
-                    actions = a;
+                    sync(
+                        &Container::Root(&root),
+                        &mut nodes,
+                        &new_model.items,
+                        &mut HashSet::new(),
+                    );
                     let _ = t.set_tooltip(Some(&new_model.tooltip));
                     if model.as_ref().map(|m| m.active) != Some(new_model.active) {
                         #[cfg(target_os = "macos")]
@@ -212,34 +299,6 @@ pub fn run(cfg: ClientConfig) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn action_ids_are_stable_and_unique() {
-        use crate::menu_model::Item;
-        assert_eq!(action_id(&Action::Connect("42".into())), "connect:42");
-        let mut actions = HashMap::new();
-        let items = vec![
-            Item::Action {
-                text: "Add".into(),
-                action: Action::OpenApp,
-                enabled: true,
-            },
-            Item::Action {
-                text: "Open".into(),
-                action: Action::OpenApp,
-                enabled: true,
-            },
-            Item::Action {
-                text: "Quit".into(),
-                action: Action::Quit,
-                enabled: true,
-            },
-        ];
-        let _ = render_items(&items, &mut actions);
-        assert_eq!(actions.get(&MenuId::new("open")), Some(&Action::OpenApp));
-        assert_eq!(actions.get(&MenuId::new("open#2")), Some(&Action::OpenApp));
-        assert_eq!(actions.get(&MenuId::new("quit")), Some(&Action::Quit));
-    }
 
     #[test]
     fn icon_shapes() {

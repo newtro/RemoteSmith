@@ -30,7 +30,7 @@ fn print_items(items: &[Item], depth: usize) {
             Item::Action { text, enabled, .. } => {
                 println!("{pad}[{}] {text}", if *enabled { "x" } else { " " })
             }
-            Item::Submenu { text, items } => {
+            Item::Submenu { text, items, .. } => {
                 println!("{pad}{text} >");
                 print_items(items, depth + 1);
             }

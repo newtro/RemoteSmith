@@ -297,20 +297,12 @@ async fn session<F: FnMut(&AppState)>(
                     });
                     return End::Mismatch;
                 }
-                other => {
-                    return fail(
-                        format!("unexpected hello reply: {}", short(&format!("{other:?}"))),
-                        false,
-                    )
-                }
+                other => return fail(format!("unexpected hello reply: {}", other.kind()), false),
             },
             Ok(_) => {} // events before hello_ok are not expected; ignore
             Err((e, _)) => {
                 malformed += 1;
-                log::warn!(
-                    "malformed line during hello ({e:?}): {}",
-                    short(&String::from_utf8_lossy(&bytes))
-                );
+                log::warn!("malformed line during hello: {}", e.describe(bytes.len()));
             }
         }
         if malformed >= cfg.max_malformed {
@@ -363,7 +355,7 @@ async fn session<F: FnMut(&AppState)>(
                     }
                     Err((e, _)) => {
                         malformed += 1;
-                        log::warn!("malformed line ({e:?}): {}", short(&String::from_utf8_lossy(&bytes)));
+                        log::warn!("malformed line: {}", e.describe(bytes.len()));
                         if malformed >= cfg.max_malformed {
                             return fail("too many malformed messages from RemoteSmith".into(), true);
                         }
@@ -422,24 +414,48 @@ fn handle_message<F: FnMut(&AppState)>(
     r: &mut Reducer<F>,
 ) -> Option<End> {
     if let Some(id) = env.id {
-        let Some((kind, _)) = pending.remove(&id) else {
+        let Some((kind, _)) = pending.get(&id) else {
             log::debug!("response for unknown id {id} ignored");
             return None;
         };
+        // Validate the reply type against what was asked before consuming the pending entry.
+        let expected = matches!(
+            (kind, &env.body),
+            (Pending::Connect(_), ServerMessage::ConnectStarted { .. })
+                | (Pending::Subscribe, ServerMessage::Subscribed { .. })
+                | (Pending::Ping, ServerMessage::Pong)
+                | (Pending::Hello, ServerMessage::HelloOk { .. })
+                | (_, ServerMessage::Error { .. })
+        );
+        let (kind, _) = pending.remove(&id)?;
+        if !expected {
+            log::warn!("unexpected {} reply to request {id}", env.body.kind());
+            return match kind {
+                Pending::Connect(peer_id) => {
+                    r.apply(StateEvent::ConnectFailed {
+                        peer_id,
+                        reason: "unexpected reply from RemoteSmith".into(),
+                    });
+                    None
+                }
+                Pending::Subscribe => Some(End::Failed {
+                    reason: "unexpected reply to subscribe from RemoteSmith".into(),
+                    handshake_ok: true,
+                }),
+                Pending::Ping | Pending::Hello => None,
+            };
+        }
         match (kind, env.body) {
             (Pending::Connect(peer_id), ServerMessage::ConnectStarted { .. }) => {
                 r.apply(StateEvent::ConnectStarted { peer_id })
             }
             (Pending::Connect(peer_id), ServerMessage::Error { error }) => {
                 let reason = if error.message.is_empty() {
-                    format!("{:?}", error.code)
+                    error.code.label()
                 } else {
-                    error.message
+                    redact(&error.message)
                 };
-                r.apply(StateEvent::ConnectFailed {
-                    peer_id,
-                    reason: redact(&reason),
-                })
+                r.apply(StateEvent::ConnectFailed { peer_id, reason })
             }
             (Pending::Subscribe, ServerMessage::Error { error }) => {
                 return Some(End::Failed {
@@ -447,8 +463,6 @@ fn handle_message<F: FnMut(&AppState)>(
                     handshake_ok: true,
                 })
             }
-            (_, ServerMessage::Status { status }) => r.apply(StateEvent::Status(status)),
-            (_, ServerMessage::Peers { peers }) => r.apply(StateEvent::Peers(peers)),
             _ => {}
         }
         return None;
@@ -473,27 +487,108 @@ fn handle_message<F: FnMut(&AppState)>(
             }
         }
         ServerMessage::Error { error } => {
-            log::warn!("server error: {:?} {}", error.code, redact(&error.message))
+            log::warn!(
+                "server error: {} {}",
+                error.code.label(),
+                redact(&error.message)
+            )
         }
         _ => {}
     }
     None
 }
 
-fn short(s: &str) -> String {
-    let red = redact(s);
-    if red.chars().count() > 120 {
-        let mut t: String = red.chars().take(120).collect();
-        t.push('…');
-        t
-    } else {
-        red
-    }
-}
-
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ErrorBody, Peer, Presence, Route};
+    use crate::state::{ConnectState, StateEvent};
+
+    fn reducer() -> Reducer<impl FnMut(&AppState)> {
+        let mut r = Reducer {
+            state: AppState::default(),
+            sink: |_: &AppState| {},
+        };
+        r.apply(StateEvent::LinkUp {
+            protocol: 1,
+            server_version: "t".into(),
+        });
+        r.apply(StateEvent::Peers(vec![Peer {
+            id: "1".into(),
+            alias: None,
+            platform: None,
+            presence: Presence::Reachable { route: Route::Lan },
+        }]));
+        r
+    }
+
+    fn reply(id: u64, body: ServerMessage) -> Envelope<ServerMessage> {
+        Envelope::new(1, Some(id), body)
+    }
+
+    #[test]
+    fn wrong_reply_type_fails_the_connect_instead_of_hanging() {
+        let mut r = reducer();
+        let mut pending = HashMap::new();
+        r.apply(StateEvent::ConnectRequested {
+            peer_id: "1".into(),
+        });
+        pending.insert(7, (Pending::Connect("1".into()), Instant::now()));
+        assert!(handle_message(reply(7, ServerMessage::Pong), &mut pending, &mut r).is_none());
+        assert!(pending.is_empty());
+        assert_eq!(
+            r.state.peers[0].connect,
+            ConnectState::Failed("unexpected reply from RemoteSmith".into())
+        );
+    }
+
+    #[test]
+    fn matching_replies_are_applied() {
+        let mut r = reducer();
+        let mut pending = HashMap::new();
+        pending.insert(1, (Pending::Connect("1".into()), Instant::now()));
+        handle_message(
+            reply(
+                1,
+                ServerMessage::ConnectStarted {
+                    peer_id: "1".into(),
+                },
+            ),
+            &mut pending,
+            &mut r,
+        );
+        assert_eq!(r.state.peers[0].connect, ConnectState::Started);
+        pending.insert(2, (Pending::Connect("1".into()), Instant::now()));
+        let err = ErrorBody::new(ErrorCode::PeerUnavailable, "");
+        handle_message(
+            reply(2, ServerMessage::Error { error: err }),
+            &mut pending,
+            &mut r,
+        );
+        assert_eq!(
+            r.state.peers[0].connect,
+            ConnectState::Failed("peer_unavailable".into())
+        );
+        // A pong for a ping is fine; a stray id is ignored.
+        pending.insert(3, (Pending::Ping, Instant::now()));
+        assert!(handle_message(reply(3, ServerMessage::Pong), &mut pending, &mut r).is_none());
+        assert!(handle_message(reply(99, ServerMessage::Pong), &mut pending, &mut r).is_none());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn wrong_reply_to_subscribe_drops_the_link() {
+        let mut r = reducer();
+        let mut pending = HashMap::new();
+        pending.insert(2, (Pending::Subscribe, Instant::now()));
+        let end = handle_message(reply(2, ServerMessage::Pong), &mut pending, &mut r);
+        assert!(matches!(end, Some(End::Failed { .. })));
     }
 }

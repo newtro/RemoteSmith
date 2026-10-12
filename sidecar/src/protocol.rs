@@ -522,6 +522,10 @@ pub fn negotiate(
 }
 
 /// Serialize one message as a single line with trailing newline.
+///
+/// TODO(IPC §3): senders must not emit lines over [`MAX_LINE`]. Nothing enforces that here yet;
+/// v1 payloads (two peers, a handful of sessions) are a few KiB. A large-peer-list server must
+/// truncate before encoding.
 pub fn encode<T: Serialize>(v: u32, id: Option<u64>, body: T) -> String {
     // Serialization of these plain types cannot fail; fall back to an empty object defensively.
     let mut s = serde_json::to_string(&Envelope::new(v, id, body)).unwrap_or_else(|_| "{}".into());
@@ -534,7 +538,55 @@ pub fn encode<T: Serialize>(v: u32, id: Option<u64>, body: T) -> String {
 pub enum DecodeError {
     TooLong,
     NotUtf8,
-    BadJson(String),
+    /// serde_json's error category only (`syntax`, `data`, `eof`, `io`). The full serde message
+    /// can quote received values, so it is never kept or logged.
+    BadJson(&'static str),
+}
+
+impl DecodeError {
+    /// Log-safe description of a rejected line: its size and why, never its content.
+    pub fn describe(&self, len: usize) -> String {
+        match self {
+            DecodeError::TooLong => format!("{len}-byte line over the 1 MiB limit"),
+            DecodeError::NotUtf8 => format!("{len}-byte line, not UTF-8"),
+            DecodeError::BadJson(c) => format!("{len}-byte line, unparseable JSON ({c} error)"),
+        }
+    }
+}
+
+impl ServerMessage {
+    /// The message's wire type name, for log lines that must not carry field values.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ServerMessage::HelloOk { .. } => "hello_ok",
+            ServerMessage::Status { .. } => "status",
+            ServerMessage::Peers { .. } => "peers",
+            ServerMessage::ConnectStarted { .. } => "connect_started",
+            ServerMessage::ConnectResult { .. } => "connect_result",
+            ServerMessage::Subscribed { .. } => "subscribed",
+            ServerMessage::Pong => "pong",
+            ServerMessage::Error { .. } => "error",
+            ServerMessage::Unknown => "unknown",
+        }
+    }
+}
+
+impl ErrorCode {
+    /// Wire name of the code (an unknown code is redacted before display).
+    pub fn label(&self) -> String {
+        match self {
+            ErrorCode::VersionMismatch => "version_mismatch".into(),
+            ErrorCode::HelloRequired => "hello_required".into(),
+            ErrorCode::BadRequest => "bad_request".into(),
+            ErrorCode::LineTooLong => "line_too_long".into(),
+            ErrorCode::UnknownType => "unknown_type".into(),
+            ErrorCode::PeerUnknown => "peer_unknown".into(),
+            ErrorCode::PeerUnavailable => "peer_unavailable".into(),
+            ErrorCode::Busy => "busy".into(),
+            ErrorCode::Internal => "internal".into(),
+            ErrorCode::Other(s) => crate::logging::redact(s),
+        }
+    }
 }
 
 /// Parse one line (without its newline). Best-effort extracts `id` for error replies.
@@ -552,7 +604,13 @@ pub fn decode<T: for<'de> Deserialize<'de>>(
             let id = serde_json::from_str::<serde_json::Value>(text)
                 .ok()
                 .and_then(|v| v.get("id").and_then(|i| i.as_u64()));
-            Err((DecodeError::BadJson(e.to_string()), id))
+            let category = match e.classify() {
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+                serde_json::error::Category::Io => "io",
+            };
+            Err((DecodeError::BadJson(category), id))
         }
     }
 }
@@ -945,6 +1003,19 @@ mod tests {
         ] {
             assert!(decode::<ServerMessage>(ok.as_bytes()).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn decode_errors_never_carry_received_values() {
+        let line = br#"{"v":1,"id":2,"type":"connect","peer_id":{"password":"hunter2"}}"#;
+        let (e, _) = decode::<Request>(line).err().unwrap();
+        let d = e.describe(line.len());
+        assert!(!d.contains("hunter2") && !d.contains("password"), "{d}");
+        assert!(d.contains("unparseable JSON"));
+        assert_eq!(
+            ErrorCode::Other("token=abc".into()).label(),
+            "token=[REDACTED]"
+        );
     }
 
     #[test]

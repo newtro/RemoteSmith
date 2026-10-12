@@ -1,0 +1,7 @@
+# The sidecar has its own toolchain, separate from vendor/rustdesk's upstream pins
+# (1.81 macOS / 1.75 Windows): tray-icon 0.26 and muda 0.21 need Rust >= 1.90.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

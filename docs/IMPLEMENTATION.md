@@ -47,6 +47,7 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
 | vcpkg | commit `9e593bb18ea69cc5095e012465dcd675a822ed0d`, triplets `arm64-osx` / `x64-windows-static` |
 | flutter_rust_bridge | 1.80 |
 
+- **The sidecar has its own toolchain.** The pins above are for `vendor/rustdesk` only. `sidecar/rust-toolchain.toml` pins Rust 1.98.1 (with rustfmt, clippy and the `x86_64-pc-windows-msvc` target), and `sidecar/Cargo.toml` declares `rust-version = "1.90"`, the floor set by tray-icon 0.26 / muda 0.21 (checked with `cargo +1.90.0 check`). `Cargo.lock` is format v4, which both read. rustup selects it automatically for any cargo command run inside `sidecar/`.
 - **Mac features:** `--flutter --hwcodec --unix-file-copy-paste --screencapturekit`.
 - **Windows features:** `--flutter --hwcodec`.
 - **Shared build caches** live on the internal disk under `~/.cache/remotesmith/`: vcpkg installed tree, cargo target, Flutter SDK. `/Volumes/Cache` has limited free space.

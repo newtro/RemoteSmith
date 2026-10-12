@@ -21,6 +21,8 @@ pub enum Item {
         enabled: bool,
     },
     Submenu {
+        /// Stable identity so the tray can update an open submenu in place.
+        key: &'static str,
         text: String,
         items: Vec<Item>,
     },
@@ -45,7 +47,7 @@ impl MenuModel {
                 match i {
                     Item::Label(t) => out.push(t.clone()),
                     Item::Action { text, .. } => out.push(text.clone()),
-                    Item::Submenu { text, items } => {
+                    Item::Submenu { text, items, .. } => {
                         out.push(text.clone());
                         walk(items, out);
                     }
@@ -57,6 +59,90 @@ impl MenuModel {
         walk(&self.items, &mut out);
         out
     }
+}
+
+/// Stable menu id for an action. Ids never shift with position, so a click on a menu that was
+/// open across an update still maps to the action the user saw.
+pub fn action_id(action: &Action) -> String {
+    match action {
+        Action::Connect(peer) => format!("connect:{peer}"),
+        Action::OpenApp => "open".into(),
+        Action::Quit => "quit".into(),
+    }
+}
+
+/// Inverse of [`action_id`]; tolerates a `#n` suffix used to keep duplicate ids unique.
+pub fn action_from_id(id: &str) -> Option<Action> {
+    if let Some(peer) = id.strip_prefix("connect:") {
+        return Some(Action::Connect(peer.to_string()));
+    }
+    match id.split('#').next() {
+        Some("open") => Some(Action::OpenApp),
+        Some("quit") => Some(Action::Quit),
+        _ => None,
+    }
+}
+
+/// Identity of a menu row for in-place updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeKey {
+    Label,
+    Separator,
+    Action(String),
+    Submenu(&'static str),
+}
+
+pub fn key_of(item: &Item) -> NodeKey {
+    match item {
+        Item::Label(_) => NodeKey::Label,
+        Item::Separator => NodeKey::Separator,
+        Item::Action { action, .. } => NodeKey::Action(action_id(action)),
+        Item::Submenu { key, .. } => NodeKey::Submenu(key),
+    }
+}
+
+/// One step turning the rendered rows into the new model's rows. Indices refer to the list as
+/// it is at the moment the op is applied (ops are applied in order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    /// Row `at` already has the right identity: update its text / enabled / children in place.
+    Update {
+        at: usize,
+    },
+    /// Create the new model's row `at` and insert it at `at`.
+    Insert {
+        at: usize,
+    },
+    Remove {
+        at: usize,
+    },
+}
+
+/// Plan an in-place update. Rows are reused whenever their identity matches, so an open macOS
+/// menu (and its submenus) is mutated rather than dropped (dropping a muda menu cancels tracking).
+pub fn plan(old: &[NodeKey], new: &[NodeKey]) -> Vec<Op> {
+    let mut cur: Vec<NodeKey> = old.to_vec();
+    let mut ops = Vec::new();
+    for (i, want) in new.iter().enumerate() {
+        match (i..cur.len()).find(|&j| &cur[j] == want) {
+            Some(j) => {
+                for _ in i..j {
+                    ops.push(Op::Remove { at: i });
+                    cur.remove(i);
+                }
+                ops.push(Op::Update { at: i });
+            }
+            None => {
+                ops.push(Op::Insert { at: i });
+                cur.insert(i, want.clone());
+            }
+        }
+    }
+    while cur.len() > new.len() {
+        ops.push(Op::Remove { at: new.len() });
+        cur.pop();
+    }
+    ops
 }
 
 /// "3 min ago" style relative time.
@@ -246,6 +332,7 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
         }
     };
     items.push(Item::Submenu {
+        key: "readiness",
         text: title,
         items: sub,
     });
@@ -261,6 +348,7 @@ pub fn build(state: &AppState, now: u64) -> MenuModel {
         }
         if !me.is_empty() {
             items.push(Item::Submenu {
+                key: "this_machine",
                 text: "This machine".into(),
                 items: me,
             });
@@ -518,7 +606,7 @@ mod tests {
             .items
             .iter()
             .find_map(|i| match i {
-                Item::Submenu { text, items } if text.starts_with("Readiness") => {
+                Item::Submenu { text, items, .. } if text.starts_with("Readiness") => {
                     Some((text.clone(), items.clone()))
                 }
                 _ => None,
@@ -592,6 +680,102 @@ mod tests {
             action: Action::Connect("1".into()),
             enabled: false
         }));
+    }
+
+    fn apply(old: &[NodeKey], new: &[NodeKey]) -> (Vec<NodeKey>, Vec<Op>) {
+        let ops = plan(old, new);
+        let mut cur = old.to_vec();
+        for op in &ops {
+            match *op {
+                Op::Update { at } => assert_eq!(cur[at], new[at]),
+                Op::Insert { at } => cur.insert(at, new[at].clone()),
+                Op::Remove { at } => {
+                    cur.remove(at);
+                }
+            }
+        }
+        (cur, ops)
+    }
+
+    #[test]
+    fn plan_reaches_target_and_keeps_submenus() {
+        use NodeKey::*;
+        let a = |s: &str| Action(s.to_string());
+        let old = vec![
+            Label,
+            a("connect:1"),
+            Separator,
+            Submenu("readiness"),
+            Submenu("this_machine"),
+            a("open"),
+            a("quit"),
+        ];
+        // A peer appears, the identity submenu goes away (link down).
+        let new = vec![
+            Label,
+            a("connect:1"),
+            Label,
+            a("connect:2"),
+            Separator,
+            Submenu("readiness"),
+            a("open"),
+            a("quit"),
+        ];
+        let (cur, ops) = apply(&old, &new);
+        assert_eq!(cur, new);
+        // The readiness submenu is updated in place, never removed and recreated.
+        let removed_at_readiness = ops.iter().any(|o| matches!(o, Op::Remove { at: 5 }));
+        assert!(!removed_at_readiness, "{ops:?}");
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, Op::Update { .. }))
+                .count(),
+            6
+        );
+        // Identical model: only updates.
+        let (_, ops) = apply(&new, &new);
+        assert!(ops.iter().all(|o| matches!(o, Op::Update { .. })));
+        // From empty and to empty.
+        assert_eq!(apply(&[], &new).0, new);
+        assert!(apply(&new, &[]).0.is_empty());
+    }
+
+    #[test]
+    fn plan_property_random() {
+        use NodeKey::*;
+        let pool = [
+            Label,
+            Separator,
+            Action("x".into()),
+            Action("y".into()),
+            Submenu("r"),
+            Submenu("m"),
+        ];
+        let mut seed = 12345u64;
+        let mut rnd = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        for _ in 0..500 {
+            let mk = |rnd: &mut dyn FnMut(usize) -> usize| -> Vec<NodeKey> {
+                let n = rnd(8);
+                (0..n).map(|_| pool[rnd(pool.len())].clone()).collect()
+            };
+            let old = mk(&mut rnd);
+            let new = mk(&mut rnd);
+            assert_eq!(apply(&old, &new).0, new);
+        }
+    }
+
+    #[test]
+    fn action_ids_round_trip() {
+        for a in [Action::Connect("4:2".into()), Action::OpenApp, Action::Quit] {
+            assert_eq!(action_from_id(&action_id(&a)), Some(a.clone()));
+        }
+        assert_eq!(action_from_id("open#2"), Some(Action::OpenApp));
+        assert_eq!(action_from_id("bogus"), None);
     }
 
     #[test]

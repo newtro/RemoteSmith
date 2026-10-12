@@ -50,6 +50,21 @@ pub fn launch_agent_plist(exe: &Path, log_dir: &Path) -> String {
     )
 }
 
+/// Create `dir` if needed and check we can write a file in it.
+pub fn ensure_log_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let probe = dir.join(".remotesmith-write-test");
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// `~/Library/LaunchAgents/<label>.plist` under `home`.
 pub fn launch_agent_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
@@ -59,6 +74,9 @@ pub fn launch_agent_path(home: &Path) -> PathBuf {
 /// Write the LaunchAgent plist under `home`. Takes effect at next login (we do not
 /// `launchctl bootstrap` here, so installing never starts a second tray instance).
 pub fn install_launch_agent(home: &Path, exe: &Path, log_dir: &Path) -> io::Result<PathBuf> {
+    // launchd opens StandardErrorPath before exec and refuses to start the job if its
+    // directory is missing, so the log directory must exist (and be writable) first.
+    ensure_log_dir(log_dir)?;
     let path = launch_agent_path(home);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -218,6 +236,19 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("/y/tray"));
         assert!(uninstall_launch_agent(dir.path()).unwrap());
         assert!(!uninstall_launch_agent(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn install_creates_missing_log_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("Library/Logs/RemoteSmith");
+        assert!(!logs.exists());
+        install_launch_agent(dir.path(), Path::new("/x/tray"), &logs).unwrap();
+        assert!(logs.is_dir());
+        // A log "dir" that is actually a file is reported, not silently accepted.
+        let bad = dir.path().join("file");
+        std::fs::write(&bad, b"x").unwrap();
+        assert!(install_launch_agent(dir.path(), Path::new("/x/tray"), &bad).is_err());
     }
 
     #[test]

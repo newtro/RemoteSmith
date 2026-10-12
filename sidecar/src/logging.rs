@@ -14,9 +14,12 @@ fn redact_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // key names (optionally quoted) followed by : or = and a value (quoted or bare).
-        regex::Regex::new(
-            r#"(?i)("?(?:password|passwd|pass|pwd|secret|token|api[_-]?key|private[_-]?key|credential|auth)"?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|[^\s,;}&]+)"#,
-        )
+        regex::Regex::new(concat!(
+            // key, optionally quoted (also as an escaped \" inside Debug-formatted text)
+            r#"(?i)((?:\\?")?(?:password|passwd|pass|pwd|secret|token|api[_-]?key|private[_-]?key|credential|auth)\w*(?:\\?")?\s*[:=]\s*)"#,
+            // value: escaped-quoted, quoted, or bare
+            r#"(\\"(?:[^\\]|\\[^"])*?\\"|"(?:[^"\\]|\\.)*"|[^\s,;}&]+)"#,
+        ))
         .expect("valid redaction regex")
     })
 }
@@ -25,16 +28,15 @@ fn redact_re() -> &'static regex::Regex {
 pub fn redact(s: &str) -> String {
     redact_re()
         .replace_all(s, |c: &regex::Captures| {
-            let quoted = c[2].starts_with('"');
-            format!(
-                "{}{}",
-                &c[1],
-                if quoted {
-                    "\"[REDACTED]\""
-                } else {
-                    "[REDACTED]"
-                }
-            )
+            let v = &c[2];
+            let masked = if v.starts_with("\\\"") {
+                "\\\"[REDACTED]\\\""
+            } else if v.starts_with('"') {
+                "\"[REDACTED]\""
+            } else {
+                "[REDACTED]"
+            };
+            format!("{}{masked}", &c[1])
         })
         .into_owned()
 }
@@ -162,6 +164,32 @@ mod tests {
             redact(r#"{"key_fingerprint":"SHA256:ab"}"#),
             r#"{"key_fingerprint":"SHA256:ab"}"#
         );
+    }
+
+    #[test]
+    fn redacts_escaped_and_nested_secrets() {
+        // Debug formatting escapes quotes; the secret must still be masked.
+        let dbg = format!("{:?}", r#"{"password":"hunter2","peer":"1"}"#);
+        let out = redact(&dbg);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains(r#"\"password\":\"[REDACTED]\""#), "{out}");
+        assert!(out.contains("peer"));
+        let nested = r#"{"outer":{"auth":{"token":"abc123"}},"api_key":"k-9"}"#;
+        let out = redact(nested);
+        assert!(!out.contains("abc123") && !out.contains("k-9"), "{out}");
+        // Debug of a struct holding a secret-named field.
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Creds {
+            password_hash: String,
+        }
+        let out = redact(&format!(
+            "{:?}",
+            Creds {
+                password_hash: "s3cr3t".into()
+            }
+        ));
+        assert!(!out.contains("s3cr3t"), "{out}");
     }
 
     #[test]
