@@ -1811,7 +1811,7 @@ index 000000000000..e07dc0e7b6c2
 +            },
 +            server: ServerStatus {
 +                state: RegState::Registered,
-+                host: Some("rs.johnnycode.ai".into()),
++                host: Some("rs.example.com".into()),
 +                detail: None,
 +            },
 +            unattended: UnattendedStatus {
@@ -3983,9 +3983,9 @@ index 000000000000..be24f643574d
 +        let s = |v: &[&str], o| collect::server_status(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>(), o);
 +        assert_eq!(s(&[], 10).state, RegState::NotConfigured);
 +        assert_eq!(s(&[" "], 10).state, RegState::NotConfigured);
-+        let r = s(&["rs.johnnycode.ai:21116"], 27);
-+        assert_eq!((r.state, r.host.as_deref()), (RegState::Registered, Some("rs.johnnycode.ai")));
-+        assert_eq!(s(&["rs.johnnycode.ai"], 0).state, RegState::Registering);
++        let r = s(&["rs.example.com:21116"], 27);
++        assert_eq!((r.state, r.host.as_deref()), (RegState::Registered, Some("rs.example.com")));
++        assert_eq!(s(&["rs.example.com"], 0).state, RegState::Registering);
 +        assert_eq!(s(&["[::1]:21116"], -1).host.as_deref(), Some("::1"));
 +        assert_eq!(s(&["h:1"], -1).state, RegState::Failed);
 +    }
@@ -4197,7 +4197,7 @@ index 000000000000..be24f643574d
 +                remote: true,
 +            }],
 +            online_state: 5,
-+            rendezvous_servers: vec!["rs.johnnycode.ai".into()],
++            rendezvous_servers: vec!["rs.example.com".into()],
 +            my_id: "111".into(),
 +            ..Default::default()
 +        };

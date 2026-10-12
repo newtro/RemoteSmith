@@ -113,7 +113,7 @@ it exists with PowerShell `[System.IO.Directory]::GetFiles("\\.\pipe\") | sls Re
    time close to the shutdown.
 2. Click Connect: the session window opens and reports the peer offline; the tray menu shows
    the reason.
-3. Block the Mac's access to rs.johnnycode.ai (e.g. turn Wi-Fi to a network without internet,
+3. Block the Mac's access to rs.example.com (e.g. turn Wi-Fi to a network without internet,
    PC on another network): the PC shows "unavailable · server unreachable".
 
 ### B4-3 (AC-60) Host session badge and connection window
@@ -280,7 +280,7 @@ first connection always enrolls over the ID route (hbbs vouches for the key) or 
    RemoteSmith controller).
 2. From it, connect to the host's ID with relay forced and the attacker relay set. The host log
    shows "refused a relay request from ... naming relay "<attacker host>:21117"; this host only
-   uses rs.johnnycode.ai:21117", and nothing connects to the attacker host (watch with `nc -lk
+   uses rs.example.com:21117", and nothing connects to the attacker host (watch with `nc -lk
    21117` on that host: no connection).
 3. AC-9 regression: from a normal controller with `force-always-relay=Y`, connect in both
    directions: the session opens over Relay.
