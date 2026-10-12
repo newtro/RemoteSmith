@@ -73,14 +73,34 @@ if compgen -G ".github/workflows/*.yml" >/dev/null; then
   fi
 fi
 if [[ -f deploy/server/install.sh ]]; then
-  echo "== deploy/server: shellcheck, probe.py syntax, install.sh dry run"
+  echo "== deploy/server: shellcheck, probe.py syntax, unit render, install.sh dry run"
   if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck deploy/server/*.sh
+    shellcheck deploy/server/*.sh scripts/check-private.sh
   else
     echo "shellcheck not installed (brew install shellcheck); skipping"
   fi
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' deploy/server/probe.py
-  bash deploy/server/install.sh --dry-run --arch amd64 >/dev/null
+  # A documentation host (RFC 2606), so the result doesn't depend on a local site.env.
+  units=$(mktemp -d)
+  bash deploy/server/install.sh --render-units "$units" --host rs.example.com >/dev/null
+  grep -qx 'ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.example.com:21117 --key _' \
+    "$units/remotesmith-hbbs.service"
+  grep -qx 'ExecStartPre=/opt/remotesmith-server/libexec/wait-resolve.sh rs.example.com 60' "$units/remotesmith-hbbs.service"
+  cmp -s "$units/remotesmith-hbbr.service" deploy/server/remotesmith-hbbr.service
+  rm -rf "$units"
+  bash deploy/server/install.sh --dry-run --arch amd64 --host rs.example.com >/dev/null
+  # --host over a site.env that holds only RS_HOST (staging rewrites it; regression:
+  # grep -v matched nothing and set -e ended the run silently).
+  kit=$(mktemp -d)
+  cp deploy/server/install.sh deploy/server/site-env.sh deploy/server/keycheck.sh deploy/server/wait-resolve.sh \
+    deploy/server/remotesmith-hbbs.service.in deploy/server/remotesmith-hbbr.service "$kit/"
+  printf 'RS_HOST=rs.example.net\n' > "$kit/site.env"
+  out=$(bash "$kit/install.sh" --dry-run --arch amd64 --host rs.example.com 2>&1) \
+    || { printf '%s\n' "$out" | tail -5; echo "install.sh --host over a RS_HOST-only site.env failed" >&2; exit 1; }
+  grep -q 'server name rs.example.com (from --host)' <<<"$out"
+  rm -rf "$kit"
   bash deploy/server/firewall.sh --dry-run >/dev/null
 fi
+echo "== no personal infrastructure in the repo (AC-33)"
+scripts/check-private.sh
 echo "verify: OK"

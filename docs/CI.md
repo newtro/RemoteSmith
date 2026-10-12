@@ -14,7 +14,7 @@ A newer run on the same ref cancels the older one (`concurrency` group per workf
 
 | Job | Runner | What it does |
 |---|---|---|
-| `ci-lint` | ubuntu-latest | `bash -n` on `scripts/*.sh` and `deploy/server/*.sh`. It also runs actionlint 1.7.12 (checksum-verified) on the workflows, with shellcheck on `run:` blocks. |
+| `ci-lint` | ubuntu-latest | `bash -n` on `scripts/*.sh` and `deploy/server/*.sh`. It also runs actionlint 1.7.12 (checksum-verified) on the workflows, with shellcheck on `run:` blocks, and `scripts/check-private.sh` (no public IP literals; AC-33). |
 | `generate-bridge` | ubuntu-22.04 | flutter_rust_bridge 1.80.1 codegen with Flutter 3.22.3 and Rust 1.75, run on the **patched** `src/flutter_ffi.rs`. Uploads `bridge-artifact`. |
 | `build-RustDeskTempTopMostWindow (x64)` | windows-2022 | Builds `WindowInjection.dll`, which the Windows bundle uses for privacy mode. |
 | `x86_64-pc-windows-msvc` | windows-2022 | The Windows Flutter app: portable folder, self-extracting exe and MSI. |

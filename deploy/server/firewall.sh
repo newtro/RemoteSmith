@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host firewall (ufw) rules for the RemoteSmith server. Run ON the VM as root.
+# Host firewall (ufw) rules for the RemoteSmith server. Run ON the server as root.
 #
 #   sudo ./firewall.sh            add the rules (idempotent; ufw skips existing rules)
 #   sudo ./firewall.sh --check    show the RemoteSmith rules and fail if anything is off
@@ -9,7 +9,7 @@
 # Opens TCP 21115-21117 and UDP 21116, IPv4 and IPv6 (DEF-14). Nothing else:
 # TCP 21114 (Pro console) and 21118/21119 (hbbs/hbbr WebSocket listeners, which the
 # daemons always bind) stay closed by ufw's default-deny incoming policy.
-# The Lightsail firewall in front of the VM needs the same ports; see firewall.md.
+# The Lightsail firewall in front of the server (if any) needs the same ports; see firewall.md.
 set -euo pipefail
 
 COMMENT="remotesmith hbbs/hbbr"
@@ -33,7 +33,7 @@ run() {
 
 if [[ $DRY_RUN == 0 ]]; then
   [[ $(id -u) == 0 ]] || { echo "run as root (sudo), or add --dry-run" >&2; exit 1; }
-  command -v ufw >/dev/null || { echo "ufw not found; this VM is expected to use ufw" >&2; exit 1; }
+  command -v ufw >/dev/null || { echo "ufw not found; this server is expected to use ufw" >&2; exit 1; }
 fi
 
 case "$MODE" in

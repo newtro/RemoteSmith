@@ -2,3 +2,5 @@
 .DS_Store
 # local build outputs and logs (scripts/build-mac.sh, scripts/bootstrap-mac.sh)
 build/
+# private fixed strings that must never be committed (scripts/verify.sh leak check)
+.private-patterns

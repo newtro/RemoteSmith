@@ -31,11 +31,11 @@ ExecStartPre=/opt/remotesmith-server/libexec/keycheck.sh /opt/remotesmith-server
 # which it hands clients no relay until restarted. So DNS is a start condition: wait up
 # to 60 s, then fail the start; Restart= retries (with backoff, no start limit) until
 # DNS answers. hbbs never runs without its relay.
-ExecStartPre=/opt/remotesmith-server/libexec/wait-resolve.sh rs.johnnycode.ai 60
+ExecStartPre=/opt/remotesmith-server/libexec/wait-resolve.sh @RS_HOST@ 60
 # -k _ : load the keypair from data/ and refuse clients whose key differs. This is
 #        hbbs's default ("-"); it is spelled out so it can't drift.
 # -r   : the relay that hbbs hands to clients.
-ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.johnnycode.ai:21117 --key _
+ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers @RS_HOST@:21117 --key _
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=10
