@@ -13,5 +13,5 @@ while [ "$i" -lt "$secs" ]; do
   i=$((i + 1))
   sleep 1
 done
-echo "wait-resolve: $name did not resolve within ${secs}s; hbbs will hand clients no relay until restarted" >&2
+echo "wait-resolve: $name did not resolve within ${secs}s; failing the start (systemd retries)" >&2
 exit 1

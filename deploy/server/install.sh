@@ -99,7 +99,44 @@ parse_args() {
 }
 
 cleanup() { if [[ -n $TMP && -d $TMP ]]; then rm -rf "$TMP"; fi; }
-trap cleanup EXIT
+
+# Revert-on-failure. Once a run starts changing live state (units, helpers, the bin
+# link), any failure exit (die, set -e, a failed command) reverts to the version and
+# units that were live before the run. arm_revert records what to go back to.
+REVERT_ARMED=0
+REV_CUR=
+REV_PREV=
+arm_revert() { REV_CUR=$1; REV_PREV=$2; [[ $DRY_RUN == 1 ]] || REVERT_ARMED=1; }
+disarm_revert() { REVERT_ARMED=0; }
+revert_install() {
+  if [[ -z $REV_CUR ]]; then
+    warn "first install failed; there is no earlier version to revert to. Fix the cause and re-run."
+    return 0
+  fi
+  warn "reverting to $REV_CUR and the units it last ran with"
+  point_link bin "$REV_CUR"
+  if [[ -n $REV_PREV && $REV_PREV != "$REV_CUR" ]]; then point_link previous "$REV_PREV"
+  else rm -f "$PREFIX/previous"; fi
+  restore_kit_for "$REV_CUR"
+  restart_services
+  if wait_healthy; then
+    write_marker
+    warn "reverted to $REV_CUR, which is healthy"
+  else
+    warn "the revert to $REV_CUR is unhealthy too; see journalctl -u $HBBS -u $HBBR"
+  fi
+}
+on_exit() {
+  local rc=$?
+  if [[ $rc != 0 && $REVERT_ARMED == 1 ]]; then
+    REVERT_ARMED=0
+    set +e
+    revert_install
+  fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
@@ -320,9 +357,60 @@ restore_kit_for() {
   if [[ -f $PREFIX/kits/$ver/$HBBS ]]; then
     log "reinstalling the units and helpers last used with $ver (kits/$ver)"
     install_support_files "$PREFIX/kits/$ver"
+  elif [[ -f $UNIT_DIR/$HBBS.bak.$STAMP || -f $UNIT_DIR/$HBBR.bak.$STAMP ]]; then
+    warn "no kits/$ver snapshot; restoring the unit files this run replaced (.bak.$STAMP)"
+    local f
+    for f in "$HBBS" "$HBBR"; do
+      if [[ -f $UNIT_DIR/$f.bak.$STAMP ]]; then run cp -p "$UNIT_DIR/$f.bak.$STAMP" "$UNIT_DIR/$f"; fi
+    done
+    run systemctl daemon-reload
   else
     warn "no kits/$ver snapshot; keeping the current units and helpers"
   fi
+}
+
+# A public key as hbbs writes it: 32 bytes, standard base64. Anything else read from
+# data/ (which the daemon owns) is never echoed or published.
+valid_pubkey() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+
+# Read data/id_ed25519.pub safely: refuse symlinks and non-regular files (data/ is
+# writable by hbbs), read at most 64 bytes, and print it only if it is a valid key.
+read_pubkey() {
+  local f=$PREFIX/data/id_ed25519.pub v
+  [[ -f $f && ! -L $f ]] || return 1
+  v=$(head -c 64 "$f" | tr -d ' \n\r')
+  valid_pubkey "$v" || return 1
+  printf '%s' "$v"
+}
+
+# Fingerprint of what should be running: version + installed units + helpers.
+deploy_fingerprint() {
+  {
+    readlink "$PREFIX/bin" 2>/dev/null
+    cat "$UNIT_DIR/$HBBS" "$UNIT_DIR/$HBBR" "$PREFIX/libexec/keycheck.sh" "$PREFIX/libexec/wait-resolve.sh" 2>/dev/null
+  } | sha256sum | awk '{print $1}'
+}
+# Recorded after every healthy install/rollback/restore. A run is only a no-op when the
+# marker matches and the processes run the target binaries; an interrupted earlier run
+# (even one killed before its revert) therefore always gets a restart.
+write_marker() {
+  [[ $DRY_RUN == 1 ]] && return 0
+  deploy_fingerprint > "$PREFIX/.deployed"
+  chmod 0644 "$PREFIX/.deployed"
+}
+# running_exe_ok UNIT BINARY: the unit's main process runs releases/$VERSION/BINARY.
+running_exe_ok() {
+  local pid exe want
+  pid=$(systemctl show -p MainPID --value "$1" 2>/dev/null || true)
+  [[ -n $pid && $pid != 0 ]] || return 1
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
+  want=$(readlink -f "$PREFIX/releases/$VERSION/$2") || return 1
+  [[ $exe == "$want" ]]
+}
+up_to_date() {
+  [[ -f $PREFIX/.deployed && $(cat "$PREFIX/.deployed") == "$(deploy_fingerprint)" ]] || return 1
+  is_active "$HBBS" && is_active "$HBBR" || return 1
+  running_exe_ok "$HBBS" hbbs && running_exe_ok "$HBBR" hbbr
 }
 
 # The server key. hbbs could create it on first start, but 1.1.16 fails open while
@@ -330,9 +418,12 @@ restore_kit_for() {
 # key is never replaced: a new key means re-keying every client.
 KEY_CREATED=0
 ensure_key() {
-  local d=$PREFIX/data utils=$PREFIX/releases/$VERSION/rustdesk-utils out pk sk
-  if [[ -e $d/id_ed25519 || -e $d/id_ed25519.pub ]]; then
+  local d=$PREFIX/data utils=$PREFIX/releases/$VERSION/rustdesk-utils out pk sk tmpd f
+  if [[ -e $d/id_ed25519 || -e $d/id_ed25519.pub || -L $d/id_ed25519 || -L $d/id_ed25519.pub ]]; then
     if [[ $DRY_RUN == 1 ]]; then log "data/ has a keypair (would validate it)"; return 0; fi
+    for f in id_ed25519 id_ed25519.pub; do
+      [[ -f $d/$f && ! -L $d/$f ]] || die "data/$f is missing, a symlink or not a regular file; refusing to continue"
+    done
     "$PREFIX/libexec/keycheck.sh" "$d" \
       || die "data/ holds an invalid or mismatched keypair. Not generating a new one (that re-keys every client); restore it with --restore-data (README, Keys)"
     log "existing keypair is valid"
@@ -340,7 +431,7 @@ ensure_key() {
   fi
   log "no keypair yet: generating one with rustdesk-utils genkeypair"
   if [[ $DRY_RUN == 1 ]]; then
-    printf 'DRY-RUN: %s genkeypair -> data/id_ed25519 (0600), data/id_ed25519.pub\n' "$utils"
+    printf 'DRY-RUN: %s genkeypair in a root-owned temp dir, then rename into data/\n' "$utils"
     return 0
   fi
   pk=
@@ -353,20 +444,32 @@ ensure_key() {
     pk=
   done
   [[ -n $pk ]] || die "could not generate a keypair with $utils"
-  (umask 077; printf '%s' "$sk" > "$d/.id_ed25519.new"; printf '%s' "$pk" > "$d/.id_ed25519.pub.new")
+  # Build the files in a fresh root-owned directory next to data/ (same filesystem, so
+  # the final mv is a rename(2)). data/ itself is writable by the daemon, so nothing
+  # is created or chowned there by name; rename never follows a destination symlink.
+  tmpd=$(mktemp -d "$PREFIX/.keygen.XXXXXX")
+  (umask 077; printf '%s' "$sk" > "$tmpd/id_ed25519"; printf '%s' "$pk" > "$tmpd/id_ed25519.pub")
   sk=; out=
-  chown "$SVC_USER:$SVC_USER" "$d/.id_ed25519.new" "$d/.id_ed25519.pub.new"
-  mv "$d/.id_ed25519.pub.new" "$d/id_ed25519.pub"
-  mv "$d/.id_ed25519.new" "$d/id_ed25519"
-  "$PREFIX/libexec/keycheck.sh" "$d" || die "the generated keypair failed validation"
+  "$PREFIX/libexec/keycheck.sh" "$tmpd" || { rm -rf "$tmpd"; die "the generated keypair failed validation"; }
+  chown "$SVC_USER:$SVC_USER" "$tmpd/id_ed25519" "$tmpd/id_ed25519.pub"
+  for f in id_ed25519.pub id_ed25519; do
+    if [[ -e $d/$f || -L $d/$f ]]; then rm -rf "$tmpd"; die "data/$f appeared while generating the key; refusing"; fi
+    mv -T "$tmpd/$f" "$d/$f"
+  done
+  rmdir "$tmpd"
+  "$PREFIX/libexec/keycheck.sh" "$d" || die "the installed keypair failed validation"
   log "generated server key $pk"
   KEY_CREATED=1
 }
 
 publish_pubkey() {
   [[ $DRY_RUN == 1 ]] && { printf 'DRY-RUN: install -m 0644 data/id_ed25519.pub %s/id_ed25519.pub\n' "$PREFIX"; return 0; }
-  [[ -f $PREFIX/data/id_ed25519.pub ]] || return 0
-  install -m 0644 -o root -g root "$PREFIX/data/id_ed25519.pub" "$PREFIX/id_ed25519.pub"
+  local pk tmpf
+  pk=$(read_pubkey) || { warn "data/id_ed25519.pub is not a valid key file; not publishing it"; return 0; }
+  tmpf=$(mktemp "$PREFIX/.pub.XXXXXX")
+  printf '%s' "$pk" > "$tmpf"
+  chmod 0644 "$tmpf"
+  mv -T "$tmpf" "$PREFIX/id_ed25519.pub"
 }
 
 # hbbs first, then hbbr (hbbr is also ordered After= hbbs).
@@ -386,8 +489,7 @@ health() {
   for unit in "$HBBS" "$HBBR"; do
     if is_active "$unit"; then log "$unit active"; else warn "$unit is not active"; ok=1; fi
   done
-  if "$PREFIX/libexec/keycheck.sh" "$PREFIX/data" 2>/dev/null; then
-    pk=$(tr -d ' \n' < "$PREFIX/data/id_ed25519.pub")
+  if [[ ! -L $PREFIX/data/id_ed25519 ]] && pk=$(read_pubkey) && "$PREFIX/libexec/keycheck.sh" "$PREFIX/data" 2>/dev/null; then
     log "keypair valid"
   else
     warn "keypair missing or invalid in $PREFIX/data"; ok=1
@@ -448,7 +550,7 @@ wait_healthy() {
 
 do_install() {
   need_root
-  need_cmds curl unzip tar systemctl useradd getent install ss python3 ip
+  need_cmds curl unzip tar systemctl useradd getent install ss python3 ip openssl sha256sum
   local cur prev
   cur=$(link_version bin)
   prev=$(link_version previous)
@@ -464,6 +566,7 @@ do_install() {
   ensure_dirs
   backup_data "pre-install-$VERSION"
   install_release
+  arm_revert "$cur" "$prev"
   install_support_files
   ensure_key
   local switched=0
@@ -477,26 +580,15 @@ do_install() {
     switched=1
   fi
   run systemctl enable "$HBBS" "$HBBR"
-  if [[ $switched == 1 || $UNITS_CHANGED == 1 ]] || ! is_active "$HBBS" || ! is_active "$HBBR"; then
-    restart_services
+  if [[ $switched == 0 && $UNITS_CHANGED == 0 && $DRY_RUN == 0 ]] && up_to_date; then
+    log "nothing changed and both daemons run releases/$VERSION with the installed units; not restarting"
   else
-    log "nothing changed and both units are active; not restarting"
+    restart_services
   fi
-  if ! wait_healthy; then
-    # Revert whatever this run changed: the version, the units/helpers, or both.
-    if [[ -n $cur ]] && [[ $switched == 1 || $UNITS_CHANGED == 1 ]]; then
-      warn "unhealthy after this change; reverting to $cur and the units it last ran with"
-      if [[ $switched == 1 ]]; then
-        point_link bin "$cur"
-        if [[ -n $prev ]]; then point_link previous "$prev"; else run rm -f "$PREFIX/previous"; fi
-      fi
-      restore_kit_for "$cur"
-      restart_services
-      wait_healthy || die "the revert to $cur is unhealthy too; see journalctl -u $HBBS -u $HBBR"
-      die "install of $VERSION (this kit) failed and was reverted to $cur"
-    fi
-    die "install is unhealthy; see journalctl -u $HBBS -u $HBBR"
-  fi
+  # On failure the EXIT trap reverts to the version and units that were live before.
+  wait_healthy || die "install of $VERSION (this kit) is unhealthy; see journalctl -u $HBBS -u $HBBR"
+  disarm_revert
+  write_marker
   if [[ $KEY_CREATED == 1 ]]; then backup_data "new-key"; fi
   publish_pubkey
   copy_kit "$PREFIX/kit"
@@ -514,11 +606,15 @@ do_rollback() {
   [[ $prev != "$cur" ]] || die "previous and current are both $cur"
   log "rolling back $cur -> $prev"
   backup_data "pre-rollback-to-$prev"
+  arm_revert "$cur" "$prev"
   point_link bin "$prev"
   if [[ -n $cur ]]; then point_link previous "$cur"; fi
   restore_kit_for "$prev"
   restart_services
-  wait_healthy || die "unhealthy after rollback to $prev; run '$0 --rollback' again to return to $cur"
+  # On failure the EXIT trap returns to $cur.
+  wait_healthy || die "unhealthy after rollback to $prev"
+  disarm_revert
+  write_marker
   publish_pubkey
   summary
 }
@@ -563,6 +659,7 @@ do_restore() {
   run systemctl start "$HBBS" || warn "$HBBS failed to start"
   run systemctl start "$HBBR" || warn "$HBBR failed to start"
   wait_healthy || die "unhealthy after restore; the replaced data is in backups/data-replaced-$STAMP"
+  write_marker
   publish_pubkey
   summary
 }

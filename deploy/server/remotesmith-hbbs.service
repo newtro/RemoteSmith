@@ -11,8 +11,9 @@ Documentation=https://github.com/rustdesk/rustdesk-server
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/opt/remotesmith-server/bin/hbbs
-StartLimitIntervalSec=120
-StartLimitBurst=10
+# Never give up: after a long outage (DNS, key problem) the unit keeps retrying with
+# backoff (10 s growing to 5 min) instead of parking in "failed".
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -27,16 +28,19 @@ WorkingDirectory=/opt/remotesmith-server/data
 # overwrite id_ed25519.pub with a fresh, mismatched key).
 ExecStartPre=/opt/remotesmith-server/libexec/keycheck.sh /opt/remotesmith-server/data
 # hbbs resolves the -r name once at startup and silently drops it if DNS fails, after
-# which it hands clients no relay until restarted. Give DNS up to 60 s at boot; start
-# anyway if it never answers (the "-" prefix), and install.sh --status flags it.
-ExecStartPre=-/opt/remotesmith-server/libexec/wait-resolve.sh rs.johnnycode.ai 60
+# which it hands clients no relay until restarted. So DNS is a start condition: wait up
+# to 60 s, then fail the start; Restart= retries (with backoff, no start limit) until
+# DNS answers. hbbs never runs without its relay.
+ExecStartPre=/opt/remotesmith-server/libexec/wait-resolve.sh rs.johnnycode.ai 60
 # -k _ : load the keypair from data/ and refuse clients whose key differs. This is
 #        hbbs's default ("-"); it is spelled out so it can't drift.
 # -r   : the relay that hbbs hands to clients.
 ExecStart=/opt/remotesmith-server/bin/hbbs --port 21116 --relay-servers rs.johnnycode.ai:21117 --key _
 TimeoutStartSec=120
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+RestartSteps=8
+RestartMaxDelaySec=300
 TimeoutStopSec=15
 Environment=RUST_LOG=info
 LimitNOFILE=65536

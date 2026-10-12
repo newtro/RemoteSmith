@@ -11,8 +11,9 @@ Documentation=https://github.com/rustdesk/rustdesk-server
 After=network-online.target remotesmith-hbbs.service
 Wants=network-online.target
 ConditionPathExists=/opt/remotesmith-server/bin/hbbr
-StartLimitIntervalSec=120
-StartLimitBurst=10
+# Never give up: after a long outage (DNS, key problem) the unit keeps retrying with
+# backoff (10 s growing to 5 min) instead of parking in "failed".
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -25,7 +26,9 @@ ExecStartPre=/opt/remotesmith-server/libexec/keycheck.sh /opt/remotesmith-server
 # -k _ : load the hbbs keypair from data/ and drop relay requests with any other key (AC-5).
 ExecStart=/opt/remotesmith-server/bin/hbbr --port 21117 --key _
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+RestartSteps=8
+RestartMaxDelaySec=300
 TimeoutStopSec=15
 Environment=RUST_LOG=info
 LimitNOFILE=65536

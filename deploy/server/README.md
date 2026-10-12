@@ -87,12 +87,17 @@ Nothing else is touched: no Caddy, Postgres or Redis, and no restart of any othe
    - restarts hbbs, then hbbr;
    - runs the health checks.
 
-   **If the result is unhealthy, it automatically reverts.** It re-points `bin` and reinstalls the units and helpers from `kits/<current>`, then exits non-zero. This covers a new version, and also a kit-only change such as an edited unit with the same version.
+   **Any failure after the run starts changing live state reverts it automatically.** That includes an unhealthy result, a failed command, or a `die`. An EXIT trap re-points `bin` and `previous`, reinstalls the units and helpers from `kits/<current>`, restarts both units and re-checks health, then exits non-zero. If there is no snapshot, it uses this run's `.bak.<UTC>` unit files. This covers a new version, and also a kit-only change such as an edited unit with the same version.
 4. Run `deploy/server/verify-server.sh`.
 
    **AC-44:** the key in `data/` never changes on an upgrade, so existing clients keep working without re-keying. In the arm64 rehearsal (1.1.15 → 1.1.16 → rollback → 1.1.16), the public key was identical at every step.
 
-Re-running `install.sh` with nothing changed is a no-op. It doesn't restart anything, but it still takes a fresh data backup, which is about 2 KB.
+Re-running `install.sh` with nothing changed is a no-op, decided strictly. Nothing is restarted only when all of these hold:
+- the `.deployed` marker matches a fingerprint of the bin target, the installed units and the helpers. The marker is written after every healthy install, rollback or restore;
+- both units are active;
+- both main processes run `releases/<target>` (`/proc/<pid>/exe`, resolved).
+
+So an interrupted earlier run always gets a restart. A no-op run still takes a fresh data backup, which is about 2 KB.
 
 ## Rollback
 
@@ -105,7 +110,10 @@ This swaps `bin` and `previous` and reinstalls the units and helpers recorded in
 ## Keys: backup and restore
 
 - **What the key is.** `data/id_ed25519` is the server's secret key, and `id_ed25519.pub` is what clients are configured with.
-  - `install.sh` generates the pair once, with the release's own `rustdesk-utils genkeypair`, before any daemon starts. It never replaces an existing one: an invalid or mismatched pair stops the install and points to `--restore-data`.
+  - `install.sh` generates the pair once, with the release's own `rustdesk-utils genkeypair`, before any daemon starts.
+  - The files are written, validated and chowned inside a fresh root-owned `mktemp -d` under `/opt/remotesmith-server`, never by name inside the daemon-writable `data/`. They are then moved in with `rename(2)`, which never follows a destination symlink. It refuses if anything already sits at the destination.
+  - It never replaces an existing pair: an invalid, mismatched or symlinked pair stops the install and points to `--restore-data`.
+  - The public key is published, or used by health, only if it reads back from a regular file as a valid 44-character key. A planted symlink in `data/` can't leak another file.
   - Rotating the key means re-keying every client (PLAN §7 data table).
 - **On-box backups.** Every install, upgrade, rollback and restore first writes `backups/data-<UTC>-<ver>-<reason>.tar.gz`. A brand-new key is backed up right after it is created.
   - These are hot copies. The key files are static, so they're always consistent. `db_v2.sqlite3` is only a peer cache that clients re-populate by re-registering.
@@ -165,16 +173,32 @@ What that means:
   - The server kit can't close this: it's in upstream hbbs.
   - The fix belongs in the client patches. A host should refuse a `RequestRelay` whose relay isn't its own configured relay, or isn't the rendezvous host on port 21117.
 
-Until that client patch exists, AC-5 is met for punch-hole and relay but **not** for "relay request via hbbs". The report flags this for the client units.
+**Scope decision (orchestrator gate review): the server is not patched.**
+- **What the server enforces:** OSS hbbs can't reject a keyless `RegisterPeer`/`RegisterPk`, because the protocol has no key there. It also forwards `RequestRelay` without a key check.
+- **Where the gap is closed:** client-side, under **AC-61**. A host accepts relay requests only for its own configured relay.
+- **What `verify-server.sh` reports:** it tests exactly what the server enforces, then prints this line instead of passing silently:
 
-`verify-server.sh` automates the server half: wrong key, missing key and right key against both hbbs `PunchHoleRequest` and hbbr. It doesn't exercise gap 2, because doing so needs a registered peer, and `RegisterPk` persists to the peer DB. The two-machine checklist should add: "a keyless client's `RequestRelay` naming a foreign relay is refused by the host".
+  ```
+  KNOWN LIMITATION: registration and relay-request forwarding are not key-checked by OSS hbbs;
+                    mitigated client-side (host accepts only its configured relay) - see AC-61
+  ```
+
+`verify-server.sh` automates the enforceable part: wrong key, missing key and right key against hbbs `PunchHoleRequest` and against hbbr.
+- **Addresses probed:** the literal A record address, and the AAAA address when this host has IPv6.
+- **Not exercised:** gap 2. That would need a registered peer, and `RegisterPk` persists to the peer DB. AC-61's two-machine test covers it: a keyless client's `RequestRelay` naming a foreign relay is refused by the host.
 
 **Fail-closed guard.** In 1.1.16, `-k _` fails **open**: if the key file can't be read, or can't be created, the daemon silently runs with an empty key and accepts everyone. An unreadable `id_ed25519` also makes hbbs overwrite `id_ed25519.pub` with a fresh key that no longer matches.
 
 The kit prevents all of that:
 
 - **The key comes first.** `install.sh` creates the key before any daemon starts.
-- **Both units check it before starting.** Both run `ExecStartPre=keycheck.sh`, which requires a readable, valid keypair whose halves match. If the key is broken, the daemon never starts. It never serves without enforcement and never gets to mint its own key.
+- **Both units check it before starting.** Both run `ExecStartPre=keycheck.sh`. It requires:
+  - two regular files, not symlinks;
+  - a 64-byte libsodium secret key and a 32-byte public key;
+  - the public key **derived from the seed with real Ed25519** (`openssl pkey`, OpenSSL 3.0.13 on the VM) equals the stored one;
+  - a **sign/verify positive control** passes (`openssl pkeyutl -rawin`).
+
+  If the key is broken, the daemon never starts. It never serves without enforcement and never gets to mint its own key.
 - **hbbr can't write `data/`.**
 - **The health check confirms it on the wire, not from the journal, which rotates.** The check is `install.sh` health, which also runs on `--status`. From the VM it sends hbbs (127.0.0.1:21116) and hbbr (the VM's own non-loopback address, port 21117) a wrong key, which must be refused, and the server key, which must be accepted.
 
@@ -204,7 +228,7 @@ The caps protect the neighbours rather than the daemons. Each unit also has `Tas
   - `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`.
   - `SystemCallFilter=@system-service ~@privileged @resources`, with `SystemCallArchitectures=native`.
 - **Result:** `systemd-analyze security` scores both units **1.2 OK**, and `systemd-analyze verify` is clean on systemd 255 (Ubuntu 24.04, the VM's version).
-- **Restarts:** `Restart=on-failure` with `RestartSec=5` and a start limit of 10 per 120 s. `install.sh` runs `reset-failed` before its own restarts.
+- **Restarts:** `Restart=on-failure` with backoff (`RestartSec=10`, `RestartSteps=8`, `RestartMaxDelaySec=300`) and `StartLimitIntervalSec=0`. After a long DNS or key outage the units keep retrying, every 5 minutes at most, instead of parking in `failed`. `install.sh` runs `reset-failed` before its own restarts.
 
 ## Known caveats
 
@@ -215,7 +239,7 @@ The caps protect the neighbours rather than the daemons. Each unit also has `Tas
   - Any process on the VM can reach them, including an SSRF in one of the other apps. That fits the box's existing trust model, but it is a real lever: a local compromise could redirect the relay hbbs hands out.
   - It also means probes must come from outside the VM. From inside, the "right key" relay probe reads as "refused".
 - **The relay name is resolved once.** hbbs resolves `--relay-servers rs.johnnycode.ai:21117` only at start, and permanently drops it if DNS fails. Clients then get no relay from hbbs.
-  - `wait-resolve.sh` (`ExecStartPre=-`) gives DNS up to 60 s at boot before hbbs starts anyway.
+  - DNS is therefore a start condition. `ExecStartPre=wait-resolve.sh` waits up to 60 s, then **fails the start**, and `Restart=` retries with backoff until the name resolves. hbbs never runs without its relay.
   - `install.sh` refuses to install before the name resolves.
   - The health check (`--status`) asks hbbs's admin port for its live relay list (`probe.py relays`). That list must be exactly `rs.johnnycode.ai:21117`; if it isn't, the check prints the restart command. This also catches a relay rewritten through the loopback admin channel.
 - **Version check.** Once a day, hbbs posts its version to RustDesk's version-check API and logs `new version is available`. This is outbound only, and no client data goes with it. AC-6 is about clients and is unaffected. The calls can't be blocked per unit without also blocking replies to clients.
