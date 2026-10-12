@@ -18,6 +18,20 @@ if [[ -x scripts/apply-patches.sh ]]; then
   echo "== patches apply cleanly"
   scripts/apply-patches.sh --check
 fi
+if [[ -d patches ]]; then
+  # DEC-15 / AC-33 / AC-40: the client patches must not carry a personal server host or key, and
+  # must not reintroduce RustDesk's public servers. (Bundle id ai.johnnycode.remotesmith is fine.)
+  echo "== patches: no personal infrastructure, no RustDesk public servers"
+  # Added lines only, ignoring comments that name what was removed.
+  if grep -rnE '^\+.*(johnnycode\.ai|rs-ny\.rustdesk\.com|admin\.rustdesk\.com|api\.rustdesk\.com)' patches/ \
+       | grep -vE '^[^:]+:[0-9]+:\+[[:space:]]*(//|#)'; then
+    echo "verify: a patch adds a personal hostname or a RustDesk public server (lines above)" >&2
+    exit 1
+  fi
+fi
+for f in scripts/branding/*.py; do
+  [[ -f "$f" ]] && python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
+done
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done
