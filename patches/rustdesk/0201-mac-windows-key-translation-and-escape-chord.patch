@@ -31,14 +31,14 @@ src/remotesmith_keymap.rs (declared from keyboard.rs):
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/keyboard.rs             |   87 ++-
- src/remotesmith_keymap.rs   | 1016 +++++++++++++++++++++++++++++++++++
+ src/keyboard.rs             |   91 ++-
+ src/remotesmith_keymap.rs   | 1101 +++++++++++++++++++++++++++++++++++
  src/ui_session_interface.rs |   17 +-
- 3 files changed, 1118 insertions(+), 2 deletions(-)
+ 3 files changed, 1207 insertions(+), 2 deletions(-)
  create mode 100644 src/remotesmith_keymap.rs
 
 diff --git a/src/keyboard.rs b/src/keyboard.rs
-index e7bdce9b5439..c61defb06ecf 100644
+index e7bdce9b5439..a10e7d8f827f 100644
 --- a/src/keyboard.rs
 +++ b/src/keyboard.rs
 @@ -20,6 +20,10 @@ use std::{
@@ -126,7 +126,7 @@ index e7bdce9b5439..c61defb06ecf 100644
              let _scan_code = event.position_code;
              let _code = event.platform_code as KeyCode;
  
-@@ -755,6 +801,45 @@ pub fn release_remote_keys(keyboard_mode: &str) {
+@@ -755,6 +801,49 @@ pub fn release_remote_keys(keyboard_mode: &str) {
      release_remote_keys_for_events(keyboard_mode, take_remote_keys());
  }
  
@@ -159,6 +159,10 @@ index e7bdce9b5439..c61defb06ecf 100644
 +#[cfg(not(any(target_os = "android", target_os = "ios")))]
 +fn release_capture_for_escape_chord(keyboard_mode: &str) {
 +    log::info!("RemoteSmith escape chord: releasing input capture");
++    let mode = get_keyboard_mode_enum(keyboard_mode);
++    for key_event in rs_keymap::win_key_mask_events(&get_peer_platform(), mode) {
++        send_key_event(&key_event);
++    }
 +    release_all_remote_keys(keyboard_mode);
 +    reset_modifiers_state();
 +    #[cfg(feature = "flutter")]
@@ -174,10 +178,10 @@ index e7bdce9b5439..c61defb06ecf 100644
          "map" => KeyboardMode::Map,
 diff --git a/src/remotesmith_keymap.rs b/src/remotesmith_keymap.rs
 new file mode 100644
-index 000000000000..592a329e53f7
+index 000000000000..d064773061e0
 --- /dev/null
 +++ b/src/remotesmith_keymap.rs
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,1101 @@
 +//! RemoteSmith key-mapping contract (DEC-6 / DEC-22, PLAN §6.1).
 +//!
 +//! Translation happens on the controller, on the key events upstream has already built for the
@@ -452,7 +456,8 @@ index 000000000000..592a329e53f7
 +            if p.m != from || e.m == to {
 +                continue;
 +            }
-+            let new = ModKey::new(to, p.side);
++            // Always the left key: right Alt is AltGr (Ctrl+Alt) on many Windows layouts.
++            let new = ModKey::new(to, Side::Left);
 +            out.extend(self.release(e));
 +            self.held[i].1 = new;
 +            out.extend(self.press(new));
@@ -499,6 +504,11 @@ index 000000000000..592a329e53f7
 +            (true, None) => self.held.push(k),
 +            (false, Some(i)) => {
 +                self.held.remove(i);
++                // The chord is broken, so the next Esc with the chord is a new chord. The
++                // consumed Esc's own release is usually never seen: capture is gone by then.
++                if !self.chord_held() {
++                    self.esc_consumed = false;
++                }
 +            }
 +            _ => {}
 +        }
@@ -637,11 +647,17 @@ index 000000000000..592a329e53f7
 +    }
 +    if key == Key::Tab && down {
 +        let switched = t.tab_down();
-+        out.extend(
-+            switched
-+                .into_iter()
-+                .map(|m| build_mod_event(m, &peer, mode)),
-+        );
++        // Legacy mode carries the modifier state on every event (the host syncs to it), so the
++        // switched modifier events keep the Tab's list, e.g. Shift for Cmd+Shift+Tab.
++        let mut mods = events.first().map(|e| e.clone()).unwrap_or_default();
++        remap_modifier_list(t, &mut mods);
++        for m in switched {
++            let mut e = build_mod_event(m, &peer, mode);
++            if mode == KeyboardMode::Legacy {
++                e.modifiers = mods.modifiers.clone();
++            }
++            out.push(e);
++        }
 +    }
 +    for mut e in events {
 +        remap_modifier_list(t, &mut e);
@@ -706,6 +722,20 @@ index 000000000000..592a329e53f7
 +        event,
 +        events,
 +    )
++}
++
++/// A Right-Ctrl tap for a Windows host, sent before the escape chord's releases: with no other
++/// key after Win, releasing Win (raw mode, or a Windows controller) would open the Start menu.
++pub fn win_key_mask_events(peer: &str, mode: KeyboardMode) -> Vec<KeyEvent> {
++    let peer = normalize_peer(peer);
++    if peer != "windows" {
++        return Vec::new();
++    }
++    let k = ModKey::new(Mod::Ctrl, Side::Right);
++    vec![
++        build_mod_event((k, true), &peer, mode),
++        build_mod_event((k, false), &peer, mode),
++    ]
 +}
 +
 +/// Key-ups for whatever the translation still holds on the host (e.g. the Alt it switched to).
@@ -966,6 +996,42 @@ index 000000000000..592a329e53f7
 +    }
 +
 +    #[test]
++    fn escape_chord_works_twice_in_a_row() {
++        // Real flow: the grab loop tracks every key; after Release capture is gone, so the
++        // Esc release never reaches on_escape.
++        let mut c = ChordTracker::default();
++        for _ in 0..3 {
++            for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++                c.track(k, true);
++            }
++            assert_eq!(c.on_escape(true), ChordAction::Release);
++            c.track(Key::Escape, false);
++            for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
++                c.track(k, false);
++            }
++        }
++    }
++
++    #[test]
++    fn cmd_tab_from_right_cmd_uses_left_alt() {
++        let mut t = tr(Direction::MacToWindows);
++        assert_eq!(t.modifier(RCMD, true), vec![(RCTRL, true)]);
++        assert_eq!(t.tab_down(), vec![(RCTRL, false), (ALT, true)]);
++        assert_eq!(t.modifier(RCMD, false), vec![(ALT, false)]);
++        assert!(t.is_idle());
++    }
++
++    #[test]
++    fn win_key_mask_only_for_windows_hosts() {
++        let out = win_key_mask_events("Windows", KeyboardMode::Map);
++        assert_eq!(
++            out.iter().map(chr).collect::<Vec<_>>(),
++            vec![(0xE01D, true), (0xE01D, false)]
++        );
++        assert!(win_key_mask_events("Mac OS", KeyboardMode::Map).is_empty());
++    }
++
++    #[test]
 +    fn escape_chord_lost_release_does_not_eat_next_esc() {
 +        let mut c = ChordTracker::default();
 +        for k in [Key::ControlLeft, Key::Alt, Key::MetaLeft] {
@@ -1161,6 +1227,29 @@ index 000000000000..592a329e53f7
 +        assert_eq!((out[1].control_key(), out[1].down), (ControlKey::Alt, true));
 +        assert_eq!(out[2].control_key(), ControlKey::Tab);
 +        assert_eq!(out[2].modifiers, vec![EnumOrUnknown::new(ControlKey::Alt)]);
++        assert_eq!(out[1].modifiers, out[2].modifiers);
++        // Cmd+Shift+Tab keeps Shift on the switched Alt.
++        let mut tab = KeyEvent::new();
++        tab.mode = mode.into();
++        tab.set_control_key(ControlKey::Tab);
++        tab.down = true;
++        tab.modifiers = vec![ControlKey::Meta.into(), ControlKey::Shift.into()];
++        let mut t = Translator::default();
++        let mut cmd = KeyEvent::new();
++        cmd.mode = mode.into();
++        cmd.set_control_key(ControlKey::Meta);
++        cmd.down = true;
++        translate_with(
++            &mut t,
++            d,
++            "Windows",
++            mode,
++            &ev(Key::MetaLeft, true),
++            vec![cmd],
++        );
++        let out = translate_with(&mut t, d, "Windows", mode, &ev(Key::Tab, true), vec![tab]);
++        assert_eq!((out[1].control_key(), out[1].down), (ControlKey::Alt, true));
++        assert!(out[1].modifiers.contains(&ControlKey::Shift.into()));
 +    }
 +
 +    #[test]
@@ -1195,27 +1284,22 @@ index 000000000000..592a329e53f7
 +    }
 +}
 diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
-index f28752e77d7e..c92c1a36aede 100644
+index f28752e77d7e..3828d7b07715 100644
 --- a/src/ui_session_interface.rs
 +++ b/src/ui_session_interface.rs
-@@ -640,11 +640,17 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -640,6 +640,12 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn set_option(&self, k: String, mut v: String) {
-+        // RemoteSmith (AC-59): changing the mapping mode releases everything held on the host.
-+        let remap = k == keyboard::rs_keymap::OPTION_TRANSLATE_SHORTCUTS;
++        // RemoteSmith (AC-59): changing the mapping mode releases everything held on the host,
++        // under the old mapping (so a raw Win is released as Win), before the option changes.
++        if k == keyboard::rs_keymap::OPTION_TRANSLATE_SHORTCUTS && v != self.get_option(k.clone())
++        {
++            keyboard::release_all_remote_keys(&self.get_keyboard_mode());
++        }
          let mut lc = self.lc.write().unwrap();
          if k.eq("remote_dir") {
              v = lc.get_all_remote_dir(v);
-         }
-         lc.set_option(k, v);
-+        drop(lc);
-+        if remap {
-+            keyboard::release_all_remote_keys(&self.get_keyboard_mode());
-+        }
-     }
- 
-     #[inline]
 @@ -697,7 +703,10 @@ impl<T: InvokeUiSession> Session<T> {
  
      pub fn swap_modifier_key(&self, msg: &mut KeyEvent) {
