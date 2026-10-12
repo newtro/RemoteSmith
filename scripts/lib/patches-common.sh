@@ -65,8 +65,12 @@ format_commit() { # repo-dir commit
 
 # Exact identity of a patch: sha256 of its bytes (message, metadata and diff, whitespace
 # included). Deliberately not `git patch-id`, which ignores whitespace and the message.
-file_hash() { shasum -a 256 <"$1" | cut -d' ' -f1; }
-commit_hash() { format_commit "$1" "$2" | shasum -a 256 | cut -d' ' -f1; }
+# sha256 of stdin. macOS ships shasum; Git Bash on Windows CI ships sha256sum but not shasum.
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+file_hash() { sha256_stdin <"$1"; }
+commit_hash() { format_commit "$1" "$2" | sha256_stdin; }
 
 # Hashes of the patch files for one target, one per line (after load_patches).
 patch_file_hashes() {
