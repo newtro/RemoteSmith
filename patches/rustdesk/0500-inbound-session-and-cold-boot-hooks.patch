@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:35:40 -0400
+Subject: remotesmith(0500): inbound session and cold-boot hooks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Report every authorized inbound connection to the RemoteSmith session
+registry when its AuthedConnID is created and dropped, so the sidecar's
+tray badge follows sessions within milliseconds (§6.2a, AC-60), and remote
+sessions authorized at the login screen within 15 minutes of boot are
+recorded in the cold-boot ledger behind "Unattended ready" (§6.3, AC-55).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/server/connection.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index 7f318326e25c..0fdb1956b7ab 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -6841,6 +6841,14 @@ mod raii {
+             let printer = conn_type == crate::server::AuthConnType::Remote
+                 && crate::is_support_remote_print(&lr.version)
+                 && lr.my_platform == hbb_common::whoami::Platform::Windows.to_string();
++            // RemoteSmith: inbound-session badge and cold-boot ledger (§6.2a, §6.3).
++            #[cfg(not(any(target_os = "android", target_os = "ios")))]
++            crate::remotesmith::sessions::opened(
++                conn_id,
++                conn_type == AuthConnType::Remote,
++                &lr.my_id,
++                &lr.my_name,
++            );
+             AUTHED_CONNS.lock().unwrap().push(AuthedConn {
+                 conn_id,
+                 conn_type,
+@@ -6986,6 +6994,8 @@ mod raii {
+             #[cfg(not(any(target_os = "android", target_os = "ios")))]
+             clear_relative_mouse_active(self.0);
+             AUTHED_CONNS.lock().unwrap().retain(|c| c.conn_id != self.0);
++            #[cfg(not(any(target_os = "android", target_os = "ios")))]
++            crate::remotesmith::sessions::closed(self.0);
+             let remote_count = AUTHED_CONNS
+                 .lock()
+                 .unwrap()

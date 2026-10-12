@@ -1,0 +1,38 @@
+{"to":"server","valid":true,"type":"hello","note":"\u00a74 hello","line":"{\"v\":1,\"id\":1,\"type\":\"hello\",\"min_version\":1,\"max_version\":1,\"client\":\"remotesmith-tray\",\"client_version\":\"0.1.0\"}"}
+{"to":"server","valid":true,"type":"get_status","note":"get_status","line":"{\"v\":1,\"id\":2,\"type\":\"get_status\"}"}
+{"to":"server","valid":true,"type":"list_peers","note":"list_peers","line":"{\"v\":1,\"id\":3,\"type\":\"list_peers\"}"}
+{"to":"server","valid":true,"type":"subscribe","note":"\u00a75 subscribe","line":"{\"v\":1,\"id\":2,\"type\":\"subscribe\",\"topics\":[\"status\",\"peers\"]}"}
+{"to":"server","valid":true,"type":"subscribe","note":"unknown topic maps to fallback","line":"{\"v\":1,\"id\":2,\"type\":\"subscribe\",\"topics\":[\"status\",\"desk_mode\"]}"}
+{"to":"server","valid":true,"type":"connect","note":"\u00a75 connect","line":"{\"v\":1,\"id\":3,\"type\":\"connect\",\"peer_id\":\"123456789\"}"}
+{"to":"server","valid":true,"type":"connect","note":"extra credential field is ignored (\u00a71.2)","line":"{\"v\":1,\"id\":3,\"type\":\"connect\",\"peer_id\":\"1\",\"password\":\"hunter2\"}"}
+{"to":"server","valid":true,"type":"ping","note":"\u00a75 ping","line":"{\"v\":1,\"id\":4,\"type\":\"ping\"}"}
+{"to":"server","valid":true,"type":"ping","note":"CRLF tolerated (\u00a73)","line":"{\"v\":1,\"id\":4,\"type\":\"ping\"}\r"}
+{"to":"server","valid":true,"type":"unknown","note":"unknown request type decodes as unknown","line":"{\"v\":1,\"id\":4,\"type\":\"format_disk\"}"}
+{"to":"server","valid":true,"type":"ping","note":"unknown fields ignored (\u00a73)","line":"{\"v\":1,\"id\":5,\"type\":\"ping\",\"future_field\":[1,2]}"}
+{"to":"server","valid":false,"type":null,"note":"bad JSON","line":"not json"}
+{"to":"server","valid":false,"type":null,"note":"not an object","line":"[1,2]"}
+{"to":"server","valid":false,"type":null,"note":"wrong field type","line":"{\"v\":1,\"id\":9,\"type\":\"connect\",\"peer_id\":5}"}
+{"to":"server","valid":false,"type":null,"note":"missing v","line":"{\"id\":1,\"type\":\"ping\"}"}
+{"to":"server","valid":false,"type":null,"note":"hello missing fields","line":"{\"v\":1,\"id\":1,\"type\":\"hello\",\"min_version\":1}"}
+{"to":"client","valid":true,"type":"hello_ok","note":"\u00a74 hello_ok","line":"{\"v\":1,\"id\":1,\"type\":\"hello_ok\",\"version\":1,\"min_version\":1,\"max_version\":1,\"server\":\"RemoteSmith\",\"server_version\":\"1.5.0-rs.1\"}"}
+{"to":"client","valid":true,"type":"error","note":"\u00a74 version mismatch","line":"{\"v\":1,\"id\":1,\"type\":\"error\",\"error\":{\"code\":\"version_mismatch\",\"message\":\"server speaks 2-3, client 1-1\",\"min_version\":2,\"max_version\":3}}"}
+{"to":"client","valid":true,"type":"error","note":"\u00a76.3 error","line":"{\"v\":1,\"id\":3,\"type\":\"error\",\"error\":{\"code\":\"peer_unknown\",\"message\":\"no peer 987654321\"}}"}
+{"to":"client","valid":true,"type":"error","note":"unknown error code tolerated","line":"{\"v\":1,\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"x\"}}"}
+{"to":"client","valid":true,"type":"status","note":"\u00a77 status example","line":"{\"v\":1,\"type\":\"status\",\"status\":{\"app_version\":\"1.5.0-rs.1\",\"platform\":\"macos\",\"my_id\":\"123456789\",\"key_fingerprint\":\"SHA256:3f:9a\",\"service\":{\"running\":true,\"detail\":null},\"permissions\":[{\"name\":\"accessibility\",\"state\":\"granted\"},{\"name\":\"screen_recording\",\"state\":\"missing\"},{\"name\":\"input_monitoring\",\"state\":\"granted\"},{\"name\":\"system_audio_recording\",\"state\":\"unknown\",\"detail\":\"not yet requested\"}],\"power\":{\"sleep_disabled\":true,\"detail\":null},\"preboot_unlock\":{\"detected\":false,\"detail\":null},\"server\":{\"state\":\"registered\",\"host\":\"rs.johnnycode.ai\",\"detail\":null},\"unattended\":{\"ready\":false,\"cold_boot_verified_at\":null},\"inbound_sessions\":[{\"conn_id\":7,\"peer_id\":\"987654321\",\"alias\":\"Scott-PC\",\"kind\":\"human\",\"since\":1791820800}]}}"}
+{"to":"client","valid":true,"type":"status","note":"status with every field defaulted","line":"{\"v\":1,\"type\":\"status\",\"status\":{}}"}
+{"to":"client","valid":true,"type":"status","note":"null sessions = none","line":"{\"v\":1,\"type\":\"status\",\"status\":{\"inbound_sessions\":null}}"}
+{"to":"client","valid":true,"type":"status","note":"unknown enum values map to fallbacks","line":"{\"v\":1,\"type\":\"status\",\"status\":{\"platform\":\"beos\",\"server\":{\"state\":\"exploded\"},\"inbound_sessions\":[{\"peer_id\":\"9\",\"kind\":\"robot\"}]}}"}
+{"to":"client","valid":false,"type":null,"note":"sessions not an array rejects status (\u00a73)","line":"{\"v\":1,\"type\":\"status\",\"status\":{\"inbound_sessions\":{\"peer_id\":\"9\"}}}"}
+{"to":"client","valid":false,"type":null,"note":"sessions string rejects status","line":"{\"v\":1,\"type\":\"status\",\"status\":{\"inbound_sessions\":\"none\"}}"}
+{"to":"client","valid":true,"type":"peers","note":"\u00a78 peer example","line":"{\"v\":1,\"type\":\"peers\",\"peers\":[{\"id\":\"987654321\",\"alias\":\"Scott-PC\",\"platform\":\"windows\",\"presence\":{\"state\":\"reachable\",\"route\":\"lan\"}}]}"}
+{"to":"client","valid":true,"type":"peers","note":"every presence state","line":"{\"v\":1,\"type\":\"peers\",\"peers\":[{\"id\":\"1\",\"presence\":{\"state\":\"checking\"}},{\"id\":\"2\",\"presence\":{\"state\":\"reachable\",\"route\":\"id\"}},{\"id\":\"3\",\"presence\":{\"state\":\"unavailable\",\"reason\":\"offline\",\"last_seen\":1791820000}},{\"id\":\"4\",\"presence\":{\"state\":\"unavailable\",\"reason\":\"server_unreachable\",\"detail\":\"x\"}}]}"}
+{"to":"client","valid":true,"type":"peers","note":"empty list = onboarding","line":"{\"v\":1,\"type\":\"peers\",\"peers\":[]}"}
+{"to":"client","valid":true,"type":"peers","note":"bad element dropped","line":"{\"v\":1,\"type\":\"peers\",\"peers\":[5,{\"id\":\"1\"}]}"}
+{"to":"client","valid":false,"type":null,"note":"peers null rejected","line":"{\"v\":1,\"type\":\"peers\",\"peers\":null}"}
+{"to":"client","valid":false,"type":null,"note":"peers object rejected","line":"{\"v\":1,\"type\":\"peers\",\"peers\":{\"id\":\"1\"}}"}
+{"to":"client","valid":false,"type":null,"note":"no readable peer rejected","line":"{\"v\":1,\"type\":\"peers\",\"peers\":[5,{\"alias\":\"x\"}]}"}
+{"to":"client","valid":true,"type":"connect_started","note":"connect_started","line":"{\"v\":1,\"id\":3,\"type\":\"connect_started\",\"peer_id\":\"123456789\"}"}
+{"to":"client","valid":true,"type":"connect_result","note":"connect_result","line":"{\"v\":1,\"type\":\"connect_result\",\"peer_id\":\"1\",\"ok\":false,\"reason\":\"auth_failed\"}"}
+{"to":"client","valid":true,"type":"subscribed","note":"subscribed","line":"{\"v\":1,\"id\":2,\"type\":\"subscribed\",\"topics\":[\"status\",\"peers\"]}"}
+{"to":"client","valid":true,"type":"pong","note":"pong","line":"{\"v\":1,\"id\":4,\"type\":\"pong\"}"}
+{"to":"client","valid":true,"type":"unknown","note":"unknown event type","line":"{\"v\":1,\"type\":\"desk_mode\",\"on\":true}"}
