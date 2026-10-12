@@ -34,17 +34,17 @@ already keeps one connection per peer and type.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  flutter/lib/common.dart                       |  12 +-
- .../widgets/remotesmith_trust_dialogs.dart    |  45 ++-
- flutter/lib/models/model.dart                 |  39 +-
+ .../widgets/remotesmith_trust_dialogs.dart    |  46 ++-
+ flutter/lib/models/model.dart                 |  47 ++-
  flutter/lib/utils/multi_window_manager.dart   |  35 ++
  src/client.rs                                 |   4 +
- src/client/io_loop.rs                         |  40 +-
+ src/client/io_loop.rs                         |  50 ++-
  src/flutter_ffi.rs                            |  13 +
  src/lang/en.rs                                |   2 +
  src/remotesmith_trust/mod.rs                  |   1 +
- src/remotesmith_trust/reconnect.rs            | 345 ++++++++++++++++++
- src/ui_session_interface.rs                   |  55 ++-
- 11 files changed, 575 insertions(+), 16 deletions(-)
+ src/remotesmith_trust/reconnect.rs            | 350 ++++++++++++++++++
+ src/ui_session_interface.rs                   |  70 +++-
+ 11 files changed, 613 insertions(+), 17 deletions(-)
  create mode 100644 src/remotesmith_trust/reconnect.rs
 
 diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
@@ -78,7 +78,7 @@ index b80e0b5f9580..f9956fb31810 100644
    if (link.isNotEmpty) {
      buttons.insert(0, dialogButton('JumpLink', onPressed: jumplink));
 diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
-index 91c95d7dc07d..b98b63086739 100644
+index 91c95d7dc07d..7083c1edf794 100644
 --- a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 +++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 @@ -1,4 +1,4 @@
@@ -110,7 +110,7 @@ index 91c95d7dc07d..b98b63086739 100644
  }
  
  Widget _row(String label, String value) {
-@@ -128,3 +135,33 @@ void _identityDialog(SessionID sessionId, String type, String title,
+@@ -128,3 +135,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
      tag: '$sessionId-$type',
    );
  }
@@ -120,6 +120,7 @@ index 91c95d7dc07d..b98b63086739 100644
 +    {VoidCallback? onReconnect}) {
 +  void reconnect() {
 +    dialogManager.dismissAll();
++    // Rust clears the cancel mark and starts the round in one call.
 +    unawaited(bind.sessionSetCommon(
 +        sessionId: sessionId, key: 'remotesmith-reconnect', value: 'manual'));
 +    onReconnect?.call();
@@ -145,7 +146,7 @@ index 91c95d7dc07d..b98b63086739 100644
 +  );
 +}
 diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
-index fe9aa2a82fd3..d23ab3964052 100644
+index fe9aa2a82fd3..87b8b3c75f14 100644
 --- a/flutter/lib/models/model.dart
 +++ b/flutter/lib/models/model.dart
 @@ -910,8 +910,9 @@ class FfiModel with ChangeNotifier {
@@ -156,7 +157,7 @@ index fe9aa2a82fd3..d23ab3964052 100644
 -      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager);
 +      // RemoteSmith: identity confirm/mismatch and "Disconnected — Reconnect".
 +      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager,
-+          onReconnect: () => reconnect(dialogManager, sessionId, false));
++          onReconnect: () => showReconnecting(dialogManager, sessionId));
      } else if (type == 're-input-password') {
        wrongPasswordDialog(sessionId, dialogManager, type, title, text);
      } else if (type == 'input-2fa') {
@@ -179,7 +180,7 @@ index fe9aa2a82fd3..d23ab3964052 100644
          reconnect(dialogManager, sessionId, false);
        });
        _reconnects *= 2;
-@@ -1111,6 +1115,29 @@ class FfiModel with ChangeNotifier {
+@@ -1111,16 +1115,45 @@ class FfiModel with ChangeNotifier {
      _pendingRestoreTimer = null;
    }
  
@@ -191,8 +192,8 @@ index fe9aa2a82fd3..d23ab3964052 100644
 +            key: 'remotesmith-retry-delay-ms',
 +            param: '') ??
 +        '');
-+    if (ms == null || ms <= 0) return _reconnects;
-+    return (ms + 999) ~/ 1000;
++    if (ms == null || ms <= 0) return min(_reconnects, 8);
++    return max(1, (ms + 999) ~/ 1000);
 +  }
 +
 +  /// RemoteSmith (AC-46): Cancel during a reconnect stops retrying and aborts
@@ -208,8 +209,17 @@ index fe9aa2a82fd3..d23ab3964052 100644
 +
    void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
        bool forceRelay) {
++    bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
++    showReconnecting(dialogManager, sessionId);
++  }
++
++  /// The UI side of a reconnect; RemoteSmith's manual Reconnect starts the
++  /// round itself in Rust (with its cancel mark cleared in the same call).
++  void showReconnecting(OverlayDialogManager dialogManager, SessionID sessionId) {
      // Disable relative mouse mode before reconnecting to ensure cursor is released.
-@@ -1120,7 +1147,7 @@ class FfiModel with ChangeNotifier {
+     parent.target?.inputModel.setRelativeMouseMode(false);
+     _cancelPendingMonitorRestore();
+-    bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
      clearPermissions();
      dialogManager.dismissAll();
      dialogManager.showLoading(translate('Connecting...'),
@@ -219,7 +229,7 @@ index fe9aa2a82fd3..d23ab3964052 100644
  
    Future<void> showRelayHintDialog(
 diff --git a/flutter/lib/utils/multi_window_manager.dart b/flutter/lib/utils/multi_window_manager.dart
-index 9e26f8cf9a61..6b877578c1c3 100644
+index 9e26f8cf9a61..793736ab308a 100644
 --- a/flutter/lib/utils/multi_window_manager.dart
 +++ b/flutter/lib/utils/multi_window_manager.dart
 @@ -219,6 +219,12 @@ class RustDeskMultiWindowManager {
@@ -240,7 +250,7 @@ index 9e26f8cf9a61..6b877578c1c3 100644
      bool? isSharedPassword,
      String? connToken,
 +  }) {
-+    final key = '${type.index}/$methodName/$remoteId';
++    final key = '${type.index}/$methodName/$remoteId/${forceRelay == true}';
 +    final pending = _pendingSessions[key];
 +    if (pending != null) {
 +      return pending;
@@ -253,7 +263,7 @@ index 9e26f8cf9a61..6b877578c1c3 100644
 +        isSharedPassword: isSharedPassword,
 +        connToken: connToken);
 +    _pendingSessions[key] = f;
-+    f.whenComplete(() => _pendingSessions.remove(key));
++    f.whenComplete(() => _pendingSessions.remove(key)).ignore();
 +    return f;
 +  }
 +
@@ -294,10 +304,10 @@ index 5fbe40e2f67c..590c22bea427 100644
              self.version = hbb_common::get_version_number(&pi.version);
          }
 diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
-index a8f3a104b86c..7411908f29a2 100644
+index a8f3a104b86c..1c9c5783c538 100644
 --- a/src/client/io_loop.rs
 +++ b/src/client/io_loop.rs
-@@ -191,15 +191,47 @@ impl<T: InvokeUiSession> Remote<T> {
+@@ -191,15 +191,57 @@ impl<T: InvokeUiSession> Remote<T> {
              ConnType::default()
          };
  
@@ -344,6 +354,16 @@ index a8f3a104b86c..7411908f29a2 100644
 +                    tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
 +                }
 +                self.handle_disconnected(round);
++                if !self.handler.lc.read().unwrap().remotesmith_retry.is_closed() {
++                    // The window is still open: leave it on "Disconnected - Reconnect".
++                    use crate::remotesmith_trust::reconnect as rs;
++                    self.handler.msgbox(
++                        rs::MSGBOX_DISCONNECTED,
++                        rs::DISCONNECTED_TITLE,
++                        rs::DISCONNECTED_TEXT,
++                        "",
++                    );
++                }
 +                return;
 +            }
              Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
@@ -403,10 +423,10 @@ index c88df312b182..5192a36b1158 100644
 +pub mod reconnect;
 diff --git a/src/remotesmith_trust/reconnect.rs b/src/remotesmith_trust/reconnect.rs
 new file mode 100644
-index 000000000000..dba7b985c05f
+index 000000000000..70fdcbe40ea9
 --- /dev/null
 +++ b/src/remotesmith_trust/reconnect.rs
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,350 @@
 +//! Controller reconnect policy (RemoteSmith DEF-7, AC-24, AC-46).
 +//!
 +//! Upstream retries a retryable "Connection Error" forever, doubling the delay, and only for a
@@ -509,6 +529,11 @@ index 000000000000..dba7b985c05f
 +    pub fn cancel(&mut self) {
 +        self.cancelled = true;
 +        self.last_delay = None;
++    }
++
++    /// A login succeeded at least once in this session.
++    pub fn is_established(&self) -> bool {
++        self.established
 +    }
 +
 +    pub fn is_cancelled(&self) -> bool {
@@ -753,7 +778,7 @@ index 000000000000..dba7b985c05f
 +    }
 +}
 diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
-index f28752e77d7e..3216aef85978 100644
+index f28752e77d7e..ee5964edbbe4 100644
 --- a/src/ui_session_interface.rs
 +++ b/src/ui_session_interface.rs
 @@ -1290,6 +1290,10 @@ impl<T: InvokeUiSession> Session<T> {
@@ -767,7 +792,7 @@ index f28752e77d7e..3216aef85978 100644
          // 1. If current session is connecting, do not reconnect.
          // 2. If the connection is established, send `Data::Close`.
          // 3. If the connection is disconnected, do nothing.
-@@ -1415,9 +1419,36 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -1415,9 +1419,40 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn close(&self) {
@@ -796,7 +821,11 @@ index f28752e77d7e..3216aef85978 100644
 +                    false,
 +                );
 +            }
-+            "manual" => self.lc.write().unwrap().remotesmith_retry.on_manual_reconnect(),
++            "manual" => {
++                // One call, so the cancel mark is cleared before the new round can finish.
++                self.lc.write().unwrap().remotesmith_retry.on_manual_reconnect();
++                self.reconnect(false);
++            }
 +            _ => {}
 +        }
 +    }
@@ -804,9 +833,24 @@ index f28752e77d7e..3216aef85978 100644
      pub fn continue_insecure_connection(&self, continue_insecure: bool) {
          let data = if continue_insecure {
              Data::ContinueInsecureConnection
-@@ -1791,7 +1822,29 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+@@ -1787,11 +1822,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+     }
+ 
+     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
++        use crate::remotesmith_trust::reconnect as rs_reconnect;
+         let direct = self.lc.read().unwrap().direct;
          let received = self.lc.read().unwrap().received;
          let retry_for_relay = direct == Some(true) && !received;
++        // RemoteSmith (DEF-7): once a session was up, a dropped direct (LAN/P2P) link is a
++        // transient failure like any other, not upstream's manual "try relay" prompt.
++        let msgtype = if msgtype.starts_with("relay-hint")
++            && rs_reconnect::is_connection_failure("error", title)
++            && self.lc.read().unwrap().remotesmith_retry.is_established()
++        {
++            "error"
++        } else {
++            msgtype
++        };
          let retry = check_if_retry(msgtype, title, text, retry_for_relay);
 -        self.ui_handler.msgbox(msgtype, title, text, link, retry);
 +        // RemoteSmith (DEF-7): bounded retries, transient failures after a drop included.

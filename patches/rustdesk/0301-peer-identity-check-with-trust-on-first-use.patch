@@ -41,11 +41,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/lang/en.rs                                |   9 +
  src/lib.rs                                    |   2 +
  src/port_forward.rs                           |  28 +-
- src/remotesmith_trust/identity.rs             | 512 ++++++++++++++++++
+ src/remotesmith_trust/identity.rs             | 523 ++++++++++++++++++
  src/remotesmith_trust/mod.rs                  |   3 +
  src/rendezvous_mediator.rs                    |   4 +-
  src/server.rs                                 |   2 +
- 13 files changed, 742 insertions(+), 28 deletions(-)
+ 13 files changed, 753 insertions(+), 28 deletions(-)
  create mode 100644 flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
  create mode 100644 src/remotesmith_trust/identity.rs
  create mode 100644 src/remotesmith_trust/mod.rs
@@ -435,10 +435,10 @@ index d1f4df434661..480b3d683ef3 100644
              *close_port_forward = true;
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
 new file mode 100644
-index 000000000000..21733e291080
+index 000000000000..500e0e014f3c
 --- /dev/null
 +++ b/src/remotesmith_trust/identity.rs
-@@ -0,0 +1,512 @@
+@@ -0,0 +1,523 @@
 +//! Peer identity, trust on first use (RemoteSmith DEF-3, §7, AC-37, AC-43).
 +//!
 +//! A peer is its stable RustDesk ID plus the fingerprint of its Ed25519 signing key (the key
@@ -621,6 +621,17 @@ index 000000000000..21733e291080
 +                        .set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
 +                }
 +            }
++            true
++        }
++        Verdict::FirstUse(o) if !interface.get_switch_code().is_empty() => {
++            // Switching sides back to the controller that just held a session with us: the
++            // login there rides the switch token, so there is nothing to confirm or pin.
++            log::info!(
++                "peer {}: switch-sides connection to unpinned host {} key {}",
++                peer,
++                o.id,
++                o.fingerprint
++            );
 +            true
 +        }
 +        Verdict::FirstUse(o) => {

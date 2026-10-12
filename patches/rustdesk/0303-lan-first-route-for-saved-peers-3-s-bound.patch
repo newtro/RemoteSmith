@@ -8,29 +8,31 @@ through hbbs (its intranet path needs hbbs as well) and uses the direct
 port 21118 only when the user types an IP, so with the VM down an ID
 connect fails even on the home LAN.
 
-Client::_start now tries the peer's LAN address(es) first: the address
-that last worked (peer option remotesmith-lan-hint), LAN discovery's
-IPs for that ID, and the address hbbs reports when it marks the peer as
-local. All candidates race; the first that connects AND proves the saved
-peer's ID in the identity handshake wins and the rest are dropped, so at
-most one session results. Connect plus handshake share a 3 s budget,
-then the ID route runs as before. Another machine at a stale address
-fails the handshake (no password is ever sent) and the ID route takes
-over; the same ID with a different key wins the race and is stopped by
-the 0301 identity gate. Skipped under forced relay, a SOCKS proxy or the
-WebSocket transport. The route shows as "LAN".
+For an enrolled peer (one with a pinned key, 0301) Client::_start now
+tries its LAN address(es) first: the address that last worked (peer
+option remotesmith-lan-hint), LAN discovery's IPs for that ID, and the
+address hbbs reports when it marks the peer as local. All candidates
+race; the first that connects, proves the saved peer's ID in the
+identity handshake AND signs with the pinned key wins, and the rest are
+dropped, so at most one session results. Connect plus handshake share a
+3 s budget, then the ID route runs as before. Anything else that answers
+(another machine at a stale address, or the same ID with another key) is
+a LAN failure and never gets a password; the ID route then decides with
+hbbs vouching for the key, so a LAN impostor can neither win nor enroll.
+First use is never done over LAN-first. Skipped under forced relay, a
+SOCKS proxy or the WebSocket transport. The route shows as "LAN".
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/client.rs                      |  55 +++++++-
- src/remotesmith_trust/identity.rs  | 143 +++++++++++----------
- src/remotesmith_trust/lan_first.rs | 193 +++++++++++++++++++++++++++++
+ src/client.rs                      |  60 +++++++-
+ src/remotesmith_trust/identity.rs  | 143 ++++++++++---------
+ src/remotesmith_trust/lan_first.rs | 221 +++++++++++++++++++++++++++++
  src/remotesmith_trust/mod.rs       |   1 +
- 4 files changed, 323 insertions(+), 69 deletions(-)
+ 4 files changed, 356 insertions(+), 69 deletions(-)
  create mode 100644 src/remotesmith_trust/lan_first.rs
 
 diff --git a/src/client.rs b/src/client.rs
-index 590c22bea427..5ed09f5935dd 100644
+index 590c22bea427..1308b23ab8b2 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -424,7 +424,12 @@ impl Client {
@@ -47,7 +49,7 @@ index 590c22bea427..5ed09f5935dd 100644
          // to-do: remember the port for each peer, so that we can retry easier
          if hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer) {
              let addr = if hbb_common::is_ip_str(peer) {
-@@ -455,6 +460,37 @@ impl Client {
+@@ -455,6 +460,42 @@ impl Client {
          };
          // RemoteSmith: on ID routes the identity hbbs vouches for is the real peer ID.
          interface.get_lch().write().unwrap().remotesmith_signed_id = peer.to_owned();
@@ -55,21 +57,26 @@ index 590c22bea427..5ed09f5935dd 100644
 +        // identity handshake together, then the ID route. Works with hbbs down (AC-8).
 +        {
 +            use crate::remotesmith_trust::lan_first;
-+            let (applies, saved_hint) = {
++            use crate::remotesmith_trust::identity::OPTION_FINGERPRINT;
++            let (applies, saved_hint, pinned_fp) = {
 +                let lc = interface.get_lch();
 +                let lc = lc.read().unwrap();
 +                (
 +                    other_server.is_empty() && lan_first::applies(lc.force_relay),
 +                    lc.get_option(lan_first::OPTION_LAN_HINT),
++                    lc.get_option(OPTION_FINGERPRINT),
 +                )
 +            };
-+            let addrs = if applies {
++            // Only for enrolled peers, and only the pinned key wins: a first use is enrolled from
++            // the hbbs-verified key on the ID route, never from whoever answers on the LAN.
++            let addrs = if applies && !pinned_fp.trim().is_empty() {
 +                lan_first::candidates(&saved_hint, &lan_first::discovered_ips(peer))
 +            } else {
 +                Vec::new()
 +            };
 +            if !addrs.is_empty() {
-+                match lan_first::connect(peer, &addrs, lan_first::LAN_BUDGET_MS).await {
++                match lan_first::connect(peer, &pinned_fp, &addrs, lan_first::LAN_BUDGET_MS).await
++                {
 +                    Ok((conn, addr, pk)) => {
 +                        interface.get_lch().write().unwrap().remotesmith_lan_addr = Some(addr);
 +                        return Ok((
@@ -85,7 +92,7 @@ index 590c22bea427..5ed09f5935dd 100644
          let (rendezvous_server, servers, contained) = if other_server.is_empty() {
              crate::get_rendezvous_server(1_000).await
          } else {
-@@ -1010,6 +1046,14 @@ impl Client {
+@@ -1010,6 +1051,14 @@ impl Client {
                              signed_id_pk = ph.pk.into();
                              relay_server = ph.relay_server;
                              peer_addr = AddrMangle::decode(&ph.socket_addr);
@@ -100,7 +107,7 @@ index 590c22bea427..5ed09f5935dd 100644
                              feedback = ph.feedback;
                              webrtc_sdp_answer = ph.webrtc_sdp_answer;
                              let s = udp.0.take();
-@@ -2848,6 +2892,8 @@ pub struct LoginConfigHandler {
+@@ -2848,6 +2897,8 @@ pub struct LoginConfigHandler {
      id: String,
      /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
      pub remotesmith_signed_id: String,
@@ -109,7 +116,7 @@ index 590c22bea427..5ed09f5935dd 100644
      /// RemoteSmith: automatic reconnect policy, kept across rounds (DEF-7).
      pub remotesmith_retry: crate::remotesmith_trust::reconnect::RetryPolicy,
      pub conn_type: ConnType,
-@@ -3680,6 +3726,13 @@ impl LoginConfigHandler {
+@@ -3680,6 +3731,13 @@ impl LoginConfigHandler {
      pub fn handle_peer_info(&mut self, pi: &PeerInfo) {
          // RemoteSmith: logged in, so the session is up and any reconnect streak is over.
          self.remotesmith_retry.on_connected();
@@ -124,10 +131,10 @@ index 590c22bea427..5ed09f5935dd 100644
              self.version = hbb_common::get_version_number(&pi.version);
          }
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
-index 21733e291080..cf712a19fde7 100644
+index 500e0e014f3c..3c7338a905b4 100644
 --- a/src/remotesmith_trust/identity.rs
 +++ b/src/remotesmith_trust/identity.rs
-@@ -314,17 +314,90 @@ pub async fn direct_handshake(
+@@ -325,17 +325,90 @@ pub async fn direct_handshake(
      Ok((id, sign_pk.to_vec()))
  }
  
@@ -220,7 +227,7 @@ index 21733e291080..cf712a19fde7 100644
      fn ident(id: &str, fp: &str) -> HostIdentity {
          HostIdentity {
              id: id.to_owned(),
-@@ -390,72 +463,6 @@ mod tests {
+@@ -401,72 +474,6 @@ mod tests {
          assert_eq!(id.id, "1");
      }
  
@@ -295,10 +302,10 @@ index 21733e291080..cf712a19fde7 100644
          let (host, sign_pk, done) = host_stub("123456789", Host::Honest).await;
 diff --git a/src/remotesmith_trust/lan_first.rs b/src/remotesmith_trust/lan_first.rs
 new file mode 100644
-index 000000000000..b7a3090eff26
+index 000000000000..6a76ba4bcb00
 --- /dev/null
 +++ b/src/remotesmith_trust/lan_first.rs
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,221 @@
 +//! LAN-first route for saved peers (RemoteSmith DEC-11, DEF-8, AC-7, AC-8, AC-38).
 +//!
 +//! Upstream reaches a peer by ID only through hbbs (its intranet path needs hbbs too), and goes
@@ -387,11 +394,14 @@ index 000000000000..b7a3090eff26
 +    }
 +}
 +
-+/// Try every candidate at once; the first that connects AND proves `expected_id` wins and the
-+/// rest are dropped (so only one session can come of it). Bounded by `budget_ms` overall.
-+/// Returns the stream, the address that won and the host's signing key.
++/// Try every candidate at once; the first that connects AND proves `expected_id` with the
++/// pinned key `pinned_fp` wins and the rest are dropped (so only one session can come of it).
++/// Anything else that answers (another machine, or the same ID with another key) is a LAN
++/// failure: the ID route then decides, with hbbs vouching for the key. Bounded by `budget_ms`
++/// overall. Returns the stream, the address that won and the host's signing key.
 +pub async fn connect(
 +    expected_id: &str,
++    pinned_fp: &str,
 +    addrs: &[String],
 +    budget_ms: u64,
 +) -> ResultType<(Stream, String, Vec<u8>)> {
@@ -402,11 +412,23 @@ index 000000000000..b7a3090eff26
 +    let attempts = addrs.iter().map(|addr| {
 +        let addr = addr.clone();
 +        let expected_id = expected_id.to_owned();
++        let pinned_fp = pinned_fp.to_owned();
 +        async move {
 +            let mut conn = connect_tcp_local(addr.as_str(), None, budget_ms).await?;
 +            let left = budget_ms.saturating_sub(start.elapsed().as_millis() as u64).max(1);
-+            let (_, pk) = super::identity::direct_handshake(&mut conn, Some(&expected_id), left)
++            let (id, pk) = super::identity::direct_handshake(&mut conn, Some(&expected_id), left)
 +                .await?;
++            let offered = super::identity::HostIdentity::new(&id, &pk);
++            if super::identity::evaluate(&pinned_fp, &expected_id, Some(&offered))
++                != super::identity::Verdict::Trusted
++            {
++                bail!(
++                    "{} answered for {} with key {}, not the pinned one",
++                    addr,
++                    expected_id,
++                    offered.fingerprint
++                );
++            }
 +            Ok::<_, hbb_common::anyhow::Error>((conn, addr, pk))
 +        }
 +        .boxed()
@@ -464,8 +486,10 @@ index 000000000000..b7a3090eff26
 +    #[hbb_common::tokio::test]
 +    async fn the_peer_that_proves_the_expected_id_wins() {
 +        let (wrong, _, _) = host_stub("999", Host::Honest).await;
++        let (impostor, _, _) = host_stub("123", Host::Honest).await;
 +        let (right, pk, _) = host_stub("123", Host::Honest).await;
-+        let (conn, addr, got_pk) = connect("123", &[wrong, right.clone()], LAN_BUDGET_MS)
++        let pin = super::super::identity::fingerprint(&pk);
++        let (conn, addr, got_pk) = connect("123", &pin, &[wrong, impostor, right.clone()], LAN_BUDGET_MS)
 +            .await
 +            .unwrap();
 +        assert_eq!(addr, right);
@@ -479,7 +503,7 @@ index 000000000000..b7a3090eff26
 +        // plus an address nothing listens on.
 +        let (silent, _, _) = host_stub("123", Host::Silent).await;
 +        let start = Instant::now();
-+        let Err(err) = connect("123", &[silent, "127.0.0.1:1".into()], 500).await else {
++        let Err(err) = connect("123", "abcd", &[silent, "127.0.0.1:1".into()], 500).await else {
 +            panic!("a silent host must not win");
 +        };
 +        assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
@@ -488,8 +512,19 @@ index 000000000000..b7a3090eff26
 +
 +    #[hbb_common::tokio::test]
 +    async fn another_machine_at_the_hint_is_not_accepted() {
-+        let (other, _, _) = host_stub("999", Host::Honest).await;
-+        assert!(connect("123", &[other], LAN_BUDGET_MS).await.is_err());
++        let (other, pk, _) = host_stub("999", Host::Honest).await;
++        let pin = super::super::identity::fingerprint(&pk);
++        assert!(connect("123", &pin, &[other], LAN_BUDGET_MS).await.is_err());
++    }
++
++    #[hbb_common::tokio::test]
++    async fn the_same_id_with_another_key_is_not_accepted_on_the_lan() {
++        // A LAN impostor (or a re-keyed host) claiming the saved ID: the ID route decides.
++        let (impostor, _, _) = host_stub("123", Host::Honest).await;
++        let Err(err) = connect("123", "0000 1111", &[impostor], LAN_BUDGET_MS).await else {
++            panic!("a key other than the pinned one must not win");
++        };
++        assert!(err.to_string().contains("not the pinned one"), "{err}");
 +    }
 +}
 diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
