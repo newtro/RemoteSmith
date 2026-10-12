@@ -85,7 +85,7 @@ index b80e0b5f9580..f9956fb31810 100644
    if (link.isNotEmpty) {
      buttons.insert(0, dialogButton('JumpLink', onPressed: jumplink));
 diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
-index 99cf37b685cf..dc23f5837921 100644
+index cdf73fa7e791..f2f852b63a62 100644
 --- a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 +++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 @@ -1,4 +1,4 @@
@@ -117,7 +117,7 @@ index 99cf37b685cf..dc23f5837921 100644
  }
  
  Widget _row(String label, String value) {
-@@ -133,3 +140,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
+@@ -140,3 +147,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
      tag: '$sessionId-$type',
    );
  }
@@ -294,7 +294,7 @@ index 9e26f8cf9a61..793736ab308a 100644
      var params = {
        "type": type.index,
 diff --git a/src/client.rs b/src/client.rs
-index 5fbe40e2f67c..590c22bea427 100644
+index 7367b9e5e898..c95e6465f674 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -2848,6 +2848,8 @@ pub struct LoginConfigHandler {
@@ -397,7 +397,7 @@ index 631b96a8dd58..8e3473dbb5cd 100644
                                          last_recv_time = Instant::now();
                                          if !received {
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index da55c0d4b1cb..35f6c7422d8f 100644
+index d6943f3d63b7..f0d8ea1d9a1e 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
 @@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
@@ -411,7 +411,7 @@ index da55c0d4b1cb..35f6c7422d8f 100644
 +        }
          // RemoteSmith: the answer to the first-use identity prompt (AC-43).
          if key == "remotesmith-identity" {
-             crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value == "Y"));
+             crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value));
 @@ -2933,6 +2938,14 @@ pub fn session_get_common(
      if let Some(s) = sessions::get_session_by_session_id(&session_id) {
          let v = if key == "is_screenshot_supported" {

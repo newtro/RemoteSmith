@@ -77,10 +77,10 @@ index d6aaa510b159..4a9c9d559980 100644
      fn unicode_and_sequences_hold_nothing() {
          let mut h = HeldInput::default();
 diff --git a/src/server/connection.rs b/src/server/connection.rs
-index 844b98964b60..caabf5092768 100644
+index e96e85273ae4..e5c9c13928d7 100644
 --- a/src/server/connection.rs
 +++ b/src/server/connection.rs
-@@ -709,8 +709,14 @@ impl Connection {
+@@ -711,8 +711,14 @@ impl Connection {
          // `on_message` picks the type-specific timeout then.
          conn.stream.set_send_timeout(SEND_TIMEOUT_VIDEO);
  
@@ -96,7 +96,7 @@ index 844b98964b60..caabf5092768 100644
          let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
  
          #[cfg(feature = "unix-file-copy-paste")]
-@@ -1161,6 +1167,21 @@ impl Connection {
+@@ -1163,6 +1169,21 @@ impl Connection {
                      }
                  }
                  _ = second_timer.tick() => {
@@ -118,7 +118,7 @@ index 844b98964b60..caabf5092768 100644
                      if conn.authorized
                          && crate::remotesmith_trust::password_epoch::is_stale(
                              conn.remotesmith_password_epoch,
-@@ -1255,7 +1276,11 @@ impl Connection {
+@@ -1257,7 +1278,11 @@ impl Connection {
      }
  
      #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -131,7 +131,7 @@ index 844b98964b60..caabf5092768 100644
          let mut block_input_mode = false;
          #[cfg(any(target_os = "windows", target_os = "macos"))]
          {
-@@ -1273,6 +1298,7 @@ impl Connection {
+@@ -1275,6 +1300,7 @@ impl Connection {
                      MessageInput::Mouse(mouse_input) => {
                          if mouse_input.simulate {
                              held.on_mouse(&mouse_input.msg);
@@ -139,7 +139,7 @@ index 844b98964b60..caabf5092768 100644
                              last_mouse_conn = Some((
                                  mouse_input.conn_id,
                                  mouse_input.username.clone(),
-@@ -1290,6 +1316,7 @@ impl Connection {
+@@ -1292,6 +1318,7 @@ impl Connection {
                      }
                      MessageInput::Key((mut msg, press)) => {
                          held.on_key(&msg, press);
@@ -147,7 +147,7 @@ index 844b98964b60..caabf5092768 100644
                          // Set the press state to false, use `down` only in `handle_key()`.
                          msg.press = false;
                          if press {
-@@ -1339,29 +1366,39 @@ impl Connection {
+@@ -1341,29 +1368,39 @@ impl Connection {
                  }
              }
          }

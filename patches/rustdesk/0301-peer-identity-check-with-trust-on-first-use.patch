@@ -16,7 +16,10 @@ stream proved with the pin saved in the peer's config:
   unused (the host may have timed it out meanwhile) and a fresh
   connection logs in, passing only if it proves the key just pinned; the
   credential is saved by the normal login path on it, so it too exists
-  only after confirmation. No exemptions, switch-sides included;
+  only after confirmation. The answer is bound to that prompt's id and
+  the host ID and fingerprint it showed (a concurrent prompt's answer
+  confirms nothing), and the pin is committed compare-and-set. No
+  exemptions, switch-sides included;
 - key or ID mismatch: stop without logging in, with a Forget peer path
   (AC-37, AC-43);
 - no identity proved (stock host, keyless server, plaintext fallback):
@@ -35,30 +38,30 @@ RemoteSmith.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../widgets/remotesmith_trust_dialogs.dart    | 135 +++++
+ .../widgets/remotesmith_trust_dialogs.dart    | 142 ++++
  flutter/lib/models/model.dart                 |   6 +-
  libs/base/protos/message.proto                |   7 +-
- src/client.rs                                 |  45 +-
+ src/client.rs                                 |  46 +-
  src/client/io_loop.rs                         |  21 +
  src/flutter_ffi.rs                            |   5 +
  src/lang/en.rs                                |   9 +
  src/lib.rs                                    |   2 +
  src/port_forward.rs                           |  40 +-
- src/remotesmith_trust/identity.rs             | 529 ++++++++++++++++++
+ src/remotesmith_trust/identity.rs             | 620 ++++++++++++++++++
  src/remotesmith_trust/mod.rs                  |   3 +
  src/rendezvous_mediator.rs                    |   4 +-
  src/server.rs                                 |   2 +
- 13 files changed, 780 insertions(+), 28 deletions(-)
+ 13 files changed, 879 insertions(+), 28 deletions(-)
  create mode 100644 flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
  create mode 100644 src/remotesmith_trust/identity.rs
  create mode 100644 src/remotesmith_trust/mod.rs
 
 diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 new file mode 100644
-index 000000000000..99cf37b685cf
+index 000000000000..cdf73fa7e791
 --- /dev/null
 +++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,142 @@
 +// RemoteSmith unit B3: peer identity (trust on first use) dialogs.
 +// Rust side: src/remotesmith_trust/{identity,reconnect}.rs. Kept in its own file so
 +// upstream's common.dart carries only the hook in msgBox().
@@ -114,10 +117,17 @@ index 000000000000..99cf37b685cf
 +  final isConfirm = type.startsWith('remotesmith-identity-confirm');
 +
 +  void answer(bool yes) {
++    // Bound to this prompt and the identity shown, so it can only confirm
++    // exactly what the user compared.
 +    unawaited(bind.sessionSetCommon(
 +        sessionId: sessionId,
 +        key: 'remotesmith-identity',
-+        value: yes ? 'Y' : 'N'));
++        value: jsonEncode({
++          'prompt': field('prompt'),
++          'id': id,
++          'fingerprint': fingerprint,
++          'answer': yes ? 'Y' : 'N',
++        })));
 +    dialogManager.dismissAll();
 +    if (!yes) {
 +      closeConnection();
@@ -237,7 +247,7 @@ index 991e8a31eb06..f35f6ecdcb6d 100644
  message AudioFormat {
    uint32 sample_rate = 1;
 diff --git a/src/client.rs b/src/client.rs
-index d3e66e73c6c6..5fbe40e2f67c 100644
+index d3e66e73c6c6..7367b9e5e898 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -424,31 +424,24 @@ impl Client {
@@ -306,12 +316,13 @@ index d3e66e73c6c6..5fbe40e2f67c 100644
      pub conn_type: ConnType,
      pub is_terminal_admin: bool,
      hash: Hash,
-@@ -5000,6 +4997,8 @@ pub enum Data {
+@@ -5000,6 +4997,9 @@ pub enum Data {
      NewVoiceCall,
      CloseVoiceCall,
      ContinueInsecureConnection,
-+    /// RemoteSmith: the user's answer to the first-use identity prompt (AC-43).
-+    RemoteSmithIdentity(bool),
++    /// RemoteSmith: the user's answer to one first-use identity prompt (AC-43), as the UI sent
++    /// it (prompt id, host ID, fingerprint, answer); see `identity::parse_answer`.
++    RemoteSmithIdentity(String),
      ResetDecoder(Option<usize>),
      RenameFile((i32, String, String, bool)),
      TakeScreenshot((i32, String)),
@@ -348,7 +359,7 @@ index fcbc0901ee6f..631b96a8dd58 100644
                      && !crate::common::is_direct_ip_access(&self.handler.get_id())
                      && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index f9cc2d66c251..da55c0d4b1cb 100644
+index f9cc2d66c251..d6943f3d63b7 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
 @@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
@@ -357,7 +368,7 @@ index f9cc2d66c251..da55c0d4b1cb 100644
          }
 +        // RemoteSmith: the answer to the first-use identity prompt (AC-43).
 +        if key == "remotesmith-identity" {
-+            crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value == "Y"));
++            crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value));
 +            return;
 +        }
      }
@@ -459,10 +470,10 @@ index d1f4df434661..ca4a04457137 100644
              *close_port_forward = true;
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
 new file mode 100644
-index 000000000000..e7ed0fb5f9da
+index 000000000000..36d1e4ffbd18
 --- /dev/null
 +++ b/src/remotesmith_trust/identity.rs
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,620 @@
 +//! Peer identity, trust on first use (RemoteSmith DEF-3, §7, AC-37, AC-43).
 +//!
 +//! A peer is its stable RustDesk ID plus the fingerprint of its Ed25519 signing key (the key
@@ -599,8 +610,16 @@ index 000000000000..e7ed0fb5f9da
 +pub const MSGBOX_CONFIRM: &str = "remotesmith-identity-confirm-nocancel";
 +pub const MSGBOX_MISMATCH: &str = "remotesmith-identity-mismatch-nocancel";
 +
-+fn dialog_text(peer: &str, offered: Option<&HostIdentity>, pinned: Option<(&str, &str)>) -> String {
++fn dialog_text(
++    peer: &str,
++    offered: Option<&HostIdentity>,
++    pinned: Option<(&str, &str)>,
++    prompt: Option<&str>,
++) -> String {
 +    let mut v = hbb_common::serde_json::json!({ "peer": peer });
++    if let Some(p) = prompt {
++        v["prompt"] = p.into();
++    }
 +    if let Some(o) = offered {
 +        v["id"] = o.id.clone().into();
 +        v["fingerprint"] = o.fingerprint.clone().into();
@@ -623,6 +642,36 @@ index 000000000000..e7ed0fb5f9da
 +    /// fingerprints (long enough for the host to time it out), so it is dropped unused and a
 +    /// fresh connection must log in; that one passes only if it proves the key just pinned.
 +    Reconfirm,
++}
++
++/// The user's answer to one first-use prompt, as the UI sends it: JSON with the prompt id and
++/// the host ID and fingerprint it showed. `Some(yes)` only if it answers exactly this prompt for
++/// exactly this identity; anything else (another prompt's answer, e.g. a concurrent port-forward
++/// mapping's, or a stale one) is not an answer to this prompt.
++pub fn parse_answer(prompt: &str, shown: &HostIdentity, answer: &str) -> Option<bool> {
++    let v: hbb_common::serde_json::Value = hbb_common::serde_json::from_str(answer).ok()?;
++    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_owned();
++    if field("prompt") != prompt
++        || field("id") != shown.id
++        || normalize(&field("fingerprint")) != normalize(&shown.fingerprint)
++    {
++        return None;
++    }
++    match field("answer").as_str() {
++        "Y" => Some(true),
++        "N" => Some(false),
++        _ => None,
++    }
++}
++
++/// Commit a confirmed first-use pin only if the pin has not changed since the prompt was shown
++/// (compare-and-set): still empty, or already this very identity. Another identity pinned
++/// meanwhile (say by a concurrent prompt) is not overwritten; the caller stops instead.
++pub fn may_commit_pin(current_fp: &str, current_id: &str, confirmed: &HostIdentity) -> bool {
++    matches!(
++        evaluate(current_fp, current_id, Some(confirmed)),
++        Verdict::FirstUse(_) | Verdict::Trusted
++    )
 +}
 +
 +/// The pre-login identity gate, run on every new stream before the host's `Hash` is read, so
@@ -668,18 +717,27 @@ index 000000000000..e7ed0fb5f9da
 +                o.id,
 +                o.fingerprint
 +            );
++            let prompt = uuid::Uuid::new_v4().to_string();
 +            interface.msgbox(
 +                MSGBOX_CONFIRM,
 +                "Confirm peer identity",
-+                &dialog_text(&peer, Some(&o), None),
++                &dialog_text(&peer, Some(&o), None, Some(&prompt)),
 +                "",
 +            );
 +            loop {
 +                match receiver.recv().await {
-+                    Some(crate::client::Data::RemoteSmithIdentity(true)) => break,
-+                    Some(crate::client::Data::RemoteSmithIdentity(false))
-+                    | Some(crate::client::Data::Close)
-+                    | None => {
++                    Some(crate::client::Data::RemoteSmithIdentity(answer)) => {
++                        match parse_answer(&prompt, &o, &answer) {
++                            Some(true) => break,
++                            Some(false) => {
++                                log::info!("peer {}: identity not confirmed, not logging in", peer);
++                                return Gate::Stop;
++                            }
++                            // Not an answer to this prompt.
++                            None => log::warn!("peer {}: ignoring an identity answer for another prompt", peer),
++                        }
++                    }
++                    Some(crate::client::Data::Close) | None => {
 +                        log::info!("peer {}: identity not confirmed, not logging in", peer);
 +                        return Gate::Stop;
 +                    }
@@ -689,6 +747,22 @@ index 000000000000..e7ed0fb5f9da
 +            }
 +            let lc = interface.get_lch();
 +            let mut lc = lc.write().unwrap();
++            // Compare-and-set under the write lock: the pin may have changed while we waited.
++            let (cur_fp, cur_id) = (
++                lc.get_option(OPTION_FINGERPRINT),
++                lc.get_option(OPTION_HOST_ID),
++            );
++            if !may_commit_pin(&cur_fp, &cur_id, &o) {
++                log::warn!(
++                    "peer {}: pin changed to host {:?} key {:?} while confirming {} {}; not pinning",
++                    peer,
++                    cur_id,
++                    cur_fp,
++                    o.id,
++                    o.fingerprint
++                );
++                return Gate::Stop;
++            }
 +            lc.set_option(OPTION_FINGERPRINT.to_owned(), o.fingerprint.clone());
 +            lc.set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
 +            log::info!(
@@ -710,7 +784,7 @@ index 000000000000..e7ed0fb5f9da
 +            interface.msgbox(
 +                MSGBOX_MISMATCH,
 +                "Peer identity mismatch",
-+                &dialog_text(&peer, Some(&o), Some((&pinned_id, &pinned_fp))),
++                &dialog_text(&peer, Some(&o), Some((&pinned_id, &pinned_fp)), None),
 +                "",
 +            );
 +            Gate::Stop
@@ -724,7 +798,7 @@ index 000000000000..e7ed0fb5f9da
 +            interface.msgbox(
 +                MSGBOX_MISMATCH,
 +                "Peer identity unavailable",
-+                &dialog_text(&peer, None, Some((&pinned_id, &pinned_fp))),
++                &dialog_text(&peer, None, Some((&pinned_id, &pinned_fp)), None),
 +                "",
 +            );
 +            Gate::Stop
@@ -859,6 +933,34 @@ index 000000000000..e7ed0fb5f9da
 +            evaluate("", "", Some(&ident("1", " "))),
 +            Verdict::Unavailable { enrolled: false }
 +        );
++    }
++
++    #[test]
++    fn an_answer_binds_to_its_prompt_and_the_identity_shown() {
++        let shown = ident("123", "abcd ef01");
++        let ans = |p: &str, id: &str, fp: &str, a: &str| {
++            hbb_common::serde_json::json!({"prompt": p, "id": id, "fingerprint": fp, "answer": a})
++                .to_string()
++        };
++        assert_eq!(parse_answer("p1", &shown, &ans("p1", "123", "abcd ef01", "Y")), Some(true));
++        assert_eq!(parse_answer("p1", &shown, &ans("p1", "123", "ABCDEF01", "N")), Some(false));
++        // Another prompt's answer (a concurrent mapping) confirms nothing here.
++        assert_eq!(parse_answer("p1", &shown, &ans("p2", "123", "abcd ef01", "Y")), None);
++        // An answer about another key or host confirms nothing.
++        assert_eq!(parse_answer("p1", &shown, &ans("p1", "123", "ffff 0000", "Y")), None);
++        assert_eq!(parse_answer("p1", &shown, &ans("p1", "999", "abcd ef01", "Y")), None);
++        assert_eq!(parse_answer("p1", &shown, "Y"), None);
++        assert_eq!(parse_answer("p1", &shown, &ans("p1", "123", "abcd ef01", "")), None);
++    }
++
++    #[test]
++    fn a_confirmed_pin_never_overwrites_another_pinned_meanwhile() {
++        let a = ident("123", "aaaa 0001");
++        assert!(may_commit_pin("", "", &a));
++        assert!(may_commit_pin("aaaa0001", "123", &a));
++        // Key B got pinned by another prompt while A's dialog was open.
++        assert!(!may_commit_pin("bbbb 0002", "123", &a));
++        assert!(!may_commit_pin("aaaa 0001", "999", &a));
 +    }
 +
 +    #[test]

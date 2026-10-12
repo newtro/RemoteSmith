@@ -17,6 +17,8 @@ Settings > About > Fingerprint (and, once the sidecar exposes it, in the tray).
 2. Connect to the host's ID. A "Confirm peer identity" dialog shows the host's ID and
    fingerprint and no password has been asked or sent (host log has no login attempt yet).
 3. Compare with the host's Settings > About > Fingerprint: they match character for character.
+   With two port-forward mappings to the same unenrolled peer opened at once (two prompts),
+   confirming one prompt pins only the identity that prompt showed.
 4. Press Cancel: the tab closes; the peer file has no `remotesmith-host-fingerprint` option
    (Mac: `~/Library/Preferences/ai.johnnycode.RemoteSmith/peers/<id>.toml`).
 5. Connect again, wait at least 40 s on the dialog (longer than the host's idle timeout), then
@@ -101,6 +103,9 @@ first connection always enrolls over the ID route (hbbs vouches for the key) or 
    for about 5 s (e.g. `sudo pfctl`/Windows firewall rule blocking the relay for 5 s, then lift
    it): the session continues, the drag and Shift are still held, and releasing them on the
    controller releases them on the host.
+7. Keyboard mode note: held-key release on disconnect is verified in Map mode (the supported
+   mode, as in B2's section). In Legacy mode a character key's key-up on disconnect cleanup is not
+   guaranteed (deferred); run steps 1-2 in Map mode.
 
 ### B3-7 (AC-39) Changing the host's password ends sessions; the old credential stops working
 1. In an open session (repeat with a switch-sides session, toolbar > Switch sides), change the
@@ -111,7 +116,9 @@ first connection always enrolls over the ID route (hbbs vouches for the key) or 
    works.
 3. Open a port forward (or RDP) tunnel to the host, change the password: the tunnel closes within
    30 s.
-4. Forget the peer on the controller: its saved credential is removed (peer file deleted).
+4. Resume cache: drop the controller's network for ~5 s right after changing the password (so
+   it reconnects within 30 s): the reconnect is refused, it does not resume the old session.
+5. Forget the peer on the controller: its saved credential is removed (peer file deleted).
 
 ### B3-8 (AC-61) Host refuses a relay it did not choose
 1. Prerequisite: a client with the right server host but no key (a stock RustDesk with only the

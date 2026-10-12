@@ -32,7 +32,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/remotesmith_trust/lan_first.rs
 
 diff --git a/src/client.rs b/src/client.rs
-index 590c22bea427..1308b23ab8b2 100644
+index c95e6465f674..1b4ee9f1fe7c 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -424,7 +424,12 @@ impl Client {
@@ -131,10 +131,10 @@ index 590c22bea427..1308b23ab8b2 100644
              self.version = hbb_common::get_version_number(&pi.version);
          }
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
-index e7ed0fb5f9da..2efb2c381414 100644
+index 36d1e4ffbd18..dab342561b55 100644
 --- a/src/remotesmith_trust/identity.rs
 +++ b/src/remotesmith_trust/identity.rs
-@@ -331,17 +331,90 @@ pub async fn direct_handshake(
+@@ -394,17 +394,90 @@ pub async fn direct_handshake(
      Ok((id, sign_pk.to_vec()))
  }
  
@@ -227,7 +227,7 @@ index e7ed0fb5f9da..2efb2c381414 100644
      fn ident(id: &str, fp: &str) -> HostIdentity {
          HostIdentity {
              id: id.to_owned(),
-@@ -407,72 +480,6 @@ mod tests {
+@@ -498,72 +571,6 @@ mod tests {
          assert_eq!(id.id, "1");
      }
  
