@@ -2,7 +2,8 @@
 # keycheck.sh [--wait SECONDS] [DIR]
 #
 # Succeeds only when DIR (default: the current directory) holds a valid hbbs keypair:
-# both are regular files (not symlinks); id_ed25519 decodes to a 64-byte libsodium
+# both are regular files (not symlinks) holding exactly the canonical base64 text and
+# nothing else (one trailing newline allowed); id_ed25519 decodes to a 64-byte libsodium
 # secret key (seed || public key) and id_ed25519.pub to 32 bytes; the public key equals
 # the one openssl derives from the seed with real Ed25519; and a signature made with the
 # seed verifies against the public key. Needs openssl (3.x, as on Ubuntu 24.04).
@@ -29,12 +30,32 @@ umask 077
 PKCS8_PREFIX='\060\056\002\001\000\060\005\006\003\053\145\160\004\042\004\040'
 SPKI_PREFIX='\060\052\060\005\006\003\053\145\160\003\041\000'
 
+# strict_b64 FILE CHARS PATTERN: print FILE's content only if it is exactly CHARS bytes
+# of canonical standard base64 matching PATTERN, optionally followed by ONE "\n" (which
+# upstream's trim() tolerates). Nothing else: no other whitespace, no other bytes, no
+# non-canonical padding bits. Reason: upstream 1.1.16 reads id_ed25519 with
+# read_to_string; invalid UTF-8 anywhere in the file makes that fail and the daemon
+# then runs with an EMPTY key (no enforcement). Validating a prefix is not enough.
+strict_b64() {
+  f=$1; n=$2; pat=$3
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  size=$(wc -c < "$f" | tr -d ' ')
+  if [ "$size" = "$((n + 1))" ]; then
+    [ "$(tail -c 1 "$f" | od -An -tx1 | tr -d ' \n')" = 0a ] || return 1
+  elif [ "$size" != "$n" ]; then
+    return 1
+  fi
+  v=$(head -c "$n" "$f")
+  [ "${#v}" = "$n" ] || return 1
+  printf '%s\n' "$v" | LC_ALL=C grep -qxE "$pat" || return 1
+  # Canonical: decoding and re-encoding gives back exactly the same text.
+  [ "$(printf %s "$v" | base64 -d 2>/dev/null | base64 -w0)" = "$v" ] || return 1
+  printf %s "$v"
+}
+
 check() {
-  [ -f "$dir/id_ed25519" ] && [ ! -L "$dir/id_ed25519" ] || return 1
-  [ -f "$dir/id_ed25519.pub" ] && [ ! -L "$dir/id_ed25519.pub" ] || return 1
-  sk=$(head -c 200 "$dir/id_ed25519" | tr -d ' \n\r')
-  pk=$(head -c 100 "$dir/id_ed25519.pub" | tr -d ' \n\r')
-  [ -n "$sk" ] && [ -n "$pk" ] || return 1
+  sk=$(strict_b64 "$dir/id_ed25519" 88 '[A-Za-z0-9+/]{86}==') || return 1
+  pk=$(strict_b64 "$dir/id_ed25519.pub" 44 '[A-Za-z0-9+/]{43}=') || return 1
   printf %s "$sk" | base64 -d > "$tmp/sk.bin" 2>/dev/null || return 1
   printf %s "$pk" | base64 -d > "$tmp/pk.bin" 2>/dev/null || return 1
   [ "$(wc -c < "$tmp/sk.bin" | tr -d ' ')" = 64 ] || return 1

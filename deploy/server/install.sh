@@ -376,9 +376,12 @@ valid_pubkey() { [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 # Read data/id_ed25519.pub safely: refuse symlinks and non-regular files (data/ is
 # writable by hbbs), read at most 64 bytes, and print it only if it is a valid key.
 read_pubkey() {
-  local f=$PREFIX/data/id_ed25519.pub v
+  local f=$PREFIX/data/id_ed25519.pub v size
   [[ -f $f && ! -L $f ]] || return 1
-  v=$(head -c 64 "$f" | tr -d ' \n\r')
+  # Exactly the 44-byte key, optionally one trailing newline; nothing else.
+  size=$(wc -c < "$f")
+  [[ $size == 44 || ( $size == 45 && $(tail -c 1 "$f" | od -An -tx1 | tr -d ' \n') == 0a ) ]] || return 1
+  v=$(head -c 44 "$f")
   valid_pubkey "$v" || return 1
   printf '%s' "$v"
 }
