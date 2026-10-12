@@ -76,7 +76,7 @@ The deviation from PLAN §4 (Docker → systemd) is deliberate. It matches the V
 ## Fork ↔ sidecar IPC (summary; full spec in docs/IPC.md)
 
 - **Transport:**
-  - macOS: a Unix socket at `/tmp/RemoteSmith/remotesmith-ipc.sock`, mode 0600, owned by the user.
+  - macOS: a Unix socket at `/tmp/RemoteSmith/remotesmith-ipc-<uid>.sock`, mode 0600, owned by the user (uid suffix so two logged-in users never collide; the server also checks the peer uid).
   - Windows: a named pipe `\\.\pipe\RemoteSmith-ipc-<username>` with an ACL for the current user only.
 - **Framing:** newline-delimited JSON. Every message has `"v": 1`. The server is the fork's per-user UI/server process; the client is the sidecar.
 - **Version check:** the sidecar sends `hello` with its supported range, and the fork replies with its version. If the ranges don't overlap, the sidecar shows `unknown` and stops issuing requests (DEF-4).
