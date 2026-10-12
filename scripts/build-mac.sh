@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Flutter macOS app (arm64, unsigned) from vendor/rustdesk the way upstream CI does.
-# Output: build/mac/RustDesk.app (+ build/mac/build-*.log). Run scripts/bootstrap-mac.sh first.
+# Output: build/mac/<PRODUCT_NAME>.app, i.e. RemoteSmith.app once the branding patches are applied
+# (+ build/mac/build-*.log). Run scripts/bootstrap-mac.sh first.
 #
 # Mirrors, at RustDesk 1.5.0:
 #   bridge.yml:86-104            generate the flutter_rust_bridge files (CI does this on Linux)
@@ -22,7 +23,7 @@ skip_bridge=0
 for arg in "$@"; do
   case "$arg" in
     --skip-bridge) skip_bridge=1 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
@@ -202,21 +203,25 @@ changed_by_tools="$(for f in "${CI_EDITED[@]}"; do
 [[ -z "$changed_by_tools" ]] || echo "note: changed during build.py (will be left as is): $changed_by_tools"
 ((rc == 0)) || die "build.py failed (exit $rc)"
 
-app_src="$RUSTDESK_DIR/flutter/build/macos/Build/Products/Release/RustDesk.app"
-[[ -x "$app_src/Contents/MacOS/RustDesk" ]] || die "build.py finished but $app_src is missing"
-rm -rf "$OUT_DIR/RustDesk.app"
-ditto "$app_src" "$OUT_DIR/RustDesk.app"
+# The bundle and executable are named by PRODUCT_NAME (RemoteSmith after the branding patches).
+app_name="$(sed -n 's/^PRODUCT_NAME = \(.*\)$/\1/p' "$RUSTDESK_DIR/flutter/macos/Runner/Configs/AppInfo.xcconfig" | head -n1)"
+[[ -n "$app_name" ]] || die "could not read PRODUCT_NAME from flutter/macos/Runner/Configs/AppInfo.xcconfig"
+app_src="$RUSTDESK_DIR/flutter/build/macos/Build/Products/Release/$app_name.app"
+[[ -x "$app_src/Contents/MacOS/$app_name" ]] || die "build.py finished but $app_src is missing"
+app_out="$OUT_DIR/$app_name.app"
+rm -rf "$app_out"
+ditto "$app_src" "$app_out"
 # Make the local copy launchable. Xcode leaves the app ad-hoc signed WITH the hardened runtime, and
 # then library validation refuses the ad-hoc FlutterMacOS.framework ("different Team IDs"), so the
 # app dies in dyld. That is the same "unsigned" app CI uploads; CI only launches it after signing
 # everything with a Developer ID (.github/scripts/sign-macos-app.sh). Locally we re-sign the copy
 # ad hoc without the hardened runtime, keeping upstream's Release.entitlements. Real signing
 # (Apple Development / Developer ID) is scripts/release-mac.sh's job.
-codesign --force --deep --sign - --entitlements "$RUSTDESK_DIR/flutter/macos/Runner/Release.entitlements" "$OUT_DIR/RustDesk.app"
-codesign --verify --deep --strict "$OUT_DIR/RustDesk.app"
+codesign --force --deep --sign - --entitlements "$RUSTDESK_DIR/flutter/macos/Runner/Release.entitlements" "$app_out"
+codesign --verify --deep --strict "$app_out"
 
 elapsed=$(( $(date +%s) - start_ts ))
 log "done in $((elapsed / 60))m$((elapsed % 60))s"
-echo "app:    $OUT_DIR/RustDesk.app ($(du -sh "$OUT_DIR/RustDesk.app" | cut -f1))"
-echo "arch:   $(lipo -archs "$OUT_DIR/RustDesk.app/Contents/MacOS/RustDesk")"
+echo "app:    $app_out ($(du -sh "$app_out" | cut -f1))"
+echo "arch:   $(lipo -archs "$app_out/Contents/MacOS/$app_name")"
 echo "target: $CARGO_TARGET_CACHE ($(du -sh "$CARGO_TARGET_CACHE" | cut -f1))"

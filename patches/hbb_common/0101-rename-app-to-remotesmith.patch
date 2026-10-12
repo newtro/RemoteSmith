@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:19:14 -0400
+Subject: remotesmith(0101): rename app to RemoteSmith
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+APP_NAME RustDesk -> RemoteSmith and the macOS ORG com.carriez -> ai.johnnycode.
+This moves the config dir to ~/Library/Preferences/ai.johnnycode.RemoteSmith,
+the IPC dir to /tmp/RemoteSmith-<uid>/ (docs/IPC.md) and the launchd labels to
+ai.johnnycode.RemoteSmith_service/_server. Renaming turns on upstream's
+custom-client paths (is_custom_client()); see the B1 audit.
+
+Plan: DEC-15, §4 thin-fork patch 1, AC-33.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index 6fe1004558f1..f5c9c59bdcc7 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -54,7 +54,9 @@ const SERIAL: i32 = 3;
+ 
+ #[cfg(target_os = "macos")]
+ lazy_static::lazy_static! {
+-    pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
++    // RemoteSmith: config dir ~/Library/Preferences/ai.johnnycode.RemoteSmith, launchd labels
++    // ai.johnnycode.RemoteSmith_service / _server (DEC-15).
++    pub static ref ORG: RwLock<String> = RwLock::new("ai.johnnycode".to_owned());
+ }
+ 
+ type Size = (i32, i32, i32, i32);
+@@ -69,7 +71,7 @@ lazy_static::lazy_static! {
+     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
+     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
+     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
+-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
++    pub static ref APP_NAME: RwLock<String> = RwLock::new("RemoteSmith".to_owned());
+     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
+     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
+     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();

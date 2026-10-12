@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:20:04 -0400
+Subject: remotesmith(0102): no default rendezvous server, key or update URL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Empty RENDEZVOUS_SERVERS and RS_PUB_KEY so a fresh build has no server
+configured and never contacts rs-ny.rustdesk.com. The version-check URL
+(api.rustdesk.com) is emptied as a backstop to the client-side update
+guards, the docs link points at the RemoteSmith repo, and
+Config::get_rendezvous_server() returns "" instead of ":21116" when
+nothing is configured.
+
+Plan: DEF-2, AC-6, AC-40, §4 thin-fork patch 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 28 +++++++++++++++++++++++++---
+ src/lib.rs    |  4 +++-
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index f5c9c59bdcc7..68c8a3ebe92b 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -99,7 +99,7 @@ lazy_static::lazy_static! {
+     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
+ }
+ 
+-pub const LINK_DOCS_HOME: &str = "https://rustdesk.com/docs/en/";
++pub const LINK_DOCS_HOME: &str = "https://github.com/newtro/RemoteSmith";
+ pub const LINK_DOCS_X11_REQUIRED: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
+ 
+ lazy_static::lazy_static! {
+@@ -116,8 +116,10 @@ const CHARS: &[char] = &[
+     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+ ];
+ 
+-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
++// RemoteSmith: no built-in rendezvous server or key. A fresh build never contacts
++// rustdesk.com; the server host and key come from first-run setup or `--option` (DEF-2).
++pub const RENDEZVOUS_SERVERS: &[&str] = &[];
++pub const RS_PUB_KEY: &str = "";
+ 
+ pub const RENDEZVOUS_PORT: i32 = 21116;
+ pub const RELAY_PORT: i32 = 21117;
+@@ -926,6 +928,11 @@ impl Config {
+                 .next()
+                 .unwrap_or_default();
+         }
++        if rendezvous_server.is_empty() {
++            // RemoteSmith: no server configured (direct LAN only or not set up yet). Return
++            // "" rather than ":21116", which some resolvers map to localhost (DEF-2).
++            return rendezvous_server;
++        }
+         if !rendezvous_server.contains(':') {
+             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
+         }
+@@ -3680,3 +3687,18 @@ mod tests {
+         assert_ne!(non_service_root, non_service_user);
+     }
+ }
++
++#[cfg(test)]
++mod remotesmith_no_default_servers_tests {
++    use super::*;
++
++    // DEF-2 / AC-6 / AC-40: nothing built in may point at RustDesk's public servers.
++    #[test]
++    fn no_builtin_rendezvous_server_or_key() {
++        assert!(RENDEZVOUS_SERVERS.is_empty());
++        assert!(RS_PUB_KEY.is_empty());
++        let (_, url) = crate::version_check_request(crate::VER_TYPE_RUSTDESK_CLIENT.to_owned());
++        assert!(url.is_empty(), "update check URL must be empty, got {url}");
++        assert!(!LINK_DOCS_HOME.contains("rustdesk.com"));
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 8bc7f097808b..6161ea4b7e78 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -508,7 +508,9 @@ pub const VER_TYPE_RUSTDESK_CLIENT: &str = "rustdesk-client";
+ pub const VER_TYPE_RUSTDESK_SERVER: &str = "rustdesk-server";
+ 
+ pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
+-    const URL: &str = "https://api.rustdesk.com/version/latest";
++    // RemoteSmith: no update service. An empty URL makes any caller that slips past the
++    // client-side guards fail locally instead of reporting to api.rustdesk.com (DEF-2).
++    const URL: &str = "";
+ 
+     use sysinfo::System;
+     let system = System::new();

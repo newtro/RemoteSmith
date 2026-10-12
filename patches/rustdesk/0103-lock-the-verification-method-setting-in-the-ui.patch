@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:32:04 -0400
+Subject: remotesmith(0103): lock the verification-method setting in the UI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hbb_common 0103 fixes verification-method=use-permanent-password through
+OVERWRITE_SETTINGS. The radio buttons now show it as fixed instead of
+accepting a change the service silently drops. The temporary-password
+length and numeric options are already disabled while the temporary
+password is off.
+
+Plan: DEC-10, AC-10, §4 thin-fork patch 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/desktop/pages/desktop_setting_page.dart | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/flutter/lib/desktop/pages/desktop_setting_page.dart b/flutter/lib/desktop/pages/desktop_setting_page.dart
+index 7dde2ce05815..8a9f1134c6a7 100644
+--- a/flutter/lib/desktop/pages/desktop_setting_page.dart
++++ b/flutter/lib/desktop/pages/desktop_setting_page.dart
+@@ -1248,6 +1248,9 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
+           ];
+           bool tmpEnabled = model.verificationMethod != kUsePermanentPassword;
+           bool permEnabled = model.verificationMethod != kUseTemporaryPassword;
++          // RemoteSmith fixes the method to the permanent password (DEC-10).
++          final isVerificationMethodFixed =
++              isOptionFixed(kOptionVerificationMethod);
+           String currentValue =
+               passwordValues[passwordKeys.indexOf(model.verificationMethod)];
+           List<Widget> radios = passwordValues
+@@ -1256,7 +1259,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
+                     value: value,
+                     groupValue: currentValue,
+                     label: value,
+-                    onChanged: locked
++                    onChanged: locked || isVerificationMethodFixed
+                         ? null
+                         : ((value) async {
+                             callback() async {

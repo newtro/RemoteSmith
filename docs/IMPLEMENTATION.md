@@ -70,7 +70,7 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
 git submodule update --init --recursive --depth 1
 scripts/bootstrap-mac.sh     # idempotent; Flutter 3.24.5 (+3.22.3 for the bridge), Rust 1.81/1.75 toolchains,
                              # NASM 2.16.03, cargo-expand + flutter_rust_bridge_codegen, vcpkg + arm64-osx packages
-scripts/build-mac.sh         # -> build/mac/RustDesk.app (+ build/mac/build-*.log)
+scripts/build-mac.sh         # -> build/mac/RemoteSmith.app (+ build/mac/build-*.log)
 ```
 
 - `scripts/lib/mac-env.sh` holds every version, each with the upstream workflow line it mirrors. Everything lands in `~/.cache/remotesmith/`; your default rustup toolchain is not touched (the build sets `RUSTUP_TOOLCHAIN`).
