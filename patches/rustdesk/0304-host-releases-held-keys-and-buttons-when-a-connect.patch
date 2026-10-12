@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:37:09 -0400
+Subject: remotesmith(0304): host releases held keys and buttons when a
+ connection ends
+
+DEF-7, AC-41. Upstream releases almost nothing when a connection ends:
+release_pressed_modifiers (Drop for Connection) covers a set that is
+nearly always empty, held keys are force-released only after six
+minutes or at process exit, and mouse buttons never. A drop mid-drag or
+with a key held left it stuck on the host.
+
+The connection's input thread now tracks every key and button it
+injects (HeldInput) and, when the connection's input channel closes,
+injects the matching up events through the same path as the downs (the
+main-thread queue on macOS, the portable service on Windows when it
+runs), buttons first so a drag ends where it is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/remotesmith_trust/held_input.rs | 203 ++++++++++++++++++++++++++++
+ src/remotesmith_trust/mod.rs        |   1 +
+ src/server/connection.rs            |  30 ++++
+ 3 files changed, 234 insertions(+)
+ create mode 100644 src/remotesmith_trust/held_input.rs
+
+diff --git a/src/remotesmith_trust/held_input.rs b/src/remotesmith_trust/held_input.rs
+new file mode 100644
+index 000000000000..d6aaa510b159
+--- /dev/null
++++ b/src/remotesmith_trust/held_input.rs
+@@ -0,0 +1,203 @@
++//! What a connection is holding down on the host, so it can be let go (RemoteSmith DEF-7,
++//! AC-41).
++//!
++//! Upstream releases almost nothing when a connection ends: `release_pressed_modifiers` in
++//! `Drop for Connection` covers a set that is nearly always empty, held keys are force-released
++//! only after six minutes or at process exit, and mouse buttons never are. So a drop during a
++//! drag, or while a key is held, leaves it stuck on the host.
++//!
++//! The connection's input thread feeds every event it injects through [`HeldInput`] and, when
++//! the connection ends, injects the matching "up" events through the same path (main-thread
++//! queue on macOS, the portable service on Windows when it runs), so they reach whatever got the
++//! "down".
++
++use crate::common::input::{MOUSE_TYPE_DOWN, MOUSE_TYPE_MASK, MOUSE_TYPE_UP};
++use base::message_proto::{key_event, KeyEvent, KeyboardMode, MouseEvent};
++use hbb_common::protobuf::EnumOrUnknown;
++use std::collections::{BTreeMap, BTreeSet};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++enum KeyId {
++    Control(i32, i32),
++    Chr(i32, u32),
++    Win2Win(i32, u32),
++}
++
++fn key_id(evt: &KeyEvent) -> Option<KeyId> {
++    let mode = evt.mode.value();
++    match evt.union {
++        Some(key_event::Union::ControlKey(ck)) => Some(KeyId::Control(mode, ck.value())),
++        Some(key_event::Union::Chr(c)) => Some(KeyId::Chr(mode, c)),
++        Some(key_event::Union::Win2winHotkey(c)) => Some(KeyId::Win2Win(mode, c)),
++        // Unicode and sequences are typed whole, never held.
++        _ => None,
++    }
++}
++
++#[derive(Default, Debug)]
++pub struct HeldInput {
++    keys: BTreeMap<KeyId, KeyEvent>,
++    /// Button bits currently down.
++    buttons: BTreeSet<i32>,
++    /// Where the last mouse event pointed, for the synthesized releases.
++    last_pos: (i32, i32),
++}
++
++impl HeldInput {
++    /// Record a key event as injected. `press` (a click) holds nothing.
++    pub fn on_key(&mut self, evt: &KeyEvent, press: bool) {
++        let Some(id) = key_id(evt) else {
++            return;
++        };
++        if evt.down && !press {
++            self.keys.insert(id, evt.clone());
++        } else {
++            self.keys.remove(&id);
++        }
++    }
++
++    /// Record a mouse event as injected.
++    pub fn on_mouse(&mut self, evt: &MouseEvent) {
++        self.last_pos = (evt.x, evt.y);
++        let buttons = evt.mask >> 3;
++        if buttons == 0 {
++            return;
++        }
++        match evt.mask & MOUSE_TYPE_MASK {
++            MOUSE_TYPE_DOWN => {
++                self.buttons.insert(buttons);
++            }
++            MOUSE_TYPE_UP => {
++                self.buttons.remove(&buttons);
++            }
++            _ => {}
++        }
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.keys.is_empty() && self.buttons.is_empty()
++    }
++
++    /// The events that let go of everything still held, and forget it: buttons first (ends a
++    /// drag where it is), then keys.
++    pub fn take_releases(&mut self) -> (Vec<MouseEvent>, Vec<KeyEvent>) {
++        let (x, y) = self.last_pos;
++        let mouse = std::mem::take(&mut self.buttons)
++            .into_iter()
++            .map(|b| MouseEvent {
++                mask: (b << 3) | MOUSE_TYPE_UP,
++                x,
++                y,
++                ..Default::default()
++            })
++            .collect();
++        let keys = std::mem::take(&mut self.keys)
++            .into_values()
++            .map(|mut k| {
++                k.down = false;
++                k.press = false;
++                // No modifiers in the release: they would be pressed again around it.
++                k.modifiers.clear();
++                if k.mode.enum_value().is_err() {
++                    k.mode = EnumOrUnknown::new(KeyboardMode::Legacy);
++                }
++                k
++            })
++            .collect();
++        (mouse, keys)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_MOVE};
++    use base::message_proto::ControlKey;
++
++    fn mouse(t: i32, b: i32, x: i32, y: i32) -> MouseEvent {
++        MouseEvent {
++            mask: (b << 3) | t,
++            x,
++            y,
++            ..Default::default()
++        }
++    }
++
++    fn ck(k: ControlKey, down: bool) -> KeyEvent {
++        let mut e = KeyEvent::new();
++        e.set_control_key(k);
++        e.down = down;
++        e.mode = KeyboardMode::Map.into();
++        e
++    }
++
++    fn chr(c: u32, down: bool) -> KeyEvent {
++        let mut e = KeyEvent::new();
++        e.set_chr(c);
++        e.down = down;
++        e.mode = KeyboardMode::Map.into();
++        e.modifiers.push(ControlKey::Shift.into());
++        e
++    }
++
++    #[test]
++    fn a_drop_mid_drag_releases_the_button_where_it_is() {
++        let mut h = HeldInput::default();
++        h.on_mouse(&mouse(MOUSE_TYPE_DOWN, MOUSE_BUTTON_LEFT, 10, 10));
++        h.on_mouse(&mouse(MOUSE_TYPE_MOVE, 0, 50, 60));
++        let (m, k) = h.take_releases();
++        assert!(k.is_empty());
++        assert_eq!(m.len(), 1);
++        assert_eq!(m[0].mask, (MOUSE_BUTTON_LEFT << 3) | MOUSE_TYPE_UP);
++        assert_eq!((m[0].x, m[0].y), (50, 60));
++        assert!(h.is_empty());
++    }
++
++    #[test]
++    fn released_buttons_and_keys_are_not_released_again() {
++        let mut h = HeldInput::default();
++        h.on_mouse(&mouse(MOUSE_TYPE_DOWN, MOUSE_BUTTON_RIGHT, 0, 0));
++        h.on_mouse(&mouse(MOUSE_TYPE_UP, MOUSE_BUTTON_RIGHT, 0, 0));
++        h.on_key(&ck(ControlKey::Shift, true), false);
++        h.on_key(&ck(ControlKey::Shift, false), false);
++        assert!(h.is_empty());
++        let (m, k) = h.take_releases();
++        assert!(m.is_empty() && k.is_empty());
++    }
++
++    #[test]
++    fn held_keys_are_released_as_up_events_without_modifiers() {
++        let mut h = HeldInput::default();
++        h.on_key(&ck(ControlKey::Control, true), false);
++        h.on_key(&chr(0x26, true), false);
++        // A click holds nothing.
++        h.on_key(&ck(ControlKey::Return, true), true);
++        let (_, k) = h.take_releases();
++        assert_eq!(k.len(), 2);
++        assert!(k.iter().all(|e| !e.down && !e.press && e.modifiers.is_empty()));
++        assert!(k.iter().all(|e| e.mode.enum_value() == Ok(KeyboardMode::Map)));
++        assert!(h.take_releases().1.is_empty());
++    }
++
++    #[test]
++    fn a_key_held_twice_is_released_once() {
++        let mut h = HeldInput::default();
++        h.on_key(&ck(ControlKey::Alt, true), false);
++        h.on_key(&ck(ControlKey::Alt, true), false);
++        assert_eq!(h.take_releases().1.len(), 1);
++    }
++
++    #[test]
++    fn unicode_and_sequences_hold_nothing() {
++        let mut h = HeldInput::default();
++        let mut e = KeyEvent::new();
++        e.set_seq("abc".into());
++        e.down = true;
++        h.on_key(&e, false);
++        let mut u = KeyEvent::new();
++        u.set_unicode(0x41);
++        u.down = true;
++        h.on_key(&u, false);
++        assert!(h.is_empty());
++    }
++}
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index 5df97bb143e6..f399832aff24 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -3,3 +3,4 @@
+ pub mod identity;
+ pub mod reconnect;
+ pub mod lan_first;
++pub mod held_input;
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index 7f318326e25c..92617b564a9f 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -1247,10 +1247,21 @@ impl Connection {
+         }
+         #[cfg(target_os = "macos")]
+         reset_input_ondisconn();
++        // RemoteSmith (AC-41): what this connection holds down, released when it ends.
++        let mut held = crate::remotesmith_trust::held_input::HeldInput::default();
++        let mut last_mouse_conn: Option<(i32, String, u32)> = None;
+         loop {
+             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+                 Ok(v) => match v {
+                     MessageInput::Mouse(mouse_input) => {
++                        if mouse_input.simulate {
++                            held.on_mouse(&mouse_input.msg);
++                            last_mouse_conn = Some((
++                                mouse_input.conn_id,
++                                mouse_input.username.clone(),
++                                mouse_input.argb,
++                            ));
++                        }
+                         handle_mouse(
+                             &mouse_input.msg,
+                             mouse_input.conn_id,
+@@ -1261,6 +1272,7 @@ impl Connection {
+                         );
+                     }
+                     MessageInput::Key((mut msg, press)) => {
++                        held.on_key(&msg, press);
+                         // Set the press state to false, use `down` only in `handle_key()`.
+                         msg.press = false;
+                         if press {
+@@ -1310,6 +1322,24 @@ impl Connection {
+                 }
+             }
+         }
++        // RemoteSmith (AC-41): the connection is gone; let go of everything it still holds,
++        // through the same injection path the downs took.
++        if !held.is_empty() {
++            let (mouse_ups, key_ups) = held.take_releases();
++            log::info!(
++                "connection ended holding {} button(s) and {} key(s); releasing",
++                mouse_ups.len(),
++                key_ups.len()
++            );
++            if let Some((conn_id, username, argb)) = last_mouse_conn {
++                for m in mouse_ups.iter() {
++                    handle_mouse(m, conn_id, username.clone(), argb, true, false);
++                }
++            }
++            for k in key_ups.iter() {
++                handle_key(k);
++            }
++        }
+         #[cfg(target_os = "linux")]
+         clear_remapped_keycode();
+         log::debug!("Input thread exited");

@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:38:08 -0400
+Subject: remotesmith(0305): host follows only its own relay
+
+AC-61, mitigating the AC-5 server limitation. OSS hbbs 1.1.16 forwards a
+controller's RequestRelay to the host without a key check, and the stock
+host connects to whatever relay it names, so a keyless client that knows
+the host's ID could steer the session to a relay it controls.
+
+The host's relay is pinned: the configured relay-server option, else
+the relay port on its own rendezvous server (what RemoteSmith's hbbs
+advertises, --relay-servers <same host>:21117). A RequestRelay naming
+another relay is refused and logged. Where the host picks the relay
+itself (punch hole, intranet fallback) it uses the pinned one, never a
+different one from hbbs; upstream preferred hbbs's. Direct and LAN
+routes involve no relay.
+
+Deployments whose hbbs advertises a relay on another host must set
+relay-server on the host.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/remotesmith_trust/mod.rs       |  1 +
+ src/remotesmith_trust/relay_pin.rs | 78 ++++++++++++++++++++++++++++++
+ src/rendezvous_mediator.rs         | 40 ++++++++++++---
+ 3 files changed, 112 insertions(+), 7 deletions(-)
+ create mode 100644 src/remotesmith_trust/relay_pin.rs
+
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index f399832aff24..e1cbbb493704 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -4,3 +4,4 @@ pub mod identity;
+ pub mod reconnect;
+ pub mod lan_first;
+ pub mod held_input;
++pub mod relay_pin;
+diff --git a/src/remotesmith_trust/relay_pin.rs b/src/remotesmith_trust/relay_pin.rs
+new file mode 100644
+index 000000000000..218eb312dabb
+--- /dev/null
++++ b/src/remotesmith_trust/relay_pin.rs
+@@ -0,0 +1,78 @@
++//! Relay pinning on the host (RemoteSmith AC-61, mitigating the AC-5 server limitation).
++//!
++//! OSS hbbs 1.1.16 forwards a controller's `RequestRelay` to the host without any key check,
++//! and a stock host connects to whatever relay the request names. So a keyless client that
++//! knows the host's ID could steer the host's session to a relay it controls. The host now
++//! uses only its own relay:
++//! - the configured `relay-server` option when set, otherwise
++//! - the relay port (21117) on its own rendezvous server, which is what RemoteSmith's hbbs
++//!   advertises (`--relay-servers <same host>:21117`).
++//!
++//! A `RequestRelay` naming any other relay is refused and logged. Where the host itself picks
++//! the relay (punch hole, intranet fallback) it picks the pinned one, ignoring a different one
++//! from hbbs. Direct and LAN paths do not involve a relay and are unaffected.
++
++use hbb_common::config::RELAY_PORT;
++
++/// `host:port` lowercased, with the relay port added when missing.
++pub fn normalize(relay: &str) -> String {
++    hbb_common::socket_client::check_port(relay.trim().to_lowercase(), RELAY_PORT)
++}
++
++/// The only relay this host uses. `rendezvous_host` is the `host:port` of its rendezvous server.
++pub fn pinned_relay(configured_relay: &str, rendezvous_host: &str) -> String {
++    if !configured_relay.trim().is_empty() {
++        normalize(configured_relay)
++    } else {
++        normalize(&hbb_common::socket_client::increase_port(
++            rendezvous_host.trim(),
++            1,
++        ))
++    }
++}
++
++/// Whether a relay named by someone else (hbbs, or a controller through hbbs) is ours.
++pub fn is_allowed(requested: &str, pinned: &str) -> bool {
++    !requested.trim().is_empty() && normalize(requested) == normalize(pinned)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_configured_relay_wins() {
++        assert_eq!(
++            pinned_relay("Relay.Example.org", "rs.example.org:21116"),
++            "relay.example.org:21117"
++        );
++        assert_eq!(
++            pinned_relay("relay.example.org:9000", "rs.example.org:21116"),
++            "relay.example.org:9000"
++        );
++    }
++
++    #[test]
++    fn without_one_it_is_the_rendezvous_hosts_relay_port() {
++        assert_eq!(pinned_relay("", "rs.example.org:21116"), "rs.example.org:21117");
++        assert_eq!(pinned_relay("  ", "10.0.0.2:21116"), "10.0.0.2:21117");
++    }
++
++    #[test]
++    fn our_relay_is_allowed_in_any_spelling() {
++        let pinned = pinned_relay("", "rs.example.org:21116");
++        assert!(is_allowed("rs.example.org:21117", &pinned));
++        assert!(is_allowed("RS.EXAMPLE.ORG", &pinned));
++        assert!(is_allowed(" rs.example.org ", &pinned));
++    }
++
++    #[test]
++    fn any_other_relay_is_refused() {
++        let pinned = pinned_relay("", "rs.example.org:21116");
++        assert!(!is_allowed("evil.example.net:21117", &pinned));
++        assert!(!is_allowed("rs.example.org:21118", &pinned));
++        assert!(!is_allowed("rs.example.org.evil.net", &pinned));
++        assert!(!is_allowed("203.0.113.9:21117", &pinned));
++        assert!(!is_allowed("", &pinned));
++    }
++}
+diff --git a/src/rendezvous_mediator.rs b/src/rendezvous_mediator.rs
+index e1b6d39929d5..ecac01867bbe 100644
+--- a/src/rendezvous_mediator.rs
++++ b/src/rendezvous_mediator.rs
+@@ -671,6 +671,21 @@ impl RendezvousMediator {
+ 
+     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
+         let addr = AddrMangle::decode(&rr.socket_addr);
++        // RemoteSmith (AC-61): hbbs forwards relay requests without a key check, so a keyless
++        // client could name its own relay. Only ours is followed.
++        let pinned = crate::remotesmith_trust::relay_pin::pinned_relay(
++            &Config::get_option("relay-server"),
++            &self.host,
++        );
++        if !crate::remotesmith_trust::relay_pin::is_allowed(&rr.relay_server, &pinned) {
++            log::warn!(
++                "refused a relay request from {} naming relay {:?}; this host only uses {}",
++                addr,
++                rr.relay_server,
++                pinned
++            );
++            return Ok(());
++        }
+         let last = *LAST_RELAY_MSG.lock().await;
+         *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
+         // skip duplicate relay request messages
+@@ -1330,14 +1345,25 @@ impl RendezvousMediator {
+     }
+ 
+     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
+-        let mut relay_server = Config::get_option("relay-server");
+-        if relay_server.is_empty() {
+-            relay_server = provided_by_rendezvous_server;
+-        }
+-        if relay_server.is_empty() {
+-            relay_server = crate::increase_port(&self.host, 1);
++        // RemoteSmith (AC-61): always our pinned relay (the configured one, else our rendezvous
++        // server's relay port), never one named by the rendezvous server.
++        let pinned = crate::remotesmith_trust::relay_pin::pinned_relay(
++            &Config::get_option("relay-server"),
++            &self.host,
++        );
++        if !provided_by_rendezvous_server.is_empty()
++            && !crate::remotesmith_trust::relay_pin::is_allowed(
++                &provided_by_rendezvous_server,
++                &pinned,
++            )
++        {
++            log::warn!(
++                "rendezvous server named relay {:?}; using this host's relay {}",
++                provided_by_rendezvous_server,
++                pinned
++            );
+         }
+-        relay_server
++        pinned
+     }
+ }
+ 

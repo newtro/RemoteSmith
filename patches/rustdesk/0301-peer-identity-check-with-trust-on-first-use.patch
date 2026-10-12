@@ -1,0 +1,990 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:27:58 -0400
+Subject: remotesmith(0301): peer identity check with trust on first use
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A peer is its RustDesk ID plus the fingerprint of its Ed25519 signing key
+(DEF-3, PLAN §7). Before the host's Hash is read, and so before any
+password-derived data leaves, the controller compares the identity the
+stream proved with the pin saved in the peer's config:
+
+- first use: show ID and fingerprint and pin only after the user
+  confirms (AC-43); the credential is saved later by the normal login
+  path, so it too exists only after confirmation;
+- key or ID mismatch: stop without logging in, with a Forget peer path
+  (AC-37, AC-43);
+- no identity proved (stock host, keyless server, plaintext fallback):
+  stop.
+
+ID routes keep upstream's hbbs-signed key. Direct routes (IP connect)
+had no identity and no encryption at all: the host's direct listener
+now runs the identity handshake, and SignedId carries the host's
+signing key (new field remotesmith_identity_pk = 1001) so the controller
+can verify the signature and pin the key. The host's own fingerprint is
+upstream's (Settings > About, ipc get_config("fingerprint")).
+
+Consequence: a stock RustDesk client can no longer connect by IP to a
+RemoteSmith host (it never answers the handshake); both ends run
+RemoteSmith.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../widgets/remotesmith_trust_dialogs.dart    | 130 +++++
+ flutter/lib/models/model.dart                 |   6 +-
+ libs/base/protos/message.proto                |   7 +-
+ src/client.rs                                 |  45 +-
+ src/client/io_loop.rs                         |  17 +
+ src/flutter_ffi.rs                            |   5 +
+ src/lang/en.rs                                |   9 +
+ src/lib.rs                                    |   2 +
+ src/port_forward.rs                           |  28 +-
+ src/remotesmith_trust/identity.rs             | 512 ++++++++++++++++++
+ src/remotesmith_trust/mod.rs                  |   3 +
+ src/rendezvous_mediator.rs                    |   4 +-
+ src/server.rs                                 |   2 +
+ 13 files changed, 742 insertions(+), 28 deletions(-)
+ create mode 100644 flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
+ create mode 100644 src/remotesmith_trust/identity.rs
+ create mode 100644 src/remotesmith_trust/mod.rs
+
+diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
+new file mode 100644
+index 000000000000..91c95d7dc07d
+--- /dev/null
++++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
+@@ -0,0 +1,130 @@
++// RemoteSmith unit B3: peer identity (trust on first use) dialogs.
++// Rust side: src/remotesmith_trust/{identity,reconnect}.rs. Kept in its own file so
++// upstream's common.dart carries only the hook in msgBox().
++import 'dart:async';
++import 'dart:convert';
++
++import 'package:flutter/material.dart';
++import 'package:flutter_hbb/common.dart';
++import 'package:flutter_hbb/models/platform_model.dart';
++
++/// Whether [type] is one of the msgbox types rendered here.
++bool isRemoteSmithTrustMsgbox(String type) =>
++    type.startsWith('remotesmith-identity');
++
++void showRemoteSmithTrustMsgbox(SessionID sessionId, String type, String title,
++    String text, OverlayDialogManager dialogManager) {
++  dialogManager.dismissAll();
++  _identityDialog(sessionId, type, title, text, dialogManager);
++}
++
++Widget _row(String label, String value) {
++  return Padding(
++    padding: const EdgeInsets.symmetric(vertical: 3),
++    child: Row(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        SizedBox(
++          width: 130,
++          child: Text('${translate(label)}:',
++              style: const TextStyle(fontWeight: FontWeight.bold)),
++        ),
++        Expanded(
++          child: SelectableText(value.isEmpty ? 'N/A' : value,
++              style: const TextStyle(fontFamily: 'monospace')),
++        ),
++      ],
++    ),
++  );
++}
++
++void _identityDialog(SessionID sessionId, String type, String title,
++    String text, OverlayDialogManager dialogManager) {
++  Map<String, dynamic> info = {};
++  try {
++    info = jsonDecode(text) as Map<String, dynamic>;
++  } catch (_) {}
++  String field(String k) => (info[k] ?? '').toString();
++  final peer = field('peer');
++  final id = field('id');
++  final fingerprint = field('fingerprint');
++  final pinnedId = field('pinned_id');
++  final pinnedFingerprint = field('pinned_fingerprint');
++  final isConfirm = type.startsWith('remotesmith-identity-confirm');
++
++  void answer(bool yes) {
++    unawaited(bind.sessionSetCommon(
++        sessionId: sessionId,
++        key: 'remotesmith-identity',
++        value: yes ? 'Y' : 'N'));
++    dialogManager.dismissAll();
++    if (!yes) {
++      closeConnection();
++    }
++  }
++
++  Future<void> forgetPeer() async {
++    // Deletes the peer's saved config: the pinned fingerprint and the saved
++    // password go with it (AC-39, AC-43). The next connection enrolls afresh.
++    if (peer.isNotEmpty) {
++      await bind.mainRemovePeer(id: peer);
++    }
++    dialogManager.dismissAll();
++    closeConnection();
++    showToast(translate('remotesmith-peer-forgotten'));
++  }
++
++  void close() {
++    dialogManager.dismissAll();
++    closeConnection();
++  }
++
++  final String tip;
++  if (isConfirm) {
++    tip = 'remotesmith-identity-confirm-tip';
++  } else if (fingerprint.isEmpty) {
++    tip = 'remotesmith-identity-unavailable-tip';
++  } else {
++    tip = 'remotesmith-identity-mismatch-tip';
++  }
++
++  dialogManager.show(
++    (setState, dismiss, context) => CustomAlertDialog(
++      title: Text(translate(title)),
++      content: SelectionArea(
++        child: Column(
++          mainAxisSize: MainAxisSize.min,
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Text(translate(tip)),
++            const SizedBox(height: 12),
++            if (!isConfirm && pinnedFingerprint.isNotEmpty) ...[
++              _row('remotesmith-saved-id', pinnedId),
++              _row('remotesmith-saved-fingerprint', pinnedFingerprint),
++              const SizedBox(height: 8),
++            ],
++            if (id.isNotEmpty) _row('ID', id),
++            if (fingerprint.isNotEmpty) _row('Fingerprint', fingerprint),
++          ],
++        ),
++      ),
++      actions: isConfirm
++          ? [
++              dialogButton('Cancel',
++                  onPressed: () => answer(false), isOutline: true),
++              dialogButton('remotesmith-trust-and-connect',
++                  onPressed: () => answer(true)),
++            ]
++          : [
++              if (pinnedFingerprint.isNotEmpty)
++                dialogButton('remotesmith-forget-peer',
++                    onPressed: forgetPeer, isOutline: true),
++              dialogButton('Close', onPressed: close),
++            ],
++      // Enter must never trust a key by accident; Esc declines.
++      onSubmit: isConfirm ? null : close,
++      onCancel: isConfirm ? () => answer(false) : close,
++    ),
++    tag: '$sessionId-$type',
++  );
++}
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index f1abb8e36623..fe9aa2a82fd3 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -40,6 +40,7 @@ import 'package:vector_math/vector_math.dart' show Vector2;
+ import '../common.dart';
+ import '../utils/image.dart' as img;
+ import '../common/widgets/dialog.dart';
++import '../common/widgets/remotesmith_trust_dialogs.dart';
+ import 'input_model.dart';
+ import 'platform_model.dart';
+ import 'package:flutter_hbb/utils/scale.dart';
+@@ -908,7 +909,10 @@ class FfiModel with ChangeNotifier {
+       parent.target?.inputModel.setRelativeMouseMode(false);
+     }
+ 
+-    if (type == 're-input-password') {
++    if (isRemoteSmithTrustMsgbox(type)) {
++      // RemoteSmith: identity confirm and mismatch dialogs.
++      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager);
++    } else if (type == 're-input-password') {
+       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+     } else if (type == 'input-2fa') {
+       enter2FaDialog(sessionId, dialogManager);
+diff --git a/libs/base/protos/message.proto b/libs/base/protos/message.proto
+index 991e8a31eb06..f35f6ecdcb6d 100644
+--- a/libs/base/protos/message.proto
++++ b/libs/base/protos/message.proto
+@@ -712,7 +712,12 @@ message PublicKey {
+   uint32 kx_version = 3;
+ }
+ 
+-message SignedId { bytes id = 1; }
++message SignedId {
++  bytes id = 1;
++  // RemoteSmith: the signer's Ed25519 signing public key, which also signs `id`. Lets a
++  // controller on a direct route (no rendezvous signature) pin the host key on first use.
++  bytes remotesmith_identity_pk = 1001;
++}
+ 
+ message AudioFormat {
+   uint32 sample_rate = 1;
+diff --git a/src/client.rs b/src/client.rs
+index d3e66e73c6c6..5fbe40e2f67c 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -424,31 +424,24 @@ impl Client {
+         if config::is_incoming_only() && !is_switch_sides_back(conn_type, &interface).await {
+             bail!("Incoming only mode");
+         }
++        interface.get_lch().write().unwrap().remotesmith_signed_id.clear();
+         // to-do: remember the port for each peer, so that we can retry easier
+-        if hbb_common::is_ip_str(peer) {
+-            return Ok((
+-                (
+-                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
+-                        .await?,
+-                    true,
+-                    None,
+-                    None,
+-                    "TCP",
+-                ),
+-                (0, "".to_owned()),
+-                false,
+-            ));
+-        }
+-        // Allow connect to {domain}:{port}
+-        if hbb_common::is_domain_port_str(peer) {
++        if hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer) {
++            let addr = if hbb_common::is_ip_str(peer) {
++                check_port(peer, RELAY_PORT + 1)
++            } else {
++                // Allow connect to {domain}:{port}
++                peer.to_owned()
++            };
++            let mut conn = connect_tcp_local(addr, None, CONNECT_TIMEOUT).await?;
++            // RemoteSmith (DEF-3): a direct route has no rendezvous signature, so the host
++            // proves its identity key itself; the pin is checked before login (io_loop).
++            let (signed_id, pk) =
++                crate::remotesmith_trust::identity::direct_handshake(&mut conn, None, READ_TIMEOUT)
++                    .await?;
++            interface.get_lch().write().unwrap().remotesmith_signed_id = signed_id;
+             return Ok((
+-                (
+-                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,
+-                    true,
+-                    None,
+-                    None,
+-                    "TCP",
+-                ),
++                (conn, true, Some(pk), None, "TCP"),
+                 (0, "".to_owned()),
+                 false,
+             ));
+@@ -460,6 +453,8 @@ impl Client {
+         } else {
+             (peer, "", key, token)
+         };
++        // RemoteSmith: on ID routes the identity hbbs vouches for is the real peer ID.
++        interface.get_lch().write().unwrap().remotesmith_signed_id = peer.to_owned();
+         let (rendezvous_server, servers, contained) = if other_server.is_empty() {
+             crate::get_rendezvous_server(1_000).await
+         } else {
+@@ -2851,6 +2846,8 @@ struct ConnToken {
+ #[derive(Default)]
+ pub struct LoginConfigHandler {
+     id: String,
++    /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
++    pub remotesmith_signed_id: String,
+     pub conn_type: ConnType,
+     pub is_terminal_admin: bool,
+     hash: Hash,
+@@ -5000,6 +4997,8 @@ pub enum Data {
+     NewVoiceCall,
+     CloseVoiceCall,
+     ContinueInsecureConnection,
++    /// RemoteSmith: the user's answer to the first-use identity prompt (AC-43).
++    RemoteSmithIdentity(bool),
+     ResetDecoder(Option<usize>),
+     RenameFile((i32, String, String, bool)),
+     TakeScreenshot((i32, String)),
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index fcbc0901ee6f..a8f3a104b86c 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -217,6 +217,23 @@ impl<T: InvokeUiSession> Remote<T> {
+                 };
+                 self.handler
+                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
++                // RemoteSmith (DEF-3, AC-37, AC-43): check the host's identity against the pin
++                // before the host's Hash is read, so no password-derived data leaves first.
++                if !crate::remotesmith_trust::identity::gate(
++                    &self.handler,
++                    &mut self.receiver,
++                    is_secured,
++                    pk.as_deref(),
++                )
++                .await
++                {
++                    self.send_close_reason(&mut peer, "").await;
++                    if kcp.is_some() {
++                        tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
++                    }
++                    self.handle_disconnected(round);
++                    return;
++                }
+                 if !is_secured
+                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
+                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index f9cc2d66c251..da55c0d4b1cb 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+             s.continue_insecure_connection(value == "Y");
+             return;
+         }
++        // RemoteSmith: the answer to the first-use identity prompt (AC-43).
++        if key == "remotesmith-identity" {
++            crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value == "Y"));
++            return;
++        }
+     }
+ }
+ 
+diff --git a/src/lang/en.rs b/src/lang/en.rs
+index ca61f35a15a0..f6fb59c0206f 100644
+--- a/src/lang/en.rs
++++ b/src/lang/en.rs
+@@ -279,5 +279,14 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("terminal-clipboard-write-tip", "An app in the terminal wants to copy text to this device's clipboard. If granted, this permission applies to terminal apps in all connections until you turn it off in Settings. Manual copy and paste are unaffected."),
+         ("port-forward-mux-tip", "Carry every connection of a port-forward mapping over a single connection to the peer, instead of connecting and logging in again for each one."),
+         ("relay-fallback-delay-tip", "How long a relay connection that is already up waits for the direct WebRTC connection before it is used instead. Raise it to give a slow direct connection more time to win; lower it to settle on the relay sooner on networks where a direct connection cannot be made. Leave empty for the default of 2.5 seconds."),
++        // RemoteSmith unit B3: peer identity (DEF-3, AC-37, AC-43).
++        ("remotesmith-identity-confirm-tip", "This is the first connection to this peer. Check that the ID and fingerprint below match the ones the host shows (on the host: Settings > About, or its tray). Trust it only if they match: the fingerprint is then saved and checked on every later connection."),
++        ("remotesmith-identity-mismatch-tip", "The machine that answered is not the one saved for this peer: its ID or key fingerprint changed. The saved password was not sent. If the host was reinstalled or replaced, choose Forget peer and connect again to enroll it."),
++        ("remotesmith-identity-unavailable-tip", "The host did not prove its identity (it may not be running RemoteSmith, or the server key is missing). The saved password was not sent."),
++        ("remotesmith-saved-id", "Saved ID"),
++        ("remotesmith-saved-fingerprint", "Saved fingerprint"),
++        ("remotesmith-trust-and-connect", "Trust and connect"),
++        ("remotesmith-forget-peer", "Forget peer"),
++        ("remotesmith-peer-forgotten", "Peer forgotten. Connect again to enroll it."),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 649f3ef955b0..899f5761788f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,6 +15,8 @@ mod server;
+ pub use self::server::*;
+ mod client;
+ mod lan;
++/// RemoteSmith: peer identity, LAN-first, reconnect and relay rules.
++pub mod remotesmith_trust;
+ #[cfg(not(any(target_os = "ios")))]
+ mod rendezvous_mediator;
+ #[cfg(not(any(target_os = "ios")))]
+diff --git a/src/port_forward.rs b/src/port_forward.rs
+index d1f4df434661..480b3d683ef3 100644
+--- a/src/port_forward.rs
++++ b/src/port_forward.rs
+@@ -174,9 +174,21 @@ async fn connect_and_login(
+     } else {
+         ConnType::PORT_FORWARD
+     };
+-    let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
++    let ((mut stream, direct, pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
+         Client::start(id, key, token, conn_type, interface.clone()).await?;
+     interface.update_direct(Some(direct));
++    // RemoteSmith (DEF-3): the same pre-login identity gate as desktop sessions.
++    if !crate::remotesmith_trust::identity::gate(
++        &interface,
++        ui_receiver,
++        stream.is_secured(),
++        pk.as_deref(),
++    )
++    .await
++    {
++        *close_port_forward = true;
++        return Ok(None);
++    }
+     if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
+         if !confirm_insecure_connection(&interface, ui_receiver).await {
+             *close_port_forward = true;
+@@ -415,9 +427,21 @@ async fn connect_and_login_mux(
+     } else {
+         ConnType::PORT_FORWARD
+     };
+-    let ((mut stream, direct, _pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
++    let ((mut stream, direct, pk, _kcp, _stream_type), (feedback, rendezvous_server)) =
+         Client::start(id, key, token, conn_type, interface.clone()).await?;
+     interface.update_direct(Some(direct));
++    // RemoteSmith (DEF-3): the same pre-login identity gate as desktop sessions.
++    if !crate::remotesmith_trust::identity::gate(
++        &interface,
++        ui_receiver,
++        stream.is_secured(),
++        pk.as_deref(),
++    )
++    .await
++    {
++        *close_port_forward = true;
++        return Ok(None);
++    }
+     if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
+         if !confirm_insecure_connection(&interface, ui_receiver).await {
+             *close_port_forward = true;
+diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
+new file mode 100644
+index 000000000000..21733e291080
+--- /dev/null
++++ b/src/remotesmith_trust/identity.rs
+@@ -0,0 +1,512 @@
++//! Peer identity, trust on first use (RemoteSmith DEF-3, §7, AC-37, AC-43).
++//!
++//! A peer is its stable RustDesk ID plus the fingerprint of its Ed25519 signing key (the key
++//! the host registers with hbbs and signs its handshake with). The fingerprint uses upstream's
++//! format ([`crate::common::pk_to_fingerprint`]), so it is the value the host shows in its own
++//! settings ("Fingerprint" under About) and over `ipc::get_fingerprint()`.
++//!
++//! Where the key comes from:
++//! - ID routes (hole punch, relay): hbbs signs the host's registered key, and
++//!   `Client::secure_connection` verifies the host's handshake with it.
++//! - Direct routes (an IP, or the LAN-first attempt): there is no server signature, so the
++//!   host sends its signing key in `SignedId.remotesmith_identity_pk` and signs the handshake
++//!   with it ([`direct_handshake`]). The key is only as good as the pin it is compared with,
++//!   which is exactly trust on first use.
++//!
++//! Either way the identity counts only when the stream ended up keyed by that handshake
++//! (`Stream::is_secured`): a handshake that fell back to plaintext proves nothing.
++//!
++//! The pin lives in the peer's own config (`PeerConfig.options`), so "Forget peer" (removing the
++//! peer) deletes it together with the saved password.
++
++use hbb_common::{
++    anyhow::anyhow,
++    bail, log,
++    protobuf::Message as _,
++    sodiumoxide::crypto::sign,
++    tcp::{kx_version_for, KxTranscript},
++    timeout, ResultType, Stream,
++};
++use base::message_proto::*;
++
++/// Peer option holding the pinned host key fingerprint.
++pub const OPTION_FINGERPRINT: &str = "remotesmith-host-fingerprint";
++/// Peer option holding the RustDesk ID the pinned host signed. For a peer saved by ID it equals
++/// the peer ID; for a peer saved by IP it is what makes "this IP now belongs to another machine"
++/// detectable (AC-37).
++pub const OPTION_HOST_ID: &str = "remotesmith-host-id";
++
++/// The identity a host proved during the handshake.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct HostIdentity {
++    pub id: String,
++    pub fingerprint: String,
++}
++
++impl HostIdentity {
++    pub fn new(id: &str, sign_pk: &[u8]) -> Self {
++        Self {
++            id: id.to_owned(),
++            fingerprint: fingerprint(sign_pk),
++        }
++    }
++}
++
++/// Upstream's display format: lowercase hex in groups of four.
++pub fn fingerprint(sign_pk: &[u8]) -> String {
++    crate::common::pk_to_fingerprint(sign_pk.to_vec())
++}
++
++fn normalize(fp: &str) -> String {
++    fp.chars()
++        .filter(|c| !c.is_whitespace() && *c != ':')
++        .map(|c| c.to_ascii_lowercase())
++        .collect()
++}
++
++/// The decision for one connection, made before any password-derived data is sent.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Verdict {
++    /// Pinned and matching: log in.
++    Trusted,
++    /// No pin yet: show ID and fingerprint and wait for the user to confirm (AC-43).
++    FirstUse(HostIdentity),
++    /// Same peer, different key: a reinstalled host or an impostor. Stop (AC-37).
++    KeyMismatch {
++        pinned: String,
++        offered: HostIdentity,
++    },
++    /// The pinned host's ID differs from the one that answered: the saved address now belongs to
++    /// another machine. Stop (AC-37).
++    IdMismatch {
++        pinned: String,
++        offered: HostIdentity,
++    },
++    /// The host proved no identity (a stock host, a key-less server, or a handshake that fell
++    /// back to plaintext). Stop: there is nothing to pin or to compare with.
++    Unavailable { enrolled: bool },
++}
++
++/// Compare what the host proved with the pin. `pinned_id` may be empty for pins written before
++/// the ID was stored; the fingerprint is what binds.
++pub fn evaluate(pinned_fp: &str, pinned_id: &str, offered: Option<&HostIdentity>) -> Verdict {
++    let enrolled = !normalize(pinned_fp).is_empty();
++    let Some(offered) = offered else {
++        return Verdict::Unavailable { enrolled };
++    };
++    if normalize(&offered.fingerprint).is_empty() {
++        return Verdict::Unavailable { enrolled };
++    }
++    if !enrolled {
++        return Verdict::FirstUse(offered.clone());
++    }
++    if normalize(pinned_fp) != normalize(&offered.fingerprint) {
++        return Verdict::KeyMismatch {
++            pinned: pinned_fp.to_owned(),
++            offered: offered.clone(),
++        };
++    }
++    if !pinned_id.is_empty() && pinned_id != offered.id {
++        return Verdict::IdMismatch {
++            pinned: pinned_id.to_owned(),
++            offered: offered.clone(),
++        };
++    }
++    Verdict::Trusted
++}
++
++/// The identity a secured stream proved: `sign_pk` is the host's signing key (verified by hbbs
++/// on ID routes, pinned by us on direct ones) and `signed_id` the ID it signed.
++pub fn proven_identity(
++    is_secured: bool,
++    signed_id: &str,
++    sign_pk: Option<&[u8]>,
++) -> Option<HostIdentity> {
++    match sign_pk {
++        Some(pk) if is_secured && pk.len() == sign::PUBLICKEYBYTES && !signed_id.is_empty() => {
++            Some(HostIdentity::new(signed_id, pk))
++        }
++        _ => None,
++    }
++}
++
++/// Msgbox types the Flutter UI renders with RemoteSmith's identity dialogs.
++pub const MSGBOX_CONFIRM: &str = "remotesmith-identity-confirm-nocancel";
++pub const MSGBOX_MISMATCH: &str = "remotesmith-identity-mismatch-nocancel";
++
++fn dialog_text(peer: &str, offered: Option<&HostIdentity>, pinned: Option<(&str, &str)>) -> String {
++    let mut v = hbb_common::serde_json::json!({ "peer": peer });
++    if let Some(o) = offered {
++        v["id"] = o.id.clone().into();
++        v["fingerprint"] = o.fingerprint.clone().into();
++    }
++    if let Some((id, fp)) = pinned {
++        v["pinned_id"] = id.into();
++        v["pinned_fingerprint"] = fp.into();
++    }
++    v.to_string()
++}
++
++/// The pre-login identity gate, run on every new stream before the host's `Hash` is read, so
++/// no password-derived data can leave before it passes. Returns whether to log in.
++///
++/// `sign_pk` is the host signing key `Client::start` returned for this stream. On first use it
++/// asks the user (AC-43) and pins only after a yes; the credential is saved later by the normal
++/// login path, so it too exists only after confirmation.
++pub async fn gate(
++    interface: &impl crate::client::Interface,
++    receiver: &mut hbb_common::tokio::sync::mpsc::UnboundedReceiver<crate::client::Data>,
++    is_secured: bool,
++    sign_pk: Option<&[u8]>,
++) -> bool {
++    let (peer, signed_id, pinned_fp, pinned_id) = {
++        let lc = interface.get_lch();
++        let lc = lc.read().unwrap();
++        (
++            interface.get_id(),
++            lc.remotesmith_signed_id.clone(),
++            lc.get_option(OPTION_FINGERPRINT),
++            lc.get_option(OPTION_HOST_ID),
++        )
++    };
++    let offered = proven_identity(is_secured, &signed_id, sign_pk);
++    match evaluate(&pinned_fp, &pinned_id, offered.as_ref()) {
++        Verdict::Trusted => {
++            if pinned_id.is_empty() {
++                if let Some(o) = &offered {
++                    let lc = interface.get_lch();
++                    lc.write()
++                        .unwrap()
++                        .set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
++                }
++            }
++            true
++        }
++        Verdict::FirstUse(o) => {
++            log::info!(
++                "peer {}: first connection, host {} key {}; asking to confirm",
++                peer,
++                o.id,
++                o.fingerprint
++            );
++            interface.msgbox(
++                MSGBOX_CONFIRM,
++                "Confirm peer identity",
++                &dialog_text(&peer, Some(&o), None),
++                "",
++            );
++            loop {
++                match receiver.recv().await {
++                    Some(crate::client::Data::RemoteSmithIdentity(true)) => break,
++                    Some(crate::client::Data::RemoteSmithIdentity(false))
++                    | Some(crate::client::Data::Close)
++                    | None => {
++                        log::info!("peer {}: identity not confirmed, not logging in", peer);
++                        return false;
++                    }
++                    // Anything the UI queued meanwhile (input included) is dropped.
++                    Some(_) => {}
++                }
++            }
++            let lc = interface.get_lch();
++            let mut lc = lc.write().unwrap();
++            lc.set_option(OPTION_FINGERPRINT.to_owned(), o.fingerprint.clone());
++            lc.set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
++            log::info!("peer {}: identity confirmed and pinned", peer);
++            true
++        }
++        Verdict::KeyMismatch { offered: o, .. } | Verdict::IdMismatch { offered: o, .. } => {
++            log::warn!(
++                "peer {}: identity mismatch (pinned host {:?} key {:?}, answered host {} key {}); \
++                 not sending the saved password",
++                peer,
++                pinned_id,
++                pinned_fp,
++                o.id,
++                o.fingerprint
++            );
++            interface.msgbox(
++                MSGBOX_MISMATCH,
++                "Peer identity mismatch",
++                &dialog_text(&peer, Some(&o), Some((&pinned_id, &pinned_fp))),
++                "",
++            );
++            false
++        }
++        Verdict::Unavailable { enrolled } => {
++            log::warn!(
++                "peer {}: the host proved no identity (enrolled: {}); not logging in",
++                peer,
++                enrolled
++            );
++            interface.msgbox(
++                MSGBOX_MISMATCH,
++                "Peer identity unavailable",
++                &dialog_text(&peer, None, Some((&pinned_id, &pinned_fp))),
++                "",
++            );
++            false
++        }
++    }
++}
++
++/// Controller side of the handshake on a direct route (no hbbs signature available).
++///
++/// Reads the host's `SignedId`, takes the signing key the host sent with it, checks the
++/// signature and, when `expected_id` is given, the signed ID, then sends our half of the key
++/// exchange and keys `conn`. Returns `(signed_id, sign_pk)`. Every failure is an error: unlike
++/// upstream's ID-route fallback, a direct route never continues in plaintext.
++pub async fn direct_handshake(
++    conn: &mut Stream,
++    expected_id: Option<&str>,
++    read_timeout_ms: u64,
++) -> ResultType<(String, Vec<u8>)> {
++    let bytes = match timeout(read_timeout_ms, conn.next()).await {
++        Ok(Some(Ok(bytes))) => bytes,
++        Ok(Some(Err(err))) => bail!("identity handshake: {}", err),
++        Ok(None) => bail!("Reset by the peer"),
++        Err(_) => bail!("identity handshake: the peer sent no identity"),
++    };
++    let msg = Message::parse_from_bytes(&bytes)
++        .map_err(|_| anyhow!("identity handshake: malformed message"))?;
++    let Some(message::Union::SignedId(si)) = msg.union else {
++        bail!("identity handshake: the peer sent no identity");
++    };
++    let sign_pk: [u8; sign::PUBLICKEYBYTES] = si
++        .remotesmith_identity_pk
++        .as_ref()
++        .try_into()
++        .map_err(|_| anyhow!("identity handshake: the peer sent no identity key"))?;
++    let (id, their_pk_b, _dtls, kx_version) =
++        crate::common::decode_id_pk_dtls(&si.id, &sign::PublicKey(sign_pk))
++            .map_err(|_| anyhow!("identity handshake: signature mismatch"))?;
++    if let Some(expected) = expected_id {
++        if id != expected {
++            bail!(
++                "identity handshake: expected peer {} but {} answered",
++                expected,
++                id
++            );
++        }
++    }
++    let (asymmetric_value, symmetric_value, key) =
++        crate::common::create_symmetric_key_msg(their_pk_b);
++    let picked = kx_version_for(kx_version);
++    let mut msg_out = Message::new();
++    msg_out.set_public_key(PublicKey {
++        asymmetric_value: asymmetric_value.clone(),
++        symmetric_value,
++        kx_version: picked,
++        ..Default::default()
++    });
++    timeout(read_timeout_ms, conn.send(&msg_out)).await??;
++    conn.set_negotiated_key(
++        key,
++        true,
++        &KxTranscript {
++            initiator_pk: &asymmetric_value,
++            responder_pk: &their_pk_b,
++            advertised: kx_version,
++            picked,
++        },
++    )?;
++    log::info!("direct route: peer {} proved its identity key", id);
++    Ok((id, sign_pk.to_vec()))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use hbb_common::{
++        rendezvous_proto::IdPk,
++        socket_client::connect_tcp,
++        sodiumoxide::crypto::box_,
++        tcp::{Encrypt, FramedStream, KX_VERSION_LATEST},
++        tokio::{self, sync::oneshot},
++    };
++
++    fn ident(id: &str, fp: &str) -> HostIdentity {
++        HostIdentity {
++            id: id.to_owned(),
++            fingerprint: fp.to_owned(),
++        }
++    }
++
++    #[test]
++    fn first_use_when_nothing_is_pinned() {
++        let offered = ident("123", "abcd ef01");
++        assert_eq!(
++            evaluate("", "", Some(&offered)),
++            Verdict::FirstUse(offered.clone())
++        );
++    }
++
++    #[test]
++    fn matching_pin_is_trusted_regardless_of_spacing_and_case() {
++        let offered = ident("123", "abcd ef01");
++        assert_eq!(evaluate("ABCDEF01", "123", Some(&offered)), Verdict::Trusted);
++        assert_eq!(evaluate("ab:cd:ef:01", "", Some(&offered)), Verdict::Trusted);
++    }
++
++    #[test]
++    fn a_different_key_is_a_mismatch_even_with_the_same_id() {
++        let offered = ident("123", "ffff 0000");
++        assert!(matches!(
++            evaluate("abcd ef01", "123", Some(&offered)),
++            Verdict::KeyMismatch { .. }
++        ));
++    }
++
++    #[test]
++    fn the_same_key_answering_under_another_id_is_a_mismatch() {
++        let offered = ident("999", "abcd ef01");
++        assert!(matches!(
++            evaluate("abcd ef01", "123", Some(&offered)),
++            Verdict::IdMismatch { .. }
++        ));
++    }
++
++    #[test]
++    fn no_identity_is_never_trusted() {
++        assert_eq!(
++            evaluate("abcd", "123", None),
++            Verdict::Unavailable { enrolled: true }
++        );
++        assert_eq!(evaluate("", "", None), Verdict::Unavailable { enrolled: false });
++        assert_eq!(
++            evaluate("", "", Some(&ident("1", " "))),
++            Verdict::Unavailable { enrolled: false }
++        );
++    }
++
++    #[test]
++    fn identity_counts_only_on_a_secured_stream() {
++        let pk = [7u8; 32];
++        assert!(proven_identity(false, "1", Some(&pk)).is_none());
++        assert!(proven_identity(true, "1", Some(&pk[..31])).is_none());
++        assert!(proven_identity(true, "", Some(&pk)).is_none());
++        let id = proven_identity(true, "1", Some(&pk)).unwrap();
++        assert_eq!(id.fingerprint, fingerprint(&pk));
++        assert_eq!(id.id, "1");
++    }
++
++    /// What the stand-in host does with its identity in the handshake.
++    #[derive(Clone, Copy)]
++    enum Host {
++        /// As the patched host: sends its signing key and signs with it.
++        Honest,
++        /// Sends no identity at all, like an unpatched host's direct listener.
++        Silent,
++        /// Sends one key but signs with another.
++        WrongKey,
++    }
++
++    /// A stand-in host on loopback. Returns its address, its signing key and, once the
++    /// controller answered, whether the key exchange completed.
++    async fn host_stub(id: &'static str, mode: Host) -> (String, Vec<u8>, oneshot::Receiver<bool>) {
++        let (sign_pk, sign_sk) = sign::gen_keypair();
++        let (_, other_sk) = sign::gen_keypair();
++        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
++            .await
++            .unwrap();
++        let host = listener.local_addr().unwrap().to_string();
++        let (tx, rx) = oneshot::channel();
++        tokio::spawn(async move {
++            let (stream, addr) = listener.accept().await.unwrap();
++            let mut s = FramedStream::from(stream, addr);
++            if matches!(mode, Host::Silent) {
++                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
++                tx.send(false).ok();
++                return;
++            }
++            let (our_pk_b, our_sk_b) = box_::gen_keypair();
++            let signer = if matches!(mode, Host::WrongKey) {
++                &other_sk
++            } else {
++                &sign_sk
++            };
++            let id_pk = IdPk {
++                id: id.to_owned(),
++                pk: our_pk_b.0.to_vec().into(),
++                kx_version: KX_VERSION_LATEST,
++                ..Default::default()
++            }
++            .write_to_bytes()
++            .unwrap();
++            let mut msg = Message::new();
++            msg.set_signed_id(SignedId {
++                id: sign::sign(&id_pk, signer).into(),
++                remotesmith_identity_pk: sign_pk.0.to_vec().into(),
++                ..Default::default()
++            });
++            s.send(&msg).await.unwrap();
++            let ok = match s.next().await {
++                Some(Ok(bytes)) => match Message::parse_from_bytes(&bytes).ok().and_then(|m| m.union)
++                {
++                    Some(message::Union::PublicKey(pk)) => {
++                        Encrypt::decode(&pk.symmetric_value, &pk.asymmetric_value, &our_sk_b)
++                            .is_ok()
++                    }
++                    _ => false,
++                },
++                _ => false,
++            };
++            tx.send(ok).ok();
++        });
++        (host, sign_pk.0.to_vec(), rx)
++    }
++
++    #[tokio::test]
++    async fn direct_handshake_returns_the_key_the_host_signed_with() {
++        let (host, sign_pk, done) = host_stub("123456789", Host::Honest).await;
++        let mut conn = connect_tcp(host, 3000).await.unwrap();
++        let (id, pk) = direct_handshake(&mut conn, Some("123456789"), 3000)
++            .await
++            .unwrap();
++        assert_eq!(id, "123456789");
++        assert_eq!(pk, sign_pk);
++        assert!(conn.is_secured());
++        assert!(done.await.unwrap());
++    }
++
++    #[tokio::test]
++    async fn direct_handshake_without_expected_id_accepts_and_reports_the_signed_id() {
++        let (host, _, _done) = host_stub("555", Host::Honest).await;
++        let mut conn = connect_tcp(host, 3000).await.unwrap();
++        let (id, _) = direct_handshake(&mut conn, None, 3000).await.unwrap();
++        assert_eq!(id, "555");
++    }
++
++    #[tokio::test]
++    async fn direct_handshake_refuses_another_machine_at_the_address() {
++        let (host, _, done) = host_stub("999", Host::Honest).await;
++        let mut conn = connect_tcp(host, 3000).await.unwrap();
++        let err = direct_handshake(&mut conn, Some("123"), 3000)
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains("expected peer 123"), "{err}");
++        assert!(!conn.is_secured());
++        drop(conn);
++        assert!(!done.await.unwrap());
++    }
++
++    #[tokio::test]
++    async fn direct_handshake_refuses_a_signature_by_another_key() {
++        let (host, _, _done) = host_stub("123", Host::WrongKey).await;
++        let mut conn = connect_tcp(host, 3000).await.unwrap();
++        assert!(direct_handshake(&mut conn, Some("123"), 3000).await.is_err());
++        assert!(!conn.is_secured());
++    }
++
++    #[tokio::test]
++    async fn direct_handshake_times_out_on_a_host_without_identity() {
++        let (host, _, _done) = host_stub("123", Host::Silent).await;
++        let mut conn = connect_tcp(host, 3000).await.unwrap();
++        let start = std::time::Instant::now();
++        let err = direct_handshake(&mut conn, Some("123"), 300)
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains("no identity"), "{err}");
++        assert!(start.elapsed() < std::time::Duration::from_millis(1500));
++    }
++}
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+new file mode 100644
+index 000000000000..c88df312b182
+--- /dev/null
++++ b/src/remotesmith_trust/mod.rs
+@@ -0,0 +1,3 @@
++//! RemoteSmith unit B3: peer identity (trust on first use), LAN-first routing, reconnect policy
++//! and relay pinning. Kept in its own module so the upstream files carry only call sites.
++pub mod identity;
+diff --git a/src/rendezvous_mediator.rs b/src/rendezvous_mediator.rs
+index b039995a8971..e1b6d39929d5 100644
+--- a/src/rendezvous_mediator.rs
++++ b/src/rendezvous_mediator.rs
+@@ -1404,7 +1404,9 @@ async fn direct_server(server: ServerPtr) {
+                             server,
+                             hbb_common::Stream::from(stream, local_addr),
+                             addr,
+-                            false,
++                            // RemoteSmith: run the identity handshake on direct connections too,
++                            // so a controller can pin our key and the session is encrypted (DEF-3).
++                            true,
+                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
+                         )
+                         .await
+diff --git a/src/server.rs b/src/server.rs
+index 88341631b477..fa1c46f2f159 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -298,6 +298,8 @@ async fn identity_handshake(stream: &mut Stream, secure: bool) -> ResultType<()>
+                 &sk,
+             )
+             .into(),
++            // RemoteSmith: our identity key, for controllers on a direct route (DEF-3).
++            remotesmith_identity_pk: Bytes::from(pk.clone()),
+             ..Default::default()
+         });
+         timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;

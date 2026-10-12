@@ -1,0 +1,503 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:35:06 -0400
+Subject: remotesmith(0303): LAN-first route for saved peers, 3 s bound
+
+DEC-11, DEF-8, AC-7, AC-8, AC-38. Upstream reaches a peer by ID only
+through hbbs (its intranet path needs hbbs as well) and uses the direct
+port 21118 only when the user types an IP, so with the VM down an ID
+connect fails even on the home LAN.
+
+Client::_start now tries the peer's LAN address(es) first: the address
+that last worked (peer option remotesmith-lan-hint), LAN discovery's
+IPs for that ID, and the address hbbs reports when it marks the peer as
+local. All candidates race; the first that connects AND proves the saved
+peer's ID in the identity handshake wins and the rest are dropped, so at
+most one session results. Connect plus handshake share a 3 s budget,
+then the ID route runs as before. Another machine at a stale address
+fails the handshake (no password is ever sent) and the ID route takes
+over; the same ID with a different key wins the race and is stopped by
+the 0301 identity gate. Skipped under forced relay, a SOCKS proxy or the
+WebSocket transport. The route shows as "LAN".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/client.rs                      |  55 +++++++-
+ src/remotesmith_trust/identity.rs  | 143 +++++++++++----------
+ src/remotesmith_trust/lan_first.rs | 193 +++++++++++++++++++++++++++++
+ src/remotesmith_trust/mod.rs       |   1 +
+ 4 files changed, 323 insertions(+), 69 deletions(-)
+ create mode 100644 src/remotesmith_trust/lan_first.rs
+
+diff --git a/src/client.rs b/src/client.rs
+index 590c22bea427..5ed09f5935dd 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -424,7 +424,12 @@ impl Client {
+         if config::is_incoming_only() && !is_switch_sides_back(conn_type, &interface).await {
+             bail!("Incoming only mode");
+         }
+-        interface.get_lch().write().unwrap().remotesmith_signed_id.clear();
++        {
++            let lc = interface.get_lch();
++            let mut lc = lc.write().unwrap();
++            lc.remotesmith_signed_id.clear();
++            lc.remotesmith_lan_addr = None;
++        }
+         // to-do: remember the port for each peer, so that we can retry easier
+         if hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer) {
+             let addr = if hbb_common::is_ip_str(peer) {
+@@ -455,6 +460,37 @@ impl Client {
+         };
+         // RemoteSmith: on ID routes the identity hbbs vouches for is the real peer ID.
+         interface.get_lch().write().unwrap().remotesmith_signed_id = peer.to_owned();
++        // RemoteSmith (DEF-8, AC-38): a saved peer's LAN address first, 3 s for connect and
++        // identity handshake together, then the ID route. Works with hbbs down (AC-8).
++        {
++            use crate::remotesmith_trust::lan_first;
++            let (applies, saved_hint) = {
++                let lc = interface.get_lch();
++                let lc = lc.read().unwrap();
++                (
++                    other_server.is_empty() && lan_first::applies(lc.force_relay),
++                    lc.get_option(lan_first::OPTION_LAN_HINT),
++                )
++            };
++            let addrs = if applies {
++                lan_first::candidates(&saved_hint, &lan_first::discovered_ips(peer))
++            } else {
++                Vec::new()
++            };
++            if !addrs.is_empty() {
++                match lan_first::connect(peer, &addrs, lan_first::LAN_BUDGET_MS).await {
++                    Ok((conn, addr, pk)) => {
++                        interface.get_lch().write().unwrap().remotesmith_lan_addr = Some(addr);
++                        return Ok((
++                            (conn, true, Some(pk), None, lan_first::ROUTE_LABEL),
++                            (0, "".to_owned()),
++                            false,
++                        ));
++                    }
++                    Err(err) => log::info!("{}; trying the ID route", err),
++                }
++            }
++        }
+         let (rendezvous_server, servers, contained) = if other_server.is_empty() {
+             crate::get_rendezvous_server(1_000).await
+         } else {
+@@ -1010,6 +1046,14 @@ impl Client {
+                             signed_id_pk = ph.pk.into();
+                             relay_server = ph.relay_server;
+                             peer_addr = AddrMangle::decode(&ph.socket_addr);
++                            if is_local
++                                && crate::remotesmith_trust::lan_first::is_lan_ip(&peer_addr.ip())
++                            {
++                                // RemoteSmith: hbbs says the peer shares our LAN; keep its
++                                // address as a LAN-first hint (direct-server port).
++                                interface.get_lch().write().unwrap().remotesmith_lan_addr =
++                                    Some(peer_addr.ip().to_string());
++                            }
+                             feedback = ph.feedback;
+                             webrtc_sdp_answer = ph.webrtc_sdp_answer;
+                             let s = udp.0.take();
+@@ -2848,6 +2892,8 @@ pub struct LoginConfigHandler {
+     id: String,
+     /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
+     pub remotesmith_signed_id: String,
++    /// RemoteSmith: the LAN direct-server address this round used or hbbs reported (DEF-8).
++    pub remotesmith_lan_addr: Option<String>,
+     /// RemoteSmith: automatic reconnect policy, kept across rounds (DEF-7).
+     pub remotesmith_retry: crate::remotesmith_trust::reconnect::RetryPolicy,
+     pub conn_type: ConnType,
+@@ -3680,6 +3726,13 @@ impl LoginConfigHandler {
+     pub fn handle_peer_info(&mut self, pi: &PeerInfo) {
+         // RemoteSmith: logged in, so the session is up and any reconnect streak is over.
+         self.remotesmith_retry.on_connected();
++        // RemoteSmith: remember the LAN address that reached this peer, for LAN-first next time.
++        if let Some(addr) = self.remotesmith_lan_addr.take() {
++            self.set_option(
++                crate::remotesmith_trust::lan_first::OPTION_LAN_HINT.to_owned(),
++                addr,
++            );
++        }
+         if !pi.version.is_empty() {
+             self.version = hbb_common::get_version_number(&pi.version);
+         }
+diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
+index 21733e291080..cf712a19fde7 100644
+--- a/src/remotesmith_trust/identity.rs
++++ b/src/remotesmith_trust/identity.rs
+@@ -314,17 +314,90 @@ pub async fn direct_handshake(
+     Ok((id, sign_pk.to_vec()))
+ }
+ 
++/// A stand-in host for tests of the controller side (here and in `lan_first`).
+ #[cfg(test)]
+-mod tests {
++pub(crate) mod test_support {
+     use super::*;
+     use hbb_common::{
+         rendezvous_proto::IdPk,
+-        socket_client::connect_tcp,
+         sodiumoxide::crypto::box_,
+         tcp::{Encrypt, FramedStream, KX_VERSION_LATEST},
+         tokio::{self, sync::oneshot},
+     };
+ 
++    /// What the stand-in host does with its identity in the handshake.
++    #[derive(Clone, Copy)]
++    pub(crate) enum Host {
++        /// As the patched host: sends its signing key and signs with it.
++        Honest,
++        /// Sends no identity at all, like an unpatched host's direct listener.
++        Silent,
++        /// Sends one key but signs with another.
++        WrongKey,
++    }
++
++    /// A stand-in host on loopback. Returns its address, its signing key and, once the
++    /// controller answered, whether the key exchange completed.
++    pub(crate) async fn host_stub(id: &'static str, mode: Host) -> (String, Vec<u8>, oneshot::Receiver<bool>) {
++        let (sign_pk, sign_sk) = sign::gen_keypair();
++        let (_, other_sk) = sign::gen_keypair();
++        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
++            .await
++            .unwrap();
++        let host = listener.local_addr().unwrap().to_string();
++        let (tx, rx) = oneshot::channel();
++        tokio::spawn(async move {
++            let (stream, addr) = listener.accept().await.unwrap();
++            let mut s = FramedStream::from(stream, addr);
++            if matches!(mode, Host::Silent) {
++                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
++                tx.send(false).ok();
++                return;
++            }
++            let (our_pk_b, our_sk_b) = box_::gen_keypair();
++            let signer = if matches!(mode, Host::WrongKey) {
++                &other_sk
++            } else {
++                &sign_sk
++            };
++            let id_pk = IdPk {
++                id: id.to_owned(),
++                pk: our_pk_b.0.to_vec().into(),
++                kx_version: KX_VERSION_LATEST,
++                ..Default::default()
++            }
++            .write_to_bytes()
++            .unwrap();
++            let mut msg = Message::new();
++            msg.set_signed_id(SignedId {
++                id: sign::sign(&id_pk, signer).into(),
++                remotesmith_identity_pk: sign_pk.0.to_vec().into(),
++                ..Default::default()
++            });
++            s.send(&msg).await.unwrap();
++            let ok = match s.next().await {
++                Some(Ok(bytes)) => match Message::parse_from_bytes(&bytes).ok().and_then(|m| m.union)
++                {
++                    Some(message::Union::PublicKey(pk)) => {
++                        Encrypt::decode(&pk.symmetric_value, &pk.asymmetric_value, &our_sk_b)
++                            .is_ok()
++                    }
++                    _ => false,
++                },
++                _ => false,
++            };
++            tx.send(ok).ok();
++        });
++        (host, sign_pk.0.to_vec(), rx)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::test_support::{host_stub, Host};
++    use super::*;
++    use hbb_common::{socket_client::connect_tcp, tokio};
++
+     fn ident(id: &str, fp: &str) -> HostIdentity {
+         HostIdentity {
+             id: id.to_owned(),
+@@ -390,72 +463,6 @@ mod tests {
+         assert_eq!(id.id, "1");
+     }
+ 
+-    /// What the stand-in host does with its identity in the handshake.
+-    #[derive(Clone, Copy)]
+-    enum Host {
+-        /// As the patched host: sends its signing key and signs with it.
+-        Honest,
+-        /// Sends no identity at all, like an unpatched host's direct listener.
+-        Silent,
+-        /// Sends one key but signs with another.
+-        WrongKey,
+-    }
+-
+-    /// A stand-in host on loopback. Returns its address, its signing key and, once the
+-    /// controller answered, whether the key exchange completed.
+-    async fn host_stub(id: &'static str, mode: Host) -> (String, Vec<u8>, oneshot::Receiver<bool>) {
+-        let (sign_pk, sign_sk) = sign::gen_keypair();
+-        let (_, other_sk) = sign::gen_keypair();
+-        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
+-            .await
+-            .unwrap();
+-        let host = listener.local_addr().unwrap().to_string();
+-        let (tx, rx) = oneshot::channel();
+-        tokio::spawn(async move {
+-            let (stream, addr) = listener.accept().await.unwrap();
+-            let mut s = FramedStream::from(stream, addr);
+-            if matches!(mode, Host::Silent) {
+-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+-                tx.send(false).ok();
+-                return;
+-            }
+-            let (our_pk_b, our_sk_b) = box_::gen_keypair();
+-            let signer = if matches!(mode, Host::WrongKey) {
+-                &other_sk
+-            } else {
+-                &sign_sk
+-            };
+-            let id_pk = IdPk {
+-                id: id.to_owned(),
+-                pk: our_pk_b.0.to_vec().into(),
+-                kx_version: KX_VERSION_LATEST,
+-                ..Default::default()
+-            }
+-            .write_to_bytes()
+-            .unwrap();
+-            let mut msg = Message::new();
+-            msg.set_signed_id(SignedId {
+-                id: sign::sign(&id_pk, signer).into(),
+-                remotesmith_identity_pk: sign_pk.0.to_vec().into(),
+-                ..Default::default()
+-            });
+-            s.send(&msg).await.unwrap();
+-            let ok = match s.next().await {
+-                Some(Ok(bytes)) => match Message::parse_from_bytes(&bytes).ok().and_then(|m| m.union)
+-                {
+-                    Some(message::Union::PublicKey(pk)) => {
+-                        Encrypt::decode(&pk.symmetric_value, &pk.asymmetric_value, &our_sk_b)
+-                            .is_ok()
+-                    }
+-                    _ => false,
+-                },
+-                _ => false,
+-            };
+-            tx.send(ok).ok();
+-        });
+-        (host, sign_pk.0.to_vec(), rx)
+-    }
+-
+     #[tokio::test]
+     async fn direct_handshake_returns_the_key_the_host_signed_with() {
+         let (host, sign_pk, done) = host_stub("123456789", Host::Honest).await;
+diff --git a/src/remotesmith_trust/lan_first.rs b/src/remotesmith_trust/lan_first.rs
+new file mode 100644
+index 000000000000..b7a3090eff26
+--- /dev/null
++++ b/src/remotesmith_trust/lan_first.rs
+@@ -0,0 +1,193 @@
++//! LAN-first route for saved peers (RemoteSmith DEC-11, DEF-8, AC-7, AC-8, AC-38).
++//!
++//! Upstream reaches a peer by ID only through hbbs (its intranet path needs hbbs too), and goes
++//! to the direct port 21118 only when the user types an IP. So with the VM down, an ID connect
++//! fails even on the same LAN. RemoteSmith tries the peer's LAN address(es) first, with the
++//! identity handshake (the host must prove the saved peer's ID before anything else happens),
++//! all within 3 s, and only then the ID route.
++//!
++//! Hints come from the peer's config (the address that last worked, see [`OPTION_LAN_HINT`]),
++//! LAN discovery, and the address hbbs reports when it says the peer is on our LAN. They are
++//! hints only: the identity check decides who answered (DEF-3).
++
++use hbb_common::{
++    bail,
++    config::{Config, LanPeers, RELAY_PORT},
++    futures::future::{select_ok, FutureExt},
++    log,
++    socket_client::connect_tcp_local,
++    timeout, ResultType, Stream,
++};
++use std::time::Instant;
++
++/// Peer option: the LAN address (IP or IP:port) the last successful LAN route used.
++pub const OPTION_LAN_HINT: &str = "remotesmith-lan-hint";
++/// The whole LAN attempt, connect and identity handshake, gets this long (DEF-8).
++pub const LAN_BUDGET_MS: u64 = 3_000;
++/// Label shown for the route ("Direct ... (LAN)").
++pub const ROUTE_LABEL: &str = "LAN";
++const MAX_HINTS: usize = 4;
++
++/// The direct-server address for a hint: an IP, or IP:port as stored.
++pub fn direct_addr(hint: &str) -> Option<String> {
++    let hint = hint.trim();
++    if hint.is_empty() {
++        return None;
++    }
++    if let Ok(sa) = hint.parse::<std::net::SocketAddr>() {
++        return Some(sa.to_string());
++    }
++    if let Ok(ip) = hint.parse::<std::net::IpAddr>() {
++        return Some(std::net::SocketAddr::new(ip, (RELAY_PORT + 1) as u16).to_string());
++    }
++    None
++}
++
++/// Ordered, de-duplicated direct addresses to try: the saved hint first, then discovery.
++pub fn candidates(saved_hint: &str, discovered: &[String]) -> Vec<String> {
++    let mut out: Vec<String> = Vec::new();
++    for h in std::iter::once(saved_hint).chain(discovered.iter().map(|s| s.as_str())) {
++        if let Some(a) = direct_addr(h) {
++            if !out.contains(&a) {
++                out.push(a);
++            }
++        }
++        if out.len() >= MAX_HINTS {
++            break;
++        }
++    }
++    out
++}
++
++/// IPs LAN discovery has seen for `peer_id`, most recent peer first.
++pub fn discovered_ips(peer_id: &str) -> Vec<String> {
++    LanPeers::load()
++        .peers
++        .into_iter()
++        .filter(|p| p.id == peer_id)
++        .flat_map(|p| p.ip_mac.into_keys())
++        .collect()
++}
++
++/// Whether the LAN-first attempt applies at all: not through a proxy or WebSocket transport
++/// (a direct LAN socket would bypass them) and not when relay is forced.
++pub fn applies(force_relay: bool) -> bool {
++    !force_relay && Config::get_socks().is_none() && !hbb_common::config::use_ws()
++}
++
++/// A private-network address worth remembering as a hint.
++pub fn is_lan_ip(ip: &std::net::IpAddr) -> bool {
++    match ip {
++        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
++        std::net::IpAddr::V6(v6) => {
++            let s = v6.segments();
++            (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
++        }
++    }
++}
++
++/// Try every candidate at once; the first that connects AND proves `expected_id` wins and the
++/// rest are dropped (so only one session can come of it). Bounded by `budget_ms` overall.
++/// Returns the stream, the address that won and the host's signing key.
++pub async fn connect(
++    expected_id: &str,
++    addrs: &[String],
++    budget_ms: u64,
++) -> ResultType<(Stream, String, Vec<u8>)> {
++    if addrs.is_empty() {
++        bail!("no LAN address known");
++    }
++    let start = Instant::now();
++    let attempts = addrs.iter().map(|addr| {
++        let addr = addr.clone();
++        let expected_id = expected_id.to_owned();
++        async move {
++            let mut conn = connect_tcp_local(addr.as_str(), None, budget_ms).await?;
++            let left = budget_ms.saturating_sub(start.elapsed().as_millis() as u64).max(1);
++            let (_, pk) = super::identity::direct_handshake(&mut conn, Some(&expected_id), left)
++                .await?;
++            Ok::<_, hbb_common::anyhow::Error>((conn, addr, pk))
++        }
++        .boxed()
++    });
++    match timeout(budget_ms, select_ok(attempts)).await {
++        Ok(Ok(((conn, addr, pk), _rest))) => {
++            log::info!(
++                "LAN route to {} via {} in {:?}",
++                expected_id,
++                addr,
++                start.elapsed()
++            );
++            Ok((conn, addr, pk))
++        }
++        Ok(Err(err)) => bail!("LAN route failed: {}", err),
++        Err(_) => bail!("LAN route timed out after {} ms", budget_ms),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::identity::test_support::{host_stub, Host};
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn hints_become_direct_server_addresses() {
++        assert_eq!(direct_addr("192.168.1.20"), Some("192.168.1.20:21118".into()));
++        assert_eq!(direct_addr("192.168.1.20:4000"), Some("192.168.1.20:4000".into()));
++        assert_eq!(direct_addr("fe80::1"), Some("[fe80::1]:21118".into()));
++        assert_eq!(direct_addr("not an ip"), None);
++        assert_eq!(direct_addr(""), None);
++    }
++
++    #[test]
++    fn candidates_put_the_saved_hint_first_and_dedupe() {
++        let c = candidates(
++            "10.0.0.5",
++            &["10.0.0.6".into(), "10.0.0.5".into(), "junk".into()],
++        );
++        assert_eq!(c, vec!["10.0.0.5:21118", "10.0.0.6:21118"]);
++        let many: Vec<String> = (1..10).map(|i| format!("10.0.0.{i}")).collect();
++        assert_eq!(candidates("", &many).len(), MAX_HINTS);
++    }
++
++    #[test]
++    fn only_private_addresses_are_hints() {
++        assert!(is_lan_ip(&"192.168.1.2".parse().unwrap()));
++        assert!(is_lan_ip(&"10.1.2.3".parse().unwrap()));
++        assert!(is_lan_ip(&"fd00::1".parse().unwrap()));
++        assert!(!is_lan_ip(&"8.8.8.8".parse().unwrap()));
++        assert!(!is_lan_ip(&"2001:db8::1".parse().unwrap()));
++    }
++
++    #[hbb_common::tokio::test]
++    async fn the_peer_that_proves_the_expected_id_wins() {
++        let (wrong, _, _) = host_stub("999", Host::Honest).await;
++        let (right, pk, _) = host_stub("123", Host::Honest).await;
++        let (conn, addr, got_pk) = connect("123", &[wrong, right.clone()], LAN_BUDGET_MS)
++            .await
++            .unwrap();
++        assert_eq!(addr, right);
++        assert_eq!(got_pk, pk);
++        assert!(conn.is_secured());
++    }
++
++    #[hbb_common::tokio::test]
++    async fn a_stale_address_gives_up_within_the_budget() {
++        // A listener that accepts and then says nothing, like a host that is not RemoteSmith,
++        // plus an address nothing listens on.
++        let (silent, _, _) = host_stub("123", Host::Silent).await;
++        let start = Instant::now();
++        let Err(err) = connect("123", &[silent, "127.0.0.1:1".into()], 500).await else {
++            panic!("a silent host must not win");
++        };
++        assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
++        assert!(err.to_string().contains("LAN route"), "{err}");
++    }
++
++    #[hbb_common::tokio::test]
++    async fn another_machine_at_the_hint_is_not_accepted() {
++        let (other, _, _) = host_stub("999", Host::Honest).await;
++        assert!(connect("123", &[other], LAN_BUDGET_MS).await.is_err());
++    }
++}
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index 5192a36b1158..5df97bb143e6 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -2,3 +2,4 @@
+ //! and relay pinning. Kept in its own module so the upstream files carry only call sites.
+ pub mod identity;
+ pub mod reconnect;
++pub mod lan_first;
