@@ -21,13 +21,30 @@ macOS `~/Library/Preferences/ai.johnnycode.RemoteSmith/`, Windows `%APPDATA%\Rem
 6. Windows only, headless: on a clean install, as administrator,
    `remotesmith.exe --option custom-rendezvous-server <host>`, `--option key <key>`,
    `--password <12+ chars>`. Launch the UI: no setup dialog. `--option key short` prints an error
-   and changes nothing.
+   and changes nothing. A server without a key (`--option custom-rendezvous-server` only) still
+   shows the setup dialog. `--config "host=<host>,.exe"` (no key) is refused.
 
 ### B1-2 Direct LAN only (AC-40, AC-8)
 1. On one machine, clean profile, choose "Direct LAN only" and set a password.
 2. From the other machine, connect by the first machine's LAN IP: the session opens.
 3. With `nettop -m tcp -p RemoteSmith` (Mac) or Resource Monitor > Network (Windows) open,
    confirm no connection to any rendezvous server or `*.rustdesk.com`.
+
+4. Switch a provisioned machine to LAN only: run setup again (or, headless,
+   `--option remotesmith-lan-only Y`, which also clears the stored ID/relay/API servers), restart
+   RemoteSmith, and confirm with `nettop -P -p <pid>` that it no longer contacts the ID server
+   while LAN connections by IP still work. Setting a server again (`--option
+   custom-rendezvous-server <host>` or Settings > Network) turns LAN only off.
+
+### B1-2a Controller only (FLOW-2)
+1. On a clean profile, choose a route, tick "Controller only" and Save without a password.
+   The dialog closes; the home page shows the service as stopped.
+2. From the other machine, try to connect to it by ID and by LAN IP: both fail (no
+   registration, nothing listening on 21118: `lsof -nP -iTCP:21118` is empty).
+3. From this machine, connect to the other one: it works.
+4. Settings > General > "Start service": the setup dialog comes back and requires a
+   12+ character permanent password; after saving, the other machine can connect.
+5. Headless equivalent: `--option stop-service Y` (controller only) / `--option stop-service ""`.
 
 ### B1-3 Never contacts RustDesk's servers (AC-6)
 1. With both machines provisioned against the RemoteSmith server, run a session each way, a

@@ -8,15 +8,18 @@ at all.
 - RemoteSmith ships **no default server**. It never contacts rustdesk.com: no public
   rendezvous server, no API server, no update checks.
 - On first launch it asks for your ID server host and public key (or "Direct LAN only") and a
-  permanent password of at least 12 characters. The one-time password is disabled.
+  permanent password of at least 12 characters (or "Controller only", which turns incoming
+  connections off). The one-time password is disabled.
 - Headless setup, on an installed copy, as an administrator:
 
   ```sh
   RemoteSmith --option custom-rendezvous-server <host[:port]>
   RemoteSmith --option key <contents of id_ed25519.pub>
   RemoteSmith --password <at least 12 characters>
-  # or, with no server:
+  # or, with no server (this also clears any stored ID/relay/API server):
   RemoteSmith --option remotesmith-lan-only Y
+  # a machine that only controls others and never accepts connections needs no password:
+  RemoteSmith --option stop-service Y
   ```
 
 ## Layout and building
