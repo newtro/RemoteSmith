@@ -340,7 +340,8 @@ The installer and tray report each capability separately:
 
 **Server (FLOW-3)**
 - **AC-4** Given hbbs/hbbr 1.1.16 with key enforcement, when a client with the right host and key registers, then it gets an ID and shows as online.
-- **AC-5** Given a client with the wrong key or no key, when it tries to register or relay, then it is refused (both hbbs and hbbr).
+- **AC-5** Given a client with the wrong key or no key, when it tries to punch-hole/connect through hbbs or relay through hbbr, then it is refused. (OSS hbbs 1.1.16 cannot key-check ID registration or relay-request forwarding — the protocol carries no key there; this is a known server limitation, mitigated client-side by AC-61.)
+- **AC-61** Given a relay request forwarded by hbbs that names a relay other than the host's own configured relay, the host refuses it and logs the attempt, so a keyless client can't steer a host to an attacker-controlled relay.
 - **AC-6** Given RemoteSmith clients running, then they never contact RustDesk's public servers.
 
 **Sessions and routes (FLOW-4/5/17)**
