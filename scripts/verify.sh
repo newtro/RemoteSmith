@@ -29,4 +29,15 @@ if compgen -G ".github/workflows/*.yml" >/dev/null; then
     echo "== actionlint not installed; skipping workflow lint (brew install actionlint)"
   fi
 fi
+if [[ -f deploy/server/install.sh ]]; then
+  echo "== deploy/server: shellcheck, probe.py syntax, install.sh dry run"
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck deploy/server/*.sh
+  else
+    echo "shellcheck not installed (brew install shellcheck); skipping"
+  fi
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' deploy/server/probe.py
+  bash deploy/server/install.sh --dry-run --arch amd64 >/dev/null
+  bash deploy/server/firewall.sh --dry-run >/dev/null
+fi
 echo "verify: OK"
