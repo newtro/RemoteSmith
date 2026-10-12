@@ -131,10 +131,10 @@ index 590c22bea427..1308b23ab8b2 100644
              self.version = hbb_common::get_version_number(&pi.version);
          }
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
-index 500e0e014f3c..3c7338a905b4 100644
+index e7ed0fb5f9da..2efb2c381414 100644
 --- a/src/remotesmith_trust/identity.rs
 +++ b/src/remotesmith_trust/identity.rs
-@@ -325,17 +325,90 @@ pub async fn direct_handshake(
+@@ -331,17 +331,90 @@ pub async fn direct_handshake(
      Ok((id, sign_pk.to_vec()))
  }
  
@@ -227,7 +227,7 @@ index 500e0e014f3c..3c7338a905b4 100644
      fn ident(id: &str, fp: &str) -> HostIdentity {
          HostIdentity {
              id: id.to_owned(),
-@@ -401,72 +474,6 @@ mod tests {
+@@ -407,72 +480,6 @@ mod tests {
          assert_eq!(id.id, "1");
      }
  

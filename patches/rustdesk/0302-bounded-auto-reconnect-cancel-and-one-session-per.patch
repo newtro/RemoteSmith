@@ -27,6 +27,13 @@ completes after a lost Close is dropped. Input queued while connecting
 is discarded; the host ignores anything sent before login, so nothing is
 replayed.
 
+A Cancel holds until the manual Reconnect: a round that completes late
+is not processed at all (no login sent, no PeerInfo accepted, even ahead
+of a queued Close), a late success never clears it, and automatic
+reconnects (any window's leftover retry timer, multi-monitor sessions
+included) are refused while it holds; every window drops its timer on
+"Disconnected".
+
 Coalescing (AC-58): rapid Connect clicks while the first window is still
 being created share that request instead of opening more windows; Rust
 already keeps one connection per peer and type.
@@ -35,16 +42,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  flutter/lib/common.dart                       |  12 +-
  .../widgets/remotesmith_trust_dialogs.dart    |  46 ++-
- flutter/lib/models/model.dart                 |  47 ++-
+ flutter/lib/models/model.dart                 |  52 ++-
  flutter/lib/utils/multi_window_manager.dart   |  35 ++
  src/client.rs                                 |   4 +
- src/client/io_loop.rs                         |  50 ++-
+ src/client/io_loop.rs                         |  58 ++-
  src/flutter_ffi.rs                            |  13 +
  src/lang/en.rs                                |   2 +
  src/remotesmith_trust/mod.rs                  |   1 +
- src/remotesmith_trust/reconnect.rs            | 350 ++++++++++++++++++
- src/ui_session_interface.rs                   |  70 +++-
- 11 files changed, 613 insertions(+), 17 deletions(-)
+ src/remotesmith_trust/reconnect.rs            | 368 ++++++++++++++++++
+ src/ui_session_interface.rs                   |  72 +++-
+ 11 files changed, 646 insertions(+), 17 deletions(-)
  create mode 100644 src/remotesmith_trust/reconnect.rs
 
 diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
@@ -78,7 +85,7 @@ index b80e0b5f9580..f9956fb31810 100644
    if (link.isNotEmpty) {
      buttons.insert(0, dialogButton('JumpLink', onPressed: jumplink));
 diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
-index 91c95d7dc07d..7083c1edf794 100644
+index 99cf37b685cf..dc23f5837921 100644
 --- a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 +++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 @@ -1,4 +1,4 @@
@@ -110,7 +117,7 @@ index 91c95d7dc07d..7083c1edf794 100644
  }
  
  Widget _row(String label, String value) {
-@@ -128,3 +135,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
+@@ -133,3 +140,34 @@ void _identityDialog(SessionID sessionId, String type, String title,
      tag: '$sessionId-$type',
    );
  }
@@ -146,22 +153,27 @@ index 91c95d7dc07d..7083c1edf794 100644
 +  );
 +}
 diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
-index fe9aa2a82fd3..87b8b3c75f14 100644
+index fe9aa2a82fd3..9553600eb012 100644
 --- a/flutter/lib/models/model.dart
 +++ b/flutter/lib/models/model.dart
-@@ -910,8 +910,9 @@ class FfiModel with ChangeNotifier {
+@@ -910,8 +910,14 @@ class FfiModel with ChangeNotifier {
      }
  
      if (isRemoteSmithTrustMsgbox(type)) {
 -      // RemoteSmith: identity confirm and mismatch dialogs.
 -      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager);
++      if (type.startsWith('remotesmith-disconnected')) {
++        // Every window of the session gets this; none may keep a retry timer.
++        _timer?.cancel();
++        _timer = null;
++      }
 +      // RemoteSmith: identity confirm/mismatch and "Disconnected — Reconnect".
 +      showRemoteSmithTrustMsgbox(sessionId, type, title, text, dialogManager,
 +          onReconnect: () => showReconnecting(dialogManager, sessionId));
      } else if (type == 're-input-password') {
        wrongPasswordDialog(sessionId, dialogManager, type, title, text);
      } else if (type == 'input-2fa') {
-@@ -1085,12 +1086,15 @@ class FfiModel with ChangeNotifier {
+@@ -1085,12 +1091,15 @@ class FfiModel with ChangeNotifier {
        msgBox(sessionId, type, title, text, link, dialogManager,
            hasCancel: hasCancel,
            reconnect: hasRetry ? reconnect : null,
@@ -180,7 +192,7 @@ index fe9aa2a82fd3..87b8b3c75f14 100644
          reconnect(dialogManager, sessionId, false);
        });
        _reconnects *= 2;
-@@ -1111,16 +1115,45 @@ class FfiModel with ChangeNotifier {
+@@ -1111,16 +1120,45 @@ class FfiModel with ChangeNotifier {
      _pendingRestoreTimer = null;
    }
  
@@ -304,7 +316,7 @@ index 5fbe40e2f67c..590c22bea427 100644
              self.version = hbb_common::get_version_number(&pi.version);
          }
 diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
-index a8f3a104b86c..1c9c5783c538 100644
+index 631b96a8dd58..8e3473dbb5cd 100644
 --- a/src/client/io_loop.rs
 +++ b/src/client/io_loop.rs
 @@ -191,15 +191,57 @@ impl<T: InvokeUiSession> Remote<T> {
@@ -369,6 +381,21 @@ index a8f3a104b86c..1c9c5783c538 100644
              Ok(((mut peer, direct, pk, kcp, stream_type), (feedback, rendezvous_server))) => {
                  self.handler
                      .connection_round_state
+@@ -300,6 +342,14 @@ impl<T: InvokeUiSession> Remote<T> {
+                                         self.handler.on_establish_connection_error(err.to_string());
+                                         break;
+                                     }
++                                    Ok(_) if self.handler.lc.read().unwrap().remotesmith_retry.should_abort() => {
++                                        // RemoteSmith (AC-46, AC-58): cancelled or closed while this
++                                        // round connected; nothing from it is processed (no login
++                                        // sent, no PeerInfo accepted), even ahead of a queued Close.
++                                        log::info!("round cancelled; dropping it");
++                                        self.send_close_reason(&mut peer, "").await;
++                                        break;
++                                    }
+                                     Ok(ref bytes) => {
+                                         last_recv_time = Instant::now();
+                                         if !received {
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
 index da55c0d4b1cb..35f6c7422d8f 100644
 --- a/src/flutter_ffi.rs
@@ -423,10 +450,10 @@ index c88df312b182..5192a36b1158 100644
 +pub mod reconnect;
 diff --git a/src/remotesmith_trust/reconnect.rs b/src/remotesmith_trust/reconnect.rs
 new file mode 100644
-index 000000000000..70fdcbe40ea9
+index 000000000000..d62aa4a255c5
 --- /dev/null
 +++ b/src/remotesmith_trust/reconnect.rs
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,368 @@
 +//! Controller reconnect policy (RemoteSmith DEF-7, AC-24, AC-46).
 +//!
 +//! Upstream retries a retryable "Connection Error" forever, doubling the delay, and only for a
@@ -505,13 +532,19 @@ index 000000000000..70fdcbe40ea9
 +}
 +
 +impl RetryPolicy {
-+    /// A login succeeded: the session is up and any streak is over.
++    /// A login succeeded: the session is up and any streak is over. A late success never clears
++    /// a Cancel or a close: only [`Self::on_manual_reconnect`] does (io_loop also refuses to
++    /// process peer messages, PeerInfo included, while [`Self::should_abort`] holds).
 +    pub fn on_connected(&mut self) {
 +        self.established = true;
 +        self.first_failure = None;
 +        self.attempts = 0;
-+        self.cancelled = false;
 +        self.last_delay = None;
++    }
++
++    /// Whether an automatic (non-manual) reconnect may start a new round now.
++    pub fn may_auto_reconnect(&self) -> bool {
++        !self.closed && !self.cancelled
 +    }
 +
 +    /// The user pressed Reconnect on "Disconnected": a fresh streak.
@@ -754,6 +787,18 @@ index 000000000000..70fdcbe40ea9
 +    }
 +
 +    #[test]
++    fn a_late_success_never_clears_a_cancel() {
++        let mut p = RetryPolicy::default();
++        p.on_connected();
++        p.cancel();
++        // PeerInfo of a round that completed after the Cancel.
++        p.on_connected();
++        assert!(p.should_abort() && !p.may_auto_reconnect());
++        p.on_manual_reconnect();
++        assert!(!p.should_abort() && p.may_auto_reconnect());
++    }
++
++    #[test]
 +    fn a_successful_login_resets_the_window() {
 +        let t0 = Instant::now();
 +        let mut p = RetryPolicy::default();
@@ -778,21 +823,23 @@ index 000000000000..70fdcbe40ea9
 +    }
 +}
 diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
-index f28752e77d7e..ee5964edbbe4 100644
+index f28752e77d7e..0dccff5190fb 100644
 --- a/src/ui_session_interface.rs
 +++ b/src/ui_session_interface.rs
-@@ -1290,6 +1290,10 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -1290,6 +1290,12 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn reconnect(&self, force_relay: bool) {
-+        if self.lc.read().unwrap().remotesmith_retry.is_closed() {
-+            log::info!("not reconnecting a session the user closed");
++        if !self.lc.read().unwrap().remotesmith_retry.may_auto_reconnect() {
++            // Closed by the user, or reconnecting cancelled (any window's leftover retry timer
++            // lands here); only the manual Reconnect clears the mark, then calls us.
++            log::info!("not reconnecting: the session was closed or reconnecting cancelled");
 +            return;
 +        }
          // 1. If current session is connecting, do not reconnect.
          // 2. If the connection is established, send `Data::Close`.
          // 3. If the connection is disconnected, do nothing.
-@@ -1415,9 +1419,40 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -1415,9 +1421,40 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn close(&self) {
@@ -833,7 +880,7 @@ index f28752e77d7e..ee5964edbbe4 100644
      pub fn continue_insecure_connection(&self, continue_insecure: bool) {
          let data = if continue_insecure {
              Data::ContinueInsecureConnection
-@@ -1787,11 +1822,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+@@ -1787,11 +1824,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
      }
  
      fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {

@@ -12,8 +12,11 @@ password-derived data leaves, the controller compares the identity the
 stream proved with the pin saved in the peer's config:
 
 - first use: show ID and fingerprint and pin only after the user
-  confirms (AC-43); the credential is saved later by the normal login
-  path, so it too exists only after confirmation;
+  confirms (AC-43). The stream that waited on the dialog is then dropped
+  unused (the host may have timed it out meanwhile) and a fresh
+  connection logs in, passing only if it proves the key just pinned; the
+  credential is saved by the normal login path on it, so it too exists
+  only after confirmation. No exemptions, switch-sides included;
 - key or ID mismatch: stop without logging in, with a Forget peer path
   (AC-37, AC-43);
 - no identity proved (stock host, keyless server, plaintext fallback):
@@ -32,30 +35,30 @@ RemoteSmith.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../widgets/remotesmith_trust_dialogs.dart    | 130 +++++
+ .../widgets/remotesmith_trust_dialogs.dart    | 135 +++++
  flutter/lib/models/model.dart                 |   6 +-
  libs/base/protos/message.proto                |   7 +-
  src/client.rs                                 |  45 +-
- src/client/io_loop.rs                         |  17 +
+ src/client/io_loop.rs                         |  21 +
  src/flutter_ffi.rs                            |   5 +
  src/lang/en.rs                                |   9 +
  src/lib.rs                                    |   2 +
- src/port_forward.rs                           |  28 +-
- src/remotesmith_trust/identity.rs             | 523 ++++++++++++++++++
+ src/port_forward.rs                           |  40 +-
+ src/remotesmith_trust/identity.rs             | 529 ++++++++++++++++++
  src/remotesmith_trust/mod.rs                  |   3 +
  src/rendezvous_mediator.rs                    |   4 +-
  src/server.rs                                 |   2 +
- 13 files changed, 753 insertions(+), 28 deletions(-)
+ 13 files changed, 780 insertions(+), 28 deletions(-)
  create mode 100644 flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
  create mode 100644 src/remotesmith_trust/identity.rs
  create mode 100644 src/remotesmith_trust/mod.rs
 
 diff --git a/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
 new file mode 100644
-index 000000000000..91c95d7dc07d
+index 000000000000..99cf37b685cf
 --- /dev/null
 +++ b/flutter/lib/common/widgets/remotesmith_trust_dialogs.dart
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,135 @@
 +// RemoteSmith unit B3: peer identity (trust on first use) dialogs.
 +// Rust side: src/remotesmith_trust/{identity,reconnect}.rs. Kept in its own file so
 +// upstream's common.dart carries only the hook in msgBox().
@@ -118,6 +121,11 @@ index 000000000000..91c95d7dc07d
 +    dialogManager.dismissAll();
 +    if (!yes) {
 +      closeConnection();
++    } else {
++      // Rust drops the stream that waited on this dialog and logs in on a fresh
++      // one, which must prove the key just pinned.
++      dialogManager.showLoading(translate('Connecting...'),
++          onCancel: closeConnection);
 +    }
 +  }
 +
@@ -308,28 +316,32 @@ index d3e66e73c6c6..5fbe40e2f67c 100644
      RenameFile((i32, String, String, bool)),
      TakeScreenshot((i32, String)),
 diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
-index fcbc0901ee6f..a8f3a104b86c 100644
+index fcbc0901ee6f..631b96a8dd58 100644
 --- a/src/client/io_loop.rs
 +++ b/src/client/io_loop.rs
-@@ -217,6 +217,23 @@ impl<T: InvokeUiSession> Remote<T> {
+@@ -217,6 +217,27 @@ impl<T: InvokeUiSession> Remote<T> {
                  };
                  self.handler
                      .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
 +                // RemoteSmith (DEF-3, AC-37, AC-43): check the host's identity against the pin
 +                // before the host's Hash is read, so no password-derived data leaves first.
-+                if !crate::remotesmith_trust::identity::gate(
++                let gate = crate::remotesmith_trust::identity::gate(
 +                    &self.handler,
 +                    &mut self.receiver,
 +                    is_secured,
 +                    pk.as_deref(),
 +                )
-+                .await
-+                {
++                .await;
++                if gate != crate::remotesmith_trust::identity::Gate::Proceed {
 +                    self.send_close_reason(&mut peer, "").await;
 +                    if kcp.is_some() {
 +                        tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
 +                    }
 +                    self.handle_disconnected(round);
++                    if gate == crate::remotesmith_trust::identity::Gate::Reconfirm {
++                        // Log in on a fresh connection that must prove the key just pinned.
++                        self.handler.reconnect(false);
++                    }
 +                    return;
 +                }
                  if !is_secured
@@ -384,10 +396,10 @@ index 649f3ef955b0..899f5761788f 100644
  mod rendezvous_mediator;
  #[cfg(not(any(target_os = "ios")))]
 diff --git a/src/port_forward.rs b/src/port_forward.rs
-index d1f4df434661..480b3d683ef3 100644
+index d1f4df434661..ca4a04457137 100644
 --- a/src/port_forward.rs
 +++ b/src/port_forward.rs
-@@ -174,9 +174,21 @@ async fn connect_and_login(
+@@ -174,9 +174,27 @@ async fn connect_and_login(
      } else {
          ConnType::PORT_FORWARD
      };
@@ -396,7 +408,7 @@ index d1f4df434661..480b3d683ef3 100644
          Client::start(id, key, token, conn_type, interface.clone()).await?;
      interface.update_direct(Some(direct));
 +    // RemoteSmith (DEF-3): the same pre-login identity gate as desktop sessions.
-+    if !crate::remotesmith_trust::identity::gate(
++    match crate::remotesmith_trust::identity::gate(
 +        &interface,
 +        ui_receiver,
 +        stream.is_secured(),
@@ -404,13 +416,19 @@ index d1f4df434661..480b3d683ef3 100644
 +    )
 +    .await
 +    {
-+        *close_port_forward = true;
-+        return Ok(None);
++        crate::remotesmith_trust::identity::Gate::Proceed => {}
++        crate::remotesmith_trust::identity::Gate::Stop => {
++            *close_port_forward = true;
++            return Ok(None);
++        }
++        // Pinned just now on a stream left unread meanwhile: drop it; the next connection to
++        // the forwarded port logs in on a fresh one that must prove the pinned key.
++        crate::remotesmith_trust::identity::Gate::Reconfirm => return Ok(None),
 +    }
      if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
          if !confirm_insecure_connection(&interface, ui_receiver).await {
              *close_port_forward = true;
-@@ -415,9 +427,21 @@ async fn connect_and_login_mux(
+@@ -415,9 +433,27 @@ async fn connect_and_login_mux(
      } else {
          ConnType::PORT_FORWARD
      };
@@ -419,7 +437,7 @@ index d1f4df434661..480b3d683ef3 100644
          Client::start(id, key, token, conn_type, interface.clone()).await?;
      interface.update_direct(Some(direct));
 +    // RemoteSmith (DEF-3): the same pre-login identity gate as desktop sessions.
-+    if !crate::remotesmith_trust::identity::gate(
++    match crate::remotesmith_trust::identity::gate(
 +        &interface,
 +        ui_receiver,
 +        stream.is_secured(),
@@ -427,18 +445,24 @@ index d1f4df434661..480b3d683ef3 100644
 +    )
 +    .await
 +    {
-+        *close_port_forward = true;
-+        return Ok(None);
++        crate::remotesmith_trust::identity::Gate::Proceed => {}
++        crate::remotesmith_trust::identity::Gate::Stop => {
++            *close_port_forward = true;
++            return Ok(None);
++        }
++        // Pinned just now on a stream left unread meanwhile: drop it; the next connection to
++        // the forwarded port logs in on a fresh one that must prove the pinned key.
++        crate::remotesmith_trust::identity::Gate::Reconfirm => return Ok(None),
 +    }
      if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {
          if !confirm_insecure_connection(&interface, ui_receiver).await {
              *close_port_forward = true;
 diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
 new file mode 100644
-index 000000000000..500e0e014f3c
+index 000000000000..e7ed0fb5f9da
 --- /dev/null
 +++ b/src/remotesmith_trust/identity.rs
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,529 @@
 +//! Peer identity, trust on first use (RemoteSmith DEF-3, §7, AC-37, AC-43).
 +//!
 +//! A peer is its stable RustDesk ID plus the fingerprint of its Ed25519 signing key (the key
@@ -588,18 +612,32 @@ index 000000000000..500e0e014f3c
 +    v.to_string()
 +}
 +
++/// What the caller does with the stream after [`gate`].
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Gate {
++    /// The host is the pinned one: log in on this stream.
++    Proceed,
++    /// Refused or not confirmed: close, do not log in.
++    Stop,
++    /// The user just confirmed a first use. The stream sat unread while they compared
++    /// fingerprints (long enough for the host to time it out), so it is dropped unused and a
++    /// fresh connection must log in; that one passes only if it proves the key just pinned.
++    Reconfirm,
++}
++
 +/// The pre-login identity gate, run on every new stream before the host's `Hash` is read, so
-+/// no password-derived data can leave before it passes. Returns whether to log in.
++/// no password-derived data can leave before it passes.
 +///
 +/// `sign_pk` is the host signing key `Client::start` returned for this stream. On first use it
 +/// asks the user (AC-43) and pins only after a yes; the credential is saved later by the normal
-+/// login path, so it too exists only after confirmation.
++/// login path on the fresh connection, so it too exists only after confirmation. There is no
++/// exemption (switch-sides included): every unpinned host is confirmed by the user.
 +pub async fn gate(
 +    interface: &impl crate::client::Interface,
 +    receiver: &mut hbb_common::tokio::sync::mpsc::UnboundedReceiver<crate::client::Data>,
 +    is_secured: bool,
 +    sign_pk: Option<&[u8]>,
-+) -> bool {
++) -> Gate {
 +    let (peer, signed_id, pinned_fp, pinned_id) = {
 +        let lc = interface.get_lch();
 +        let lc = lc.read().unwrap();
@@ -621,18 +659,7 @@ index 000000000000..500e0e014f3c
 +                        .set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
 +                }
 +            }
-+            true
-+        }
-+        Verdict::FirstUse(o) if !interface.get_switch_code().is_empty() => {
-+            // Switching sides back to the controller that just held a session with us: the
-+            // login there rides the switch token, so there is nothing to confirm or pin.
-+            log::info!(
-+                "peer {}: switch-sides connection to unpinned host {} key {}",
-+                peer,
-+                o.id,
-+                o.fingerprint
-+            );
-+            true
++            Gate::Proceed
 +        }
 +        Verdict::FirstUse(o) => {
 +            log::info!(
@@ -654,7 +681,7 @@ index 000000000000..500e0e014f3c
 +                    | Some(crate::client::Data::Close)
 +                    | None => {
 +                        log::info!("peer {}: identity not confirmed, not logging in", peer);
-+                        return false;
++                        return Gate::Stop;
 +                    }
 +                    // Anything the UI queued meanwhile (input included) is dropped.
 +                    Some(_) => {}
@@ -664,8 +691,11 @@ index 000000000000..500e0e014f3c
 +            let mut lc = lc.write().unwrap();
 +            lc.set_option(OPTION_FINGERPRINT.to_owned(), o.fingerprint.clone());
 +            lc.set_option(OPTION_HOST_ID.to_owned(), o.id.clone());
-+            log::info!("peer {}: identity confirmed and pinned", peer);
-+            true
++            log::info!(
++                "peer {}: identity confirmed and pinned; reconnecting to log in",
++                peer
++            );
++            Gate::Reconfirm
 +        }
 +        Verdict::KeyMismatch { offered: o, .. } | Verdict::IdMismatch { offered: o, .. } => {
 +            log::warn!(
@@ -683,7 +713,7 @@ index 000000000000..500e0e014f3c
 +                &dialog_text(&peer, Some(&o), Some((&pinned_id, &pinned_fp))),
 +                "",
 +            );
-+            false
++            Gate::Stop
 +        }
 +        Verdict::Unavailable { enrolled } => {
 +            log::warn!(
@@ -697,7 +727,7 @@ index 000000000000..500e0e014f3c
 +                &dialog_text(&peer, None, Some((&pinned_id, &pinned_fp))),
 +                "",
 +            );
-+            false
++            Gate::Stop
 +        }
 +    }
 +}

@@ -19,7 +19,10 @@ Settings > About > Fingerprint (and, once the sidecar exposes it, in the tray).
 3. Compare with the host's Settings > About > Fingerprint: they match character for character.
 4. Press Cancel: the tab closes; the peer file has no `remotesmith-host-fingerprint` option
    (Mac: `~/Library/Preferences/ai.johnnycode.RemoteSmith/peers/<id>.toml`).
-5. Connect again, press "Trust and connect", log in with the password and tick remember.
+5. Connect again, wait at least 40 s on the dialog (longer than the host's idle timeout), then
+   press "Trust and connect": a "Connecting..." overlay appears and a fresh connection logs in
+   (controller log: "identity confirmed and pinned; reconnecting to log in"); log in with the
+   password and tick remember.
 6. The peer file now has `remotesmith-host-fingerprint`, `remotesmith-host-id` and the saved
    password. Disconnect and connect again: no dialog, straight in.
 7. Same steps connecting by the host's LAN IP typed into the ID box.
@@ -87,15 +90,21 @@ first connection always enrolls over the ID route (hbbs vouches for the key) or 
 ### B3-6 (AC-41) Host releases held keys and buttons when the connection drops
 1. Mac→PC: open Notepad on the PC. In the session hold Shift (or a letter key) and, while holding,
    pull the controller's network (or kill the controller app with `kill -9`).
-2. On the PC, within about 4 s (host log: "releasing N held button(s) and M key(s)"), type on the PC's physical keyboard: letters come out lowercase / the held key does not repeat.
+2. On the PC, within about 10 s (host log: "peer silent while input is held; treating the
+   connection as lost", then "connection ended holding N button(s) and M key(s); releasing"), type on the PC's physical keyboard: letters come out lowercase / the held key does not repeat.
 3. Start a drag of a file icon on the host's desktop, and mid-drag kill the controller: the drag
    ends where the pointer was; a physical click on the host behaves normally (no stuck button).
 4. Repeat 1-3 PC→Mac with TextEdit and a Finder icon.
 5. Repeat on Windows with an elevated window focused (Task Manager) so the portable service path
    is used.
+6. Stall without loss: in a relayed session, hold Shift and drag a window while the link stalls
+   for about 5 s (e.g. `sudo pfctl`/Windows firewall rule blocking the relay for 5 s, then lift
+   it): the session continues, the drag and Shift are still held, and releasing them on the
+   controller releases them on the host.
 
 ### B3-7 (AC-39) Changing the host's password ends sessions; the old credential stops working
-1. In an open session, change the host's permanent password (host: Settings > Security > Change
+1. In an open session (repeat with a switch-sides session, toolbar > Switch sides), change the
+   host's permanent password (host: Settings > Security > Change
    password). Within ~1 s the controller shows "Session closed by the peer: its password changed"
    and does not retry.
 2. Connect again: the saved password is refused (wrong-password prompt); entering the new one
