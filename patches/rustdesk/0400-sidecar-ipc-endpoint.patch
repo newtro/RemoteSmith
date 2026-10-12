@@ -32,7 +32,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/lib.rs                   |    4 +
  src/remotesmith/collect.rs   |  392 +++++++++++++
  src/remotesmith/host.rs      |   97 ++++
- src/remotesmith/mod.rs       |  193 +++++++
+ src/remotesmith/mod.rs       |  203 +++++++
  src/remotesmith/presence.rs  |  186 ++++++
  src/remotesmith/protocol.rs  | 1026 ++++++++++++++++++++++++++++++++++
  src/remotesmith/readiness.rs |  356 ++++++++++++
@@ -42,7 +42,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/remotesmith/tests.rs     |  904 ++++++++++++++++++++++++++++++
  src/remotesmith/winsec.rs    |   44 ++
  src/server.rs                |    3 +
- 15 files changed, 4232 insertions(+)
+ 15 files changed, 4242 insertions(+)
  create mode 100644 src/remotesmith/collect.rs
  create mode 100644 src/remotesmith/host.rs
  create mode 100644 src/remotesmith/mod.rs
@@ -617,10 +617,10 @@ index 000000000000..cea34006d641
 +}
 diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
 new file mode 100644
-index 000000000000..9ca767da924a
+index 000000000000..5628f57d2f3c
 --- /dev/null
 +++ b/src/remotesmith/mod.rs
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,203 @@
 +//! RemoteSmith additions to RustDesk.
 +//!
 +//! * The local IPC endpoint the RemoteSmith tray (`remotesmith-tray`) talks to: protocol v1 of
@@ -748,9 +748,19 @@ index 000000000000..9ca767da924a
 +                // or another process (a UI-hosted server, a second tray) may hold the name and
 +                // exit later.
 +                let mut wait = std::time::Duration::from_secs(1);
++                #[cfg_attr(not(windows), allow(unused_variables, unused_assignments))]
++                let mut attempts = 0u32;
 +                let listener = loop {
++                    attempts += 1;
 +                    match server::bind(&endpoint).await {
 +                        Ok(l) => break l,
++                        // A duplicate Windows tray must not linger (park() waits on this thread):
++                        // after a few tries it gives up, as upstream's own duplicate tray does.
++                        #[cfg(windows)]
++                        Err(e) if source == Source::Relay && attempts >= 3 => {
++                            log::warn!("remotesmith ipc: cannot listen on {endpoint}: {e}; giving up");
++                            return;
++                        }
 +                        Err(e) => {
 +                            log::warn!("remotesmith ipc: cannot listen on {endpoint}: {e}; retrying in {wait:?}");
 +                            hbb_common::tokio::time::sleep(wait).await;

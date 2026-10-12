@@ -26,7 +26,8 @@ it exists with PowerShell `[System.IO.Directory]::GetFiles("\\.\pipe\") | sls Re
 ### B4-2 (AC-21) Unavailable with reason and last seen
 1. Shut the PC down. Within 20 s the Mac's tray shows it "unavailable · offline" with a last-seen
    time close to the shutdown.
-2. Click Connect: the tray reports "offline" at once (no session window spins).
+2. Click Connect: the session window opens and reports the peer offline; the tray menu shows
+   the reason.
 3. Block the Mac's access to rs.johnnycode.ai (e.g. turn Wi-Fi to a network without internet,
    PC on another network): the PC shows "unavailable · server unreachable".
 
@@ -50,11 +51,12 @@ it exists with PowerShell `[System.IO.Directory]::GetFiles("\\.\pipe\") | sls Re
 3. Turn FileVault on (or check one where it is on): readiness names the pre-boot unlock.
 4. On the PC: set "Sleep after" on AC to 30 min: readiness names sleep. Restore "Never".
    With BitLocker using TPM+PIN, readiness names the pre-boot unlock; TPM-only passes.
-5. Cold boot: with every check passing, restart the host and, while it sits at the login screen
+5. Cold boot: with every check passing, **Restart** the host (on Windows not Shut down: with Fast
+   Startup a shutdown resumes from hibernation and does not count as a boot) and, while it sits at the login screen
    (no one logged in), connect to it from the other machine within 15 minutes of power-on and
    authenticate. Log in through the session. The host's tray now shows "Unattended ready".
    The ledger is `/Library/Application Support/RemoteSmith/remotesmith-unattended.json`
-   (Mac, owned by root) or `%ProgramData%\RemoteSmith\remotesmith-unattended.json` (PC).
+   (Mac, owned by root) or registry value `HKLM\SOFTWARE\RemoteSmith\RemoteSmith\Unattended` (PC).
 6. A connection made after logging in, or more than 15 minutes after boot, does not create
    the ledger (delete it first as admin to check).
 
