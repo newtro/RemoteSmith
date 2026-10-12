@@ -14,7 +14,9 @@ patches/rustdesk/NNNN-*.patch    RemoteSmith patches for vendor/rustdesk, applie
 patches/hbb_common/NNNN-*.patch  RemoteSmith patches for vendor/rustdesk/libs/hbb_common
 scripts/apply-patches.sh     reset the submodules to their pinned commits and apply patches/ (idempotent)
 scripts/export-patches.sh    turn the commits on top of the pinned base back into patches/ files
+scripts/bootstrap-mac.sh     idempotent macOS arm64 toolchain setup into ~/.cache/remotesmith/
 scripts/build-mac.sh         local macOS arm64 build, the same steps as CI
+scripts/verify.sh            fast verification gate
 sidecar/                     Rust tray/menu-bar app (crate `remotesmith-tray`)
 deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (systemd, not Docker)
 .github/workflows/           CI: apply patches, then build macOS arm64 and Windows x64
@@ -52,6 +54,27 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
 | flutter_rust_bridge | 1.80 |
 
 - **Mac features:** `--flutter --hwcodec --unix-file-copy-paste --screencapturekit`.
+- **LLVM on macOS:** upstream's mac job does not use 15.0.6 (that is Windows/Linux); it `brew install`s llvm, which clang-sys never finds on arm64, so bindgen uses Xcode's libclang. We skip brew llvm.
+
+### Local macOS build
+
+```sh
+git submodule update --init --recursive --depth 1
+scripts/bootstrap-mac.sh     # idempotent; Flutter 3.24.5 (+3.22.3 for the bridge), Rust 1.81/1.75 toolchains,
+                             # NASM 2.16.03, cargo-expand + flutter_rust_bridge_codegen, vcpkg + arm64-osx packages
+scripts/build-mac.sh         # -> build/mac/RustDesk.app (+ build/mac/build-*.log)
+```
+
+- `scripts/lib/mac-env.sh` holds every version, each with the upstream workflow line it mirrors. Everything lands in `~/.cache/remotesmith/`; your default rustup toolchain is not touched (the build sets `RUSTUP_TOOLCHAIN`).
+- `build-mac.sh` takes a machine-wide lock (`~/.cache/remotesmith/build-mac.lock`). `vendor/rustdesk/target` is a symlink to the shared `~/.cache/remotesmith/target-mac`, because build.py and the Xcode project hard-code `../../target/release`.
+- The build makes CI's in-place edits (MIN_MACOS_VERSION 12.3 in build.py, Podfile, Cargo.toml, project.pbxproj) and restores them afterwards, along with `Podfile.lock` and the bridge's pubspec edits. It refuses to start if those files have uncommitted changes.
+- The flutter_rust_bridge files are regenerated when the rustdesk HEAD or sources change, like CI's `generate-bridge` job (Flutter 3.22.3, codegen 1.80.1). One difference: cargo-expand runs on Rust 1.81 here, because the crate is expanded for macOS, where cidre needs 1.81. `--skip-bridge` reuses the existing files.
+- **Differences from the macos-14 runner, all because this Mac has Xcode 27 and no Rosetta:**
+  - NASM 2.16.03 is built from source (CI's prebuilt binary is x86_64).
+  - Flutter's x86_64 `gen_snapshot_arm64` is swapped for the native arm64 one from the same engine build (`darwin-arm64-release`).
+  - `FLUTTER_XCODE_MACOSX_DEPLOYMENT_TARGET=12.3` is passed, because Xcode 27 rejects the pods' 10.13/10.14 targets.
+  - The output copy is re-signed ad hoc **without** the hardened runtime: Xcode's ad-hoc + hardened-runtime app fails library validation on FlutterMacOS.framework. CI's unsigned artifact has the same problem until it is Developer ID signed.
+- None of this needs a patch to upstream sources.
 - **Windows features:** `--flutter --hwcodec`.
 - **Shared build caches** live on the internal disk under `~/.cache/remotesmith/`: vcpkg installed tree, cargo target, Flutter SDK. `/Volumes/Cache` has limited free space.
 - **Local Mac builds are heavy:** run one full build at a time. Parallel work should use `cargo check` against the shared target dir, where cargo's lock serializes them safely.
