@@ -80,7 +80,7 @@ pub enum ServerMessage {
         status: Box<Status>,
     },
     Peers {
-        #[serde(deserialize_with = "lenient_vec")]
+        #[serde(deserialize_with = "peers_array")]
         peers: Vec<Peer>,
     },
     ConnectStarted {
@@ -196,7 +196,7 @@ pub struct Status {
     pub server: ServerStatus,
     #[serde(deserialize_with = "lenient")]
     pub unattended: UnattendedStatus,
-    #[serde(deserialize_with = "lenient_vec")]
+    #[serde(deserialize_with = "sessions_array")]
     pub inbound_sessions: Vec<InboundSession>,
 }
 
@@ -433,6 +433,51 @@ where
 {
     let v = serde_json::Value::deserialize(d)?;
     Ok(T::deserialize(v).unwrap_or_default())
+}
+
+/// Top-level peer list: must be an array (anything else rejects the message, so a broken
+/// list is never mistaken for "no peers" and onboarding); unreadable elements are dropped, but
+/// a non-empty list with no readable element at all is rejected too.
+fn peers_array<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => {
+            let n = items.len();
+            let out: Vec<T> = items
+                .into_iter()
+                .filter_map(|e| T::deserialize(e).ok())
+                .collect();
+            if n > 0 && out.is_empty() {
+                return Err(D::Error::custom(
+                    "no readable peer in a non-empty peer list",
+                ));
+            }
+            Ok(out)
+        }
+        _ => Err(D::Error::custom("peers must be an array")),
+    }
+}
+
+/// Inbound sessions: null / absent means none; any other non-array rejects the whole status,
+/// so a malformed list can never silently clear the session badge (AC-60).
+fn sessions_array<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(items) => Ok(items
+            .into_iter()
+            .filter_map(|e| T::deserialize(e).ok())
+            .collect()),
+        _ => Err(D::Error::custom("inbound_sessions must be an array")),
+    }
 }
 
 fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
@@ -879,6 +924,27 @@ mod tests {
 
         let h = r#"{"v":1,"id":1,"type":"hello_ok","version":1,"min_version":1,"max_version":1,"server":null,"server_version":null}"#;
         assert!(decode::<ServerMessage>(h.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn list_shape_errors_reject_instead_of_clearing() {
+        for bad in [
+            r#"{"v":1,"type":"peers","peers":{"id":"1"}}"#,
+            r#"{"v":1,"type":"peers","peers":null}"#,
+            r#"{"v":1,"type":"peers","peers":[5,{"alias":"x"}]}"#,
+            r#"{"v":1,"type":"status","status":{"inbound_sessions":{"peer_id":"9"}}}"#,
+            r#"{"v":1,"type":"status","status":{"inbound_sessions":"none"}}"#,
+        ] {
+            assert!(decode::<ServerMessage>(bad.as_bytes()).is_err(), "{bad}");
+        }
+        for ok in [
+            r#"{"v":1,"type":"peers","peers":[]}"#,
+            r#"{"v":1,"type":"peers","peers":[5,{"id":"1"}]}"#,
+            r#"{"v":1,"type":"status","status":{"inbound_sessions":null}}"#,
+            r#"{"v":1,"type":"status","status":{}}"#,
+        ] {
+            assert!(decode::<ServerMessage>(ok.as_bytes()).is_ok(), "{ok}");
+        }
     }
 
     #[test]

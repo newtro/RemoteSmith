@@ -30,7 +30,7 @@ Keywords MUST, SHOULD and MAY are used in the RFC 2119 sense.
 | | macOS | Windows |
 |---|---|---|
 | Endpoint | Unix domain stream socket `/tmp/RemoteSmith-<uid>/remotesmith-ipc.sock` (`<uid>` = numeric effective uid of the logged-in user, e.g. `501`). The directory is the per-user IPC directory the fork already uses for its own IPC (hbb_common `ipc_parent_dir_for_uid`, created mode `0700` by `ensure_secure_ipc_parent_dir`) | Named pipe `\\.\pipe\RemoteSmith-ipc-<username>` (`<username>` = `%USERNAME%`), byte mode |
-| Who listens | the user's fork process (the UI/`--server` process running as that user, not the root service) | the user's fork process in the user's session (not the SYSTEM service) |
+| Who listens | the user's fork process (the UI/`--server` process running as that user, not the root service) | a fork process running **with the logged-in user's own token** in that user's session — on RustDesk that is the `--tray` / UI process, which relays what it needs from the SYSTEM `--server` / service over RustDesk's existing internal IPC. The pipe MUST NOT be created by a SYSTEM-token process (the service or a SYSTEM-launched `--server`): the client's server-SID check rejects such a listener by design, and its DACL would be built from the wrong SID. The DACL SID is the session user's SID, i.e. the token user of the listening process |
 | Server: endpoint permissions | the directory MUST be a real directory (not a symlink) owned by the user with no group/other access (`mode & 077 == 0`); create it `0700` if missing, refuse to bind otherwise. Socket file mode `0600` | DACL grants `GENERIC_ALL` to the current user's SID only (SDDL `D:P(A;;GA;;;<user SID>)`); `PIPE_REJECT_REMOTE_CLIENTS`; first instance created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so if the name already exists (someone squatted it) the fork's create fails and it logs an error rather than sharing the name |
 | Server: client check | after `accept`, the server MUST check the peer credentials (`getpeereid` / tokio `peer_cred()`) and close any client whose uid is not its own | the DACL keeps other users out |
 | Stale endpoint | before binding, the server removes an existing socket only if it is owned by the same uid and a connect to it fails; a live one is never stolen. On exit it unlinks the socket only if it is still the inode it bound | n/a (pipes vanish with their last handle) |
@@ -57,6 +57,10 @@ private-directory rules still apply to an overridden socket path.
   event. Every request gets exactly one response (success type or `error`).
 - `"type"` (string, snake_case) names the message.
 - Unknown fields MUST be ignored by both sides.
+- **List shapes.** The top-level `peers` array of a `peers` message is required and must be an
+  array; if it is non-empty but no element is readable, the message is rejected. `inbound_sessions`
+  may be absent or `null` (no sessions), but any other non-array value rejects the whole `status`
+  message, so a malformed list can never silently clear the session badge.
 - **Leniency inside objects.** Fields marked *required* below (`id` of a peer, `name` of a
   permission, the top-level `status` / `peers` of their messages, `version`/`min_version`/
   `max_version` of `hello_ok`, `code` of an error) must be present with the right type, or the
