@@ -28,7 +28,7 @@ command -v python3 >/dev/null || die "python3 is required (build.py)"
 #  - llvm: NOT installed. brew's llvm is keg-only under /opt/homebrew/opt/llvm, which is not on
 #    clang-sys's macOS search path (it probes /usr/local/opt/llvm*, the CommandLineTools and the
 #    Xcode toolchain), so on the arm64 runner bindgen already uses Xcode's libclang. LLVM_VERSION
-#    15.0.6 (flutter-build.yml:26) is only used by the Windows/Linux jobs.
+#    15.0.6 (flutter-build.yml:27) is only used by the Windows/Linux jobs.
 #  - create-dmg: NOT installed; we ship the .app, signing/dmg is scripts/release-mac.sh's job.
 command -v brew >/dev/null || die "Homebrew is required"
 need_brew=()
@@ -45,7 +45,7 @@ fi
 # macosx zip CI uses is i386/x86_64 only, which runs on the runner through Rosetta but not on a Mac
 # without Rosetta, so we build the same 2.16.03 release natively from the official source tarball.
 NASM_SHA256=1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148   # nasm-2.16.03.tar.xz
-if "$TOOLS_DIR/bin/nasm" -v 2>/dev/null | grep -q "version $NASM_VERSION "; then
+if "$TOOLS_DIR/bin/nasm" -v 2>/dev/null | grep "version $NASM_VERSION " >/dev/null; then
   echo "nasm $NASM_VERSION: present"
 else
   log "building NASM $NASM_VERSION from source into $TOOLS_DIR"
@@ -140,7 +140,7 @@ grep -n '_setFramesEnabledState(false);' "$binding"
 
 # --- Rust --------------------------------------------------------------------------------------
 # flutter-build.yml:857-862 Rust 1.81 + target aarch64-apple-darwin + rustfmt.
-# bridge.yml:66-71 Rust 1.75 + rustfmt for the codegen tools.
+# bridge.yml:61-66 Rust 1.75 + rustfmt for the codegen tools.
 command -v rustup >/dev/null || die "rustup is required (brew install rustup)"
 log "rust toolchains $MAC_RUST_VERSION and $BRIDGE_RUST_VERSION (default toolchain untouched)"
 rustup toolchain install "$MAC_RUST_VERSION" --profile minimal --component rustfmt --target aarch64-apple-darwin --no-self-update
@@ -150,7 +150,7 @@ rustup toolchain install "$BRIDGE_RUST_VERSION" --profile minimal --component ru
 # both --locked and built with RUST_VERSION 1.75. Installed into $TOOLS_DIR, not ~/.cargo/bin.
 cargo_tool() { # crate version binary [extra args]
   local crate="$1" ver="$2" bin="$3"; shift 3
-  if [[ -x "$TOOLS_DIR/bin/$bin" ]] && "$TOOLS_DIR/bin/$bin" --version 2>/dev/null | grep -qF "$ver"; then
+  if [[ -x "$TOOLS_DIR/bin/$bin" ]] && "$TOOLS_DIR/bin/$bin" --version 2>/dev/null | grep -F "$ver" >/dev/null; then
     echo "$crate $ver: present"
     return
   fi

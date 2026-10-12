@@ -8,7 +8,7 @@ RUSTDESK_DIR="$REPO_ROOT/vendor/rustdesk"
 
 RS_CACHE="${REMOTESMITH_CACHE:-$HOME/.cache/remotesmith}"
 
-# flutter-build.yml:27 FLUTTER_VERSION
+# flutter-build.yml:28 FLUTTER_VERSION
 FLUTTER_VERSION="3.24.5"
 # bridge.yml:25 the bridge is generated with Flutter 3.22.3, not FLUTTER_VERSION
 BRIDGE_FLUTTER_VERSION="3.22.3"

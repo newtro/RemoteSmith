@@ -42,32 +42,30 @@ start_ts=$(date +%s)
 echo "log: $LOG"
 
 # --- machine-wide lock -------------------------------------------------------------------------
-while ! mkdir "$BUILD_LOCK" 2>/dev/null; do
-  holder="$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)"
-  if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
-    echo "removing stale build lock from pid $holder"
-    rm -rf "$BUILD_LOCK"
-    continue
+# shlock(1) creates the lock file atomically with our pid and clears it if its pid is dead.
+restore=0
+cleanup() {
+  if ((restore)); then
+    git -C "$RUSTDESK_DIR" checkout -- "${CI_EDITED[@]}" "${BRIDGE_EDITED[@]}" 2>/dev/null || true
   fi
-  echo "another RemoteSmith mac build holds $BUILD_LOCK (pid ${holder:-?}, $(cat "$BUILD_LOCK/where" 2>/dev/null)); waiting 30s"
+  if [[ "$(cat "$BUILD_LOCK" 2>/dev/null)" == "$$" ]]; then rm -f "$BUILD_LOCK" "$BUILD_LOCK.where"; fi
+}
+trap cleanup EXIT
+until shlock -f "$BUILD_LOCK" -p $$; do
+  echo "another RemoteSmith mac build holds $BUILD_LOCK (pid $(cat "$BUILD_LOCK" 2>/dev/null), $(cat "$BUILD_LOCK.where" 2>/dev/null)); waiting 30s"
   sleep 30
 done
-echo $$ > "$BUILD_LOCK/pid"
-echo "$REPO_ROOT" > "$BUILD_LOCK/where"
+echo "$REPO_ROOT" > "$BUILD_LOCK.where"
 
 # Files CI edits in place before build.py (flutter-build.yml:913-918). We edit them for the build
 # and restore them afterwards, so they must not carry uncommitted work.
 # `pod install` also rewrites Podfile.lock (CI's checkout is throwaway, ours is not).
 CI_EDITED=(build.py flutter/macos/Podfile Cargo.toml flutter/macos/Runner.xcodeproj/project.pbxproj flutter/macos/Podfile.lock)
 BRIDGE_EDITED=(flutter/pubspec.yaml flutter/pubspec.lock)
-cleanup() {
-  git -C "$RUSTDESK_DIR" checkout -- "${CI_EDITED[@]}" "${BRIDGE_EDITED[@]}" 2>/dev/null || true
-  rm -rf "$BUILD_LOCK"
-}
-trap cleanup EXIT
 dirty="$(git -C "$RUSTDESK_DIR" status --porcelain -- "${CI_EDITED[@]}" "${BRIDGE_EDITED[@]}")"
 [[ -z "$dirty" ]] || die "uncommitted changes in files the build edits and restores; commit them first:
 $dirty"
+restore=1   # from here on the EXIT trap restores those files
 
 # --- shared cargo target dir -------------------------------------------------------------------
 target_link="$RUSTDESK_DIR/target"
@@ -82,9 +80,9 @@ fi
 # --- toolchain ---------------------------------------------------------------------------------
 export RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION"   # flutter-build.yml:857-862; default toolchain untouched
 log "versions"
-xcodebuild -version | head -1
-clang --version | head -1
-rustup -V 2>/dev/null | head -1
+xcodebuild -version | sed -n 1p
+clang --version | sed -n 1p
+rustup -V 2>/dev/null | sed -n 1p
 rustc -V
 cargo -V
 
@@ -99,7 +97,10 @@ cargo -V
 cd "$RUSTDESK_DIR"
 bridge_outputs=(src/bridge_generated.rs src/bridge_generated.io.rs flutter/lib/generated_bridge.dart
                 flutter/lib/generated_bridge.freezed.dart flutter/macos/Runner/bridge_generated.h flutter/ios/Runner/bridge_generated.h)
-bridge_key="$( { git rev-parse HEAD; git diff HEAD -- src libs flutter/pubspec.yaml Cargo.toml Cargo.lock; echo "$FLUTTER_RUST_BRIDGE_VERSION"; } | shasum -a 256 | cut -d' ' -f1)"
+bridge_key="$( { git rev-parse HEAD; git diff HEAD -- src libs flutter/pubspec.yaml Cargo.toml Cargo.lock
+                 git ls-files --others --exclude-standard -- src | xargs -I{} shasum -a 256 {}
+                 git -C libs/hbb_common rev-parse HEAD; git -C libs/hbb_common diff HEAD
+                 echo "$FLUTTER_RUST_BRIDGE_VERSION $MAC_RUST_VERSION $BRIDGE_FLUTTER_VERSION"; } | shasum -a 256 | cut -d' ' -f1)"
 bridge_stamp="$OUT_DIR/.bridge-stamp"
 have_outputs=1
 for f in "${bridge_outputs[@]}"; do [[ -f "$f" ]] || have_outputs=0; done
@@ -135,7 +136,7 @@ export PATH="$FLUTTER_ROOT_DIR/bin:$PATH"
 # the Pods project, so this raises all of them to CI's MIN_MACOS_VERSION without a source change.
 # (On the macos-14 runner's Xcode these were only warnings.)
 export FLUTTER_XCODE_MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION"
-log "build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit (Flutter $(flutter --suppress-analytics --version 2>/dev/null | head -1 | awk '{print $2}'))"
+log "build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit (Flutter $(flutter --suppress-analytics --version 2>/dev/null | sed -n 1p | awk '{print $2}'))"
 python3 ./build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit   # flutter-build.yml:765,920
 
 app_src="$RUSTDESK_DIR/flutter/build/macos/Build/Products/Release/RustDesk.app"

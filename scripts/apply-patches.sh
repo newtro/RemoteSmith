@@ -30,15 +30,24 @@ fi
 
 RD_PIN="$(rustdesk_pin)"
 HBB_PIN="$(hbb_pin)"
+# A pin must be an upstream commit. If someone `git add`ed the submodule after apply-patches, the
+# superproject would now point at a local patch commit that exists nowhere else.
+for pair in "vendor/rustdesk:$RUSTDESK_DIR:$RD_PIN" "libs/hbb_common:$HBB_DIR:$HBB_PIN"; do
+  IFS=: read -r label dir pin <<<"$pair"
+  if git -C "$dir" log -1 --format=%s "$pin" 2>/dev/null | grep -E "$SUBJECT_RE" >/dev/null; then
+    die "$label is pinned to RemoteSmith patch commit ${pin:0:12}, not an upstream commit; restore the gitlink (git checkout HEAD -- vendor/rustdesk, or fix the rustdesk tree)"
+  fi
+done
 git -C "$RUSTDESK_DIR" cat-file -e "$RD_PIN^{commit}" 2>/dev/null || die "rustdesk pin $RD_PIN not present locally; run: git submodule update --init --recursive"
 git -C "$HBB_DIR" cat-file -e "$HBB_PIN^{commit}" 2>/dev/null || die "hbb_common pin $HBB_PIN not present locally; run: git -C vendor/rustdesk submodule update --init libs/hbb_common"
 
 # Deterministic commits: same patches on the same pin give the same branch sha. No --3way: a
 # patch must apply as written (line offsets are fine, fuzz is not).
+# User/system git config is ignored (git_clean) and whitespace is applied verbatim.
 git_am() { # repo-dir patch
-  git -C "$1" -c user.name="${GIT_COMMITTER_NAME:-RemoteSmith patches}" \
+  git_clean -C "$1" -c user.name="${GIT_COMMITTER_NAME:-RemoteSmith patches}" \
     -c user.email="${GIT_COMMITTER_EMAIL:-patches@remotesmith.invalid}" -c commit.gpgsign=false \
-    am --quiet --committer-date-is-author-date --keep-cr "$2"
+    am --quiet --no-3way --whitespace=nowarn --no-verify --committer-date-is-author-date --keep-cr "$2"
 }
 
 am_in_progress() { [[ -d "$(git -C "$1" rev-parse --path-format=absolute --git-path rebase-apply)" ]]; }
@@ -87,23 +96,29 @@ fi
 # Refuse to throw away work unless --force: local edits, or commits on `remotesmith` above the pin
 # whose content is not in patches/ (compared by stable patch-id, so re-exported patches match).
 guard() { # repo-dir pin label
-  local dir="$1" pin="$2" label="$3" c id ids missing=()
+  local dir="$1" pin="$2" label="$3" c id ids missing=() tips=() head
   local dirty
   dirty="$(git -C "$dir" status --porcelain --untracked-files=no --ignore-submodules=all)"
   [[ -z "$dirty" ]] || { ((force)) || die "$label has uncommitted changes (use --force to discard):
 $dirty"; }
-  git -C "$dir" rev-parse --verify --quiet "refs/heads/$PATCH_BRANCH" >/dev/null || return 0
+  # Look at the branch AND at HEAD: commits made on a detached HEAD (e.g. after
+  # `git submodule update`) would otherwise be lost silently.
+  head="$(git -C "$dir" rev-parse HEAD)"
+  tips=("$head")
+  if git -C "$dir" rev-parse --verify --quiet "refs/heads/$PATCH_BRANCH" >/dev/null; then
+    tips+=("refs/heads/$PATCH_BRANCH")
+  fi
   ids="$(patch_file_ids)"
-  for c in $(git -C "$dir" rev-list --no-merges "$pin..refs/heads/$PATCH_BRANCH"); do
-    id="$(git -C "$dir" show --format= "$c" | git patch-id --stable | awk '{print $1}')"
+  for c in $(git -C "$dir" rev-list --no-merges "${tips[@]}" "^$pin"); do
+    id="$(commit_patch_id "$dir" "$c")"
     [[ -z "$id" ]] && continue                 # empty commit
     grep -qx "$id" <<<"$ids" || missing+=("$(git -C "$dir" log -1 --format='%h %s' "$c")")
   done
   if ((${#missing[@]})) && ((force == 0)); then
     printf '%s\n' "${missing[@]}" >&2
-    die "$label branch $PATCH_BRANCH has commits not in patches/ (run scripts/export-patches.sh, or --force to drop them)"
+    die "$label has commits above the pin that are not in patches/ (run scripts/export-patches.sh, or --force to drop them)"
   fi
-  echo "$label: previous $PATCH_BRANCH tip $(git -C "$dir" rev-parse --short "refs/heads/$PATCH_BRANCH")"
+  echo "$label: previous HEAD ${head:0:12}$(git -C "$dir" rev-parse --verify --quiet --short "refs/heads/$PATCH_BRANCH" | sed 's/^/, previous '"$PATCH_BRANCH"' tip /')"
 }
 
 load_patches rustdesk;   RD_PATCHES=(${PATCHES[@]+"${PATCHES[@]}"})

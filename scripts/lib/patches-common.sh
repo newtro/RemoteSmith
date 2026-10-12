@@ -17,6 +17,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 rustdesk_pin() {
   local line
   line="$(git -C "$REPO_ROOT" ls-files -s -- vendor/rustdesk)"
+  [[ "$line" != *$'\n'* ]] || die "vendor/rustdesk gitlink is conflicted in the superproject index; resolve it first"
   [[ "$line" == 160000\ * ]] || die "vendor/rustdesk is not a gitlink in the superproject index"
   awk '{print $2}' <<<"$line"
 }
@@ -46,6 +47,16 @@ load_patches() { # patches-subdir
     seen="$seen${BASH_REMATCH[1]} "
     PATCHES+=("$f")
   done
+}
+
+# git with the user's global/system config ignored, so patch output and git am behaviour do not
+# depend on whoever runs the scripts (diff.context, format.*, apply.whitespace, am.threeWay...).
+git_clean() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git "$@"; }
+
+# Stable patch-id of one commit, computed the same way export-patches.sh writes the patch.
+commit_patch_id() { # repo-dir commit
+  git_clean -C "$1" diff-tree -p --no-renames --binary --full-index -U3 --diff-algorithm=myers "$2" \
+    | git patch-id --stable | awk '{print $1}'
 }
 
 # Stable patch-ids of the patch files for one target, one per line (after load_patches).

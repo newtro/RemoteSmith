@@ -7,18 +7,20 @@
 # carries the number its author picked from the unit's range. apply-patches.sh applies in number
 # order, so before anything is written the new set is test-applied in that order onto the pin
 # (apply-patches.sh --check against a scratch copy). Patch files whose number is no longer on the
-# branch are removed.
+# branch are only removed with --prune: by default export refuses, because such a file usually
+# belongs to another unit and simply is not on this checkout's branch yet (run apply-patches.sh).
 #
-# Usage: scripts/export-patches.sh [--dry-run]
+# Usage: scripts/export-patches.sh [--dry-run] [--prune]
 set -euo pipefail
 # shellcheck source=lib/patches-common.sh
 source "$(dirname "$0")/lib/patches-common.sh"
 
-dry=0
+dry=0 prune=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --prune) prune=1 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
@@ -53,14 +55,16 @@ generate() { # target repo-dir pin  -> $SCRATCH/<target>/*.patch
     [[ "$seen" != *" $num "* ]] || die "$target $short: patch number $num is used by two commits"
     seen="$seen$num "
     [[ -n "$(git -C "$dir" diff-tree --no-commit-id -r "$c")" ]] || die "$target $short: empty commit"
-    if [[ $target == rustdesk ]] && git -C "$dir" diff-tree --no-commit-id --name-only -r "$c" | grep -qx libs/hbb_common; then
+    if [[ $target == rustdesk ]] && git -C "$dir" diff-tree --no-commit-id --name-only -r "$c" | grep -x libs/hbb_common >/dev/null; then
       die "rustdesk $short changes the libs/hbb_common gitlink; hbb_common changes belong in patches/hbb_common"
     fi
     # -k keeps the subject verbatim; --zero-commit, --no-signature and a fixed abbrev keep the file
     # byte-stable across re-exports and machines.
-    git -C "$dir" -c core.abbrev=12 -c diff.noprefix=false -c diff.mnemonicPrefix=false -c format.signOff=false \
+    git_clean -C "$dir" -c core.abbrev=12 -c diff.noprefix=false -c diff.mnemonicPrefix=false \
+      -c format.signOff=false -c format.headers= -c format.useAutoBase=false \
       format-patch -1 "$c" --stdout -k --zero-commit --no-signature --no-numbered --no-renames --binary \
-      >"$out/$num-$(slug "$topic").patch"
+      -U3 --inter-hunk-context=0 --diff-algorithm=myers --no-relative --no-notes --no-thread --no-attach \
+      --no-to --no-cc --no-from >"$out/$num-$(slug "$topic").patch"
     count=$((count + 1))
   done
   echo "== $target: $count commit(s) above ${pin:0:12}"
@@ -68,6 +72,20 @@ generate() { # target repo-dir pin  -> $SCRATCH/<target>/*.patch
 
 generate rustdesk "$RUSTDESK_DIR" "$RD_PIN"
 generate hbb_common "$HBB_DIR" "$HBB_PIN"
+
+# Existing patch files whose number is not on the branch.
+orphans=()
+for target in rustdesk hbb_common; do
+  PATCHES_ROOT="$REPO_ROOT/patches" load_patches "$target"
+  for f in ${PATCHES[@]+"${PATCHES[@]}"}; do
+    num="$(basename "$f" | cut -c1-4)"
+    compgen -G "$SCRATCH/$target/$num-*.patch" >/dev/null || orphans+=("patches/$target/$(basename "$f")")
+  done
+done
+if ((${#orphans[@]})) && ((prune == 0)); then
+  printf '  %s\n' "${orphans[@]}" >&2
+  die "these patches are not on your $PATCH_BRANCH branch. Run scripts/apply-patches.sh to pick them up first, or pass --prune to delete them"
+fi
 
 echo "== test-applying the exported set in number order"
 REMOTESMITH_PATCHES_DIR="$SCRATCH" "$(dirname "$0")/apply-patches.sh" --check \
