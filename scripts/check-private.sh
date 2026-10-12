@@ -10,7 +10,7 @@
 #      (RS_HOST, CF_ZONE, RS_IPV4, RS_IPV6 and its /64, LIGHTSAIL_INSTANCE,
 #      CF_CREDENTIALS_FILE, "ssh SSH_TARGET").
 #   3. When .private-patterns exists at the repo root (gitignored): none of its lines
-#      (fixed strings, whole-word; blank lines and # comments ignored).
+#      (fixed strings, whole-word, case-insensitive; blank lines and # comments ignored).
 #
 # Findings print as file:line only, never the matched text, so the output can't leak
 # the values it guards.
@@ -20,10 +20,21 @@ cd "$(dirname "$0")/.."
 fail=0
 scope=(-- . ':(exclude)vendor' ':(exclude)vendor/**')
 
-files() { git ls-files -z --cached --others --exclude-standard "${scope[@]}"; }
+# Files that exist: a tracked file deleted in the working tree is skipped, not an error.
+files() {
+  local f
+  while IFS= read -r -d '' f; do
+    [[ -f $f ]] && printf '%s\0' "$f"
+  done < <(git ls-files -z --cached --others --exclude-standard "${scope[@]}")
+  return 0
+}
 
 # 1. IP literals.
-ip_hits=$(files | xargs -0 grep -IHnoE '[0-9]+(\.[0-9]+){3,}|[0-9A-Fa-f]{4}(:[0-9A-Fa-f]{0,4}){3,7}' 2>/dev/null \
+# grep exits 1 for a batch without matches; only a real error (>1, xargs 125+) fails.
+ip_raw=$(files | xargs -0 grep -IHnoE '[0-9]+(\.[0-9]+){3,}|[0-9A-Fa-f]{4}(:[0-9A-Fa-f]{0,4}){3,7}') || {
+  rc=$?; [[ $rc == 1 || $rc == 123 ]] || { echo "check-private: scanning failed (exit $rc)" >&2; exit 2; }
+}
+ip_hits=$(printf '%s\n' "$ip_raw" \
   | awk -F: '
     function bad4(a,  p, n) {
       n = split(a, p, ".")
@@ -38,6 +49,7 @@ ip_hits=$(files | xargs -0 grep -IHnoE '[0-9]+(\.[0-9]+){3,}|[0-9A-Fa-f]{4}(:[0-
       return 1
     }
     {
+      if (NF < 3) next
       file = $1; line = $2
       val = substr($0, length($1) + length($2) + 3)
       if (val ~ /^[0-9.]+$/) { if (bad4(val)) print file ":" line ": public IPv4 literal" }
@@ -63,7 +75,7 @@ if [[ -f .private-patterns ]]; then
 fi
 if [[ -s $pat ]]; then
   # --untracked: the working tree's tracked files plus untracked, non-ignored ones.
-  hits=$(git grep -IwnF --untracked -f "$pat" "${scope[@]}" | cut -d: -f1,2 | sort -u) || true
+  hits=$(git grep -IiwnF --untracked -f "$pat" "${scope[@]}" | cut -d: -f1,2 | sort -u) || true
   if [[ -n $hits ]]; then
     printf '%s\n' "$hits" | sed 's/$/: names private infrastructure (from site.env or .private-patterns)/'
     fail=1

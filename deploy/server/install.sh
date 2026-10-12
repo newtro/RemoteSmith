@@ -117,11 +117,14 @@ cleanup() {
 
 # The host the installed hbbs unit hands out as its relay, or empty.
 installed_host() {
-  sed -n "s/^ExecStart=.* --relay-servers \([^ :]*\):$RELAY_PORT .*/\1/p" "$UNIT_DIR/$HBBS" 2>/dev/null | head -1
+  [[ -r $UNIT_DIR/$HBBS ]] || return 0
+  sed -n "s/^ExecStart=.* --relay-servers \([^ :]*\):$RELAY_PORT .*/\1/p" "$UNIT_DIR/$HBBS" | head -1 || true
 }
 
 # Decide RS_HOST: --host, else site.env beside this script, else (only for modes that
-# act on an existing install) the name in the installed unit.
+# act on an existing install) the name in the installed unit. Install and render need
+# one; status, rollback and restore check the relay against the installed unit anyway
+# (health), so they only warn.
 load_site() {
   local from
   if [[ -f $SCRIPT_DIR/site.env ]]; then
@@ -132,7 +135,12 @@ load_site() {
   elif [[ $MODE == status || $MODE == rollback || $MODE == restore ]]; then
     RS_HOST=$(installed_host); from="the installed $HBBS"
   fi
-  [[ -n $RS_HOST ]] || die "no server name: set RS_HOST in $SCRIPT_DIR/site.env (copy site.env.example) or pass --host NAME"
+  if [[ -z $RS_HOST ]]; then
+    local msg="no server name: set RS_HOST in $SCRIPT_DIR/site.env (copy site.env.example) or pass --host NAME"
+    [[ $MODE == install || $MODE == render ]] && die "$msg"
+    warn "$msg"
+    return 0
+  fi
   valid_hostname "$RS_HOST" || die "RS_HOST '$RS_HOST' (from $from) is not a valid DNS name"
   RELAY=$RS_HOST:$RELAY_PORT
   log "server name $RS_HOST (from $from)"
@@ -162,7 +170,21 @@ stage_kit() {
     [[ $f == "$HBBS" ]] && continue
     [[ -f $SCRIPT_DIR/$f ]] && cp -p "$SCRIPT_DIR/$f" "$STAGE/$f"
   done
+  # The site.env kept on the box must name the host the unit was rendered with, or the
+  # next run from kit/ would silently re-render with another one. So --host is written
+  # into the staged copy (the rest of site.env is kept).
+  if [[ -n $HOST_FLAG ]]; then
+    { [[ -f $SCRIPT_DIR/site.env ]] && grep -vE '^[[:space:]]*RS_HOST=' "$SCRIPT_DIR/site.env"
+      printf 'RS_HOST=%s\n' "$RS_HOST"; } > "$STAGE/site.env"
+  fi
   render_units "$STAGE"
+}
+
+# host:port the installed hbbs unit hands out, else the configured RELAY.
+expected_relay() {
+  local h
+  h=$(installed_host)
+  if [[ -n $h ]]; then printf '%s:%s' "$h" "$RELAY_PORT"; else printf '%s' "$RELAY"; fi
 }
 
 # Revert-on-failure. Once a run starts changing live state (units, helpers, the bin
@@ -599,12 +621,21 @@ health() {
   fi
   # The relay hbbs hands out right now. hbbs resolves --relay-servers once at start
   # and drops the name if DNS fails; clients then get no relay until it restarts.
+  # Expected: what the installed unit says (after a rollback, that is the restored one).
+  local want
+  want=$(expected_relay)
   line=$(python3 -I "$SCRIPT_DIR/probe.py" relays 2>&1 | tr '\n' ' ' | sed 's/ *$//' || true)
-  if [[ $line == "$RELAY" ]]; then
-    log "hbbs hands out relay $RELAY"
-  else
-    warn "hbbs hands out relay '${line}', expected '$RELAY'. Does $RS_HOST resolve? Fix DNS, then: sudo systemctl restart $HBBS"
+  if [[ -z $want ]]; then
+    warn "no server name known (site.env, --host or the installed unit); can't check the relay hbbs hands out ('${line}')"
     ok=1
+  elif [[ $line == "$want" ]]; then
+    log "hbbs hands out relay $want"
+  else
+    warn "hbbs hands out relay '${line}', expected '$want'. Does ${want%:*} resolve? Fix DNS, then: sudo systemctl restart $HBBS"
+    ok=1
+  fi
+  if [[ -n $RELAY && -n $want && $want != "$RELAY" ]]; then
+    warn "the installed $HBBS hands out $want, but this kit's server name gives $RELAY"
   fi
   return $ok
 }
@@ -741,8 +772,10 @@ summary() {
   [[ $DRY_RUN == 1 ]] && return 0
   echo
   echo "RemoteSmith server $(link_version bin) is running (previous: $(link_version previous))."
-  echo "  host: $RS_HOST   key: $(cat "$PREFIX/data/id_ed25519.pub" 2>/dev/null)"
-  echo "  clients: ID server $RS_HOST, relay $RELAY, key as above"
+  local relay
+  relay=$(expected_relay)
+  echo "  host: ${relay%:*}   key: $(cat "$PREFIX/data/id_ed25519.pub" 2>/dev/null)"
+  echo "  clients: ID server ${relay%:*}, relay $relay, key as above"
 }
 
 do_status() {

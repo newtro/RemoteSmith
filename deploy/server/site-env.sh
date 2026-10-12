@@ -57,9 +57,16 @@ site_env_leak_patterns() {
     "${LIGHTSAIL_INSTANCE:-}" "${CF_CREDENTIALS_FILE:-}"; do
     [[ -n $v ]] && printf '%s\n' "$v"
   done
-  # The IPv6 /64 too: the interface ID can change while the prefix stays.
-  if [[ ${RS_IPV6:-} =~ ^([0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}): ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
+  # The IPv4 address as cloud reverse-DNS names spell it (ec2-a-b-c-d...).
+  [[ -n ${RS_IPV4:-} ]] && printf '%s\n' "${RS_IPV4//./-}"
+  # The IPv6 /64 and /48 too: the interface ID can change while the prefix stays.
+  if [[ ${RS_IPV6:-} =~ ^(([0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}):[0-9A-Fa-f]{1,4}): ]]; then
+    printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  fi
+  # A ~ path in its spelled-out forms as well.
+  if [[ ${CF_CREDENTIALS_FILE:-} == \~/* ]]; then
+    printf '%s\n' "\$HOME/${CF_CREDENTIALS_FILE#\~/}"
+    [[ -n ${HOME:-} ]] && printf '%s\n' "$HOME/${CF_CREDENTIALS_FILE#\~/}"
   fi
   [[ -n ${SSH_TARGET:-} ]] && printf 'ssh %s\n' "$SSH_TARGET"
   return 0
