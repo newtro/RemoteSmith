@@ -205,7 +205,7 @@ index 000000000000..cdf73fa7e791
 +  );
 +}
 diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
-index f1abb8e36623..fe9aa2a82fd3 100644
+index 12f96ffa05d5..57eee6300535 100644
 --- a/flutter/lib/models/model.dart
 +++ b/flutter/lib/models/model.dart
 @@ -40,6 +40,7 @@ import 'package:vector_math/vector_math.dart' show Vector2;
@@ -216,7 +216,7 @@ index f1abb8e36623..fe9aa2a82fd3 100644
  import 'input_model.dart';
  import 'platform_model.dart';
  import 'package:flutter_hbb/utils/scale.dart';
-@@ -908,7 +909,10 @@ class FfiModel with ChangeNotifier {
+@@ -911,7 +912,10 @@ class FfiModel with ChangeNotifier {
        parent.target?.inputModel.setRelativeMouseMode(false);
      }
  
@@ -247,7 +247,7 @@ index 991e8a31eb06..f35f6ecdcb6d 100644
  message AudioFormat {
    uint32 sample_rate = 1;
 diff --git a/src/client.rs b/src/client.rs
-index d3e66e73c6c6..7367b9e5e898 100644
+index b0f9874839dc..94acaf11c2be 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -424,31 +424,24 @@ impl Client {
@@ -298,7 +298,7 @@ index d3e66e73c6c6..7367b9e5e898 100644
                  (0, "".to_owned()),
                  false,
              ));
-@@ -460,6 +453,8 @@ impl Client {
+@@ -464,6 +457,8 @@ impl Client {
          } else {
              (peer, "", key, token)
          };
@@ -307,7 +307,7 @@ index d3e66e73c6c6..7367b9e5e898 100644
          let (rendezvous_server, servers, contained) = if other_server.is_empty() {
              crate::get_rendezvous_server(1_000).await
          } else {
-@@ -2851,6 +2846,8 @@ struct ConnToken {
+@@ -2864,6 +2859,8 @@ struct ConnToken {
  #[derive(Default)]
  pub struct LoginConfigHandler {
      id: String,
@@ -316,7 +316,7 @@ index d3e66e73c6c6..7367b9e5e898 100644
      pub conn_type: ConnType,
      pub is_terminal_admin: bool,
      hash: Hash,
-@@ -5000,6 +4997,9 @@ pub enum Data {
+@@ -5013,6 +5010,9 @@ pub enum Data {
      NewVoiceCall,
      CloseVoiceCall,
      ContinueInsecureConnection,
@@ -359,10 +359,10 @@ index fcbc0901ee6f..631b96a8dd58 100644
                      && !crate::common::is_direct_ip_access(&self.handler.get_id())
                      && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index f9cc2d66c251..d6943f3d63b7 100644
+index a376363b8fbb..3843f8559841 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
-@@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+@@ -2952,6 +2952,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
              s.continue_insecure_connection(value == "Y");
              return;
          }
@@ -394,7 +394,7 @@ index ca61f35a15a0..f6fb59c0206f 100644
      ].iter().cloned().collect();
  }
 diff --git a/src/lib.rs b/src/lib.rs
-index 649f3ef955b0..899f5761788f 100644
+index e6918c2dbd0d..9a1ad7c55f9d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -15,6 +15,8 @@ mod server;

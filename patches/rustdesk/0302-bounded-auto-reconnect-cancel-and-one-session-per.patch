@@ -55,7 +55,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/remotesmith_trust/reconnect.rs
 
 diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
-index b80e0b5f9580..f9956fb31810 100644
+index 8d2665361abc..0976ac48909a 100644
 --- a/flutter/lib/common.dart
 +++ b/flutter/lib/common.dart
 @@ -1181,7 +1181,8 @@ void msgBox(SessionID sessionId, String type, String title, String text,
@@ -153,10 +153,10 @@ index cdf73fa7e791..f2f852b63a62 100644
 +  );
 +}
 diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
-index fe9aa2a82fd3..9553600eb012 100644
+index 57eee6300535..813f0bfe4240 100644
 --- a/flutter/lib/models/model.dart
 +++ b/flutter/lib/models/model.dart
-@@ -910,8 +910,14 @@ class FfiModel with ChangeNotifier {
+@@ -913,8 +913,14 @@ class FfiModel with ChangeNotifier {
      }
  
      if (isRemoteSmithTrustMsgbox(type)) {
@@ -173,7 +173,7 @@ index fe9aa2a82fd3..9553600eb012 100644
      } else if (type == 're-input-password') {
        wrongPasswordDialog(sessionId, dialogManager, type, title, text);
      } else if (type == 'input-2fa') {
-@@ -1085,12 +1091,15 @@ class FfiModel with ChangeNotifier {
+@@ -1088,12 +1094,15 @@ class FfiModel with ChangeNotifier {
        msgBox(sessionId, type, title, text, link, dialogManager,
            hasCancel: hasCancel,
            reconnect: hasRetry ? reconnect : null,
@@ -192,7 +192,7 @@ index fe9aa2a82fd3..9553600eb012 100644
          reconnect(dialogManager, sessionId, false);
        });
        _reconnects *= 2;
-@@ -1111,16 +1120,45 @@ class FfiModel with ChangeNotifier {
+@@ -1114,16 +1123,45 @@ class FfiModel with ChangeNotifier {
      _pendingRestoreTimer = null;
    }
  
@@ -294,10 +294,10 @@ index 9e26f8cf9a61..793736ab308a 100644
      var params = {
        "type": type.index,
 diff --git a/src/client.rs b/src/client.rs
-index 7367b9e5e898..c95e6465f674 100644
+index 94acaf11c2be..1234a6417bae 100644
 --- a/src/client.rs
 +++ b/src/client.rs
-@@ -2848,6 +2848,8 @@ pub struct LoginConfigHandler {
+@@ -2861,6 +2861,8 @@ pub struct LoginConfigHandler {
      id: String,
      /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
      pub remotesmith_signed_id: String,
@@ -306,7 +306,7 @@ index 7367b9e5e898..c95e6465f674 100644
      pub conn_type: ConnType,
      pub is_terminal_admin: bool,
      hash: Hash,
-@@ -3676,6 +3678,8 @@ impl LoginConfigHandler {
+@@ -3689,6 +3691,8 @@ impl LoginConfigHandler {
      /// * `username` - The name of the peer.
      /// * `pi` - The peer info.
      pub fn handle_peer_info(&mut self, pi: &PeerInfo) {
@@ -397,10 +397,10 @@ index 631b96a8dd58..8e3473dbb5cd 100644
                                          last_recv_time = Instant::now();
                                          if !received {
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index d6943f3d63b7..f0d8ea1d9a1e 100644
+index 3843f8559841..ba9df1c76701 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
-@@ -2909,6 +2909,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+@@ -2952,6 +2952,11 @@ pub fn session_set_common(session_id: SessionID, key: String, value: String) {
              s.continue_insecure_connection(value == "Y");
              return;
          }
@@ -412,7 +412,7 @@ index d6943f3d63b7..f0d8ea1d9a1e 100644
          // RemoteSmith: the answer to the first-use identity prompt (AC-43).
          if key == "remotesmith-identity" {
              crate::client::Interface::send(&*s, crate::client::Data::RemoteSmithIdentity(value));
-@@ -2933,6 +2938,14 @@ pub fn session_get_common(
+@@ -2976,6 +2981,14 @@ pub fn session_get_common(
      if let Some(s) = sessions::get_session_by_session_id(&session_id) {
          let v = if key == "is_screenshot_supported" {
              s.is_screenshot_supported().to_string()
@@ -823,10 +823,10 @@ index 000000000000..d62aa4a255c5
 +    }
 +}
 diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
-index f28752e77d7e..0dccff5190fb 100644
+index 4e5afb822686..cccbdc113e3c 100644
 --- a/src/ui_session_interface.rs
 +++ b/src/ui_session_interface.rs
-@@ -1290,6 +1290,12 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -1298,6 +1298,12 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn reconnect(&self, force_relay: bool) {
@@ -839,7 +839,7 @@ index f28752e77d7e..0dccff5190fb 100644
          // 1. If current session is connecting, do not reconnect.
          // 2. If the connection is established, send `Data::Close`.
          // 3. If the connection is disconnected, do nothing.
-@@ -1415,9 +1421,40 @@ impl<T: InvokeUiSession> Session<T> {
+@@ -1423,9 +1429,40 @@ impl<T: InvokeUiSession> Session<T> {
      }
  
      pub fn close(&self) {
@@ -880,7 +880,7 @@ index f28752e77d7e..0dccff5190fb 100644
      pub fn continue_insecure_connection(&self, continue_insecure: bool) {
          let data = if continue_insecure {
              Data::ContinueInsecureConnection
-@@ -1787,11 +1824,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
+@@ -1795,11 +1832,44 @@ impl<T: InvokeUiSession> Interface for Session<T> {
      }
  
      fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
