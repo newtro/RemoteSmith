@@ -138,17 +138,23 @@ cat "$V"
 codesign --verify --deep --strict "$APP" || die "codesign verification failed"
 spctl -a -t exec "$APP" || die "Gatekeeper rejected the app"
 xcrun stapler validate "$APP" >/dev/null || die "the notarization ticket is not stapled"
-# Every Mach-O in the bundle: Developer ID of the team, hardened runtime, secure timestamp.
+# Every Mach-O in the bundle: Developer ID of the team and a secure timestamp; executables also
+# the hardened runtime (the notary requires it of executables only; Xcode signs the embedded
+# frameworks without it, as for any app).
 bad=0
 while IFS= read -r -d '' f; do
-  file -b "$f" | grep -q 'Mach-O' || continue
+  kind="$(file -b "$f")"
+  [[ "$kind" == *Mach-O* ]] || continue
   info="$(codesign -dvv "$f" 2>&1)"
-  if ! grep -q "^Authority=Developer ID Application: .*($TEAM)" <<<"$info" \
-     || ! grep -qE '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<<"$info" \
-     || ! grep -q '^Timestamp=' <<<"$info"; then
-    echo "not Developer ID + runtime + timestamp: ${f#"$APP/"}"; bad=1
+  if ! grep -q "^Authority=Developer ID Application: .*($TEAM)" <<<"$info" || ! grep -q '^Timestamp=' <<<"$info"; then
+    echo "not Developer ID + timestamp: ${f#"$APP/"}"; bad=1
+  elif [[ "$kind" == *executable* ]] && ! grep -qE '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<<"$info"; then
+    echo "executable without the hardened runtime: ${f#"$APP/"}"; bad=1
+  else
+    echo "ok  ${f#"$APP/"}"
   fi
-done < <(find "$APP" -type f -print0)
+done < <(find "$APP" -type f -print0) >>"$V"
+grep -v '^ok ' "$V" | grep -E '^(not Developer|executable without)' || true
 ((bad == 0)) || die "some nested code is not signed for distribution (above)"
 helper="$APP/Contents/Library/LoginItems/$TRAY_HELPER_NAME"
 [[ -x "$APP/Contents/MacOS/service" ]] || die "the notarized app has no Contents/MacOS/service"
