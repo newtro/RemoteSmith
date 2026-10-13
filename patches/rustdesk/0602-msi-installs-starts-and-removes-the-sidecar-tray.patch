@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:09:13 -0400
+Subject: remotesmith(0602): msi installs, starts and removes the sidecar tray
+
+The Windows package carries remotesmith-tray.exe (DEC-20) in the install folder.
+The MSI adds an HKLM Run value for it (removed on uninstall, AC-39), starts it
+for the installing user after install like LaunchApp, and terminates it before
+its files are removed. Serves B5 / FLOW-1 / AC-1.
+---
+ res/msi/Package/Components/RustDesk.wxs     | 18 ++++++++++++++++++
+ res/msi/Package/Fragments/CustomActions.wxs |  2 ++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/res/msi/Package/Components/RustDesk.wxs b/res/msi/Package/Components/RustDesk.wxs
+index 3041c6099e30..6cefb668413f 100644
+--- a/res/msi/Package/Components/RustDesk.wxs
++++ b/res/msi/Package/Components/RustDesk.wxs
+@@ -23,6 +23,11 @@
+ 		<Property Id="TerminateProcesses" Value="AppTest.exe" />
+ 		<CustomAction Id="TerminateProcesses.SetParam" Return="check" Property="TerminateProcesses" Value="$(var.Product).exe" />
+ 		<CustomAction Id="TerminateBrokers.SetParam" Return="check" Property="TerminateProcesses" Value="RuntimeBroker_rustdesk.exe" />
++		<!-- RemoteSmith: the sidecar tray (remotesmith-tray.exe, DEC-20) ships in the install folder.
++		     Start it after install, for the installing user, as LaunchApp does (not for /qn installs,
++		     which run elevated); stop it before removal. -->
++		<CustomAction Id="LaunchRemoteSmithTray" Directory="INSTALLFOLDER_INNER" ExeCommand="&quot;[INSTALLFOLDER_INNER]remotesmith-tray.exe&quot;" Return="asyncNoWait" />
++		<CustomAction Id="TerminateRemoteSmithTray.SetParam" Return="check" Property="TerminateProcesses" Value="remotesmith-tray.exe" />
+ 		<CustomAction Id="SetPropertyIsServiceRunning.SetParam.AppName" Return="check" Property="AppName" Value="$(var.Product)" />
+ 		<CustomAction Id="SetPropertyIsServiceRunning.SetParam.PropertyName" Return="check" Property="PropertyName" Value="STOP_SERVICE" />
+ 		<CustomAction Id="SetPropertyServiceStop.SetParam.ConfigFile" Return="check" Property="ConfigFile" Value="[AppDataFolder]$(var.Product)\config\$(var.Product)2.toml" />
+@@ -99,6 +104,9 @@
+ 			<Custom Action="TerminateProcesses.SetParam" Before="TerminateProcesses"/>
+ 			<Custom Action="TerminateBrokers" Before="RemoveRuntimeGeneratedFiles"/>
+ 			<Custom Action="TerminateBrokers.SetParam" Before="TerminateBrokers"/>
++			<Custom Action="TerminateRemoteSmithTray" Before="RemoveRuntimeGeneratedFiles"/>
++			<Custom Action="TerminateRemoteSmithTray.SetParam" Before="TerminateRemoteSmithTray"/>
++			<Custom Action="LaunchRemoteSmithTray" After="InstallFinalize" Condition="(NOT UILevel=2) AND (NOT (Installed AND REMOVE AND NOT UPGRADINGPRODUCTCODE))"/>
+ 			<Custom Action="RemoveAmyuniIdd" Before="RemoveRuntimeGeneratedFiles"/>
+ 			<Custom Action="RemoveAmyuniIdd.SetParam" Before="RemoveAmyuniIdd"/>
+ 		</InstallExecuteSequence>
+@@ -139,6 +147,15 @@
+ 			</Component>
+ 		</StandardDirectory>
+ 
++		<!-- RemoteSmith: start the sidecar tray at every user's login (DEC-20). Removed on uninstall
++		     (AC-39). A standalone copy registers itself per user instead (remotesmith-tray.exe with its install-autostart
++		     option, HKCU Run); the tray's single-instance lock keeps one running. -->
++		<DirectoryRef Id="INSTALLFOLDER_INNER">
++			<Component Id="RemoteSmith.TrayAutostart" Guid="FC768EFB-93FD-43DC-8AFF-33F1B6CC59EC">
++				<RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="RemoteSmithTray" Type="string" Value="&quot;[INSTALLFOLDER_INNER]remotesmith-tray.exe&quot;" KeyPath="yes" />
++			</Component>
++		</DirectoryRef>
++
+ 		<!--<DirectoryRef Id="INSTALLFOLDER_INNER">
+ 			<Component Id="App.UninstallShortcut" Guid="FB0F2AC7-2AE5-4C54-B860-5E472620B6B1">
+ 				<Shortcut Id="App.UninstallShortcut" Name="!(loc.SC_Uninstall)" Description="!(loc.SC_Uninstall_Desc)" Target="[System6432Folder]msiexec.exe" Arguments="/x [ProductCode]" Icon="AppIcon" />
+@@ -152,6 +169,7 @@
+ 			<ComponentRef Id="App.StartMenu.Shortcut" />
+ 			<ComponentRef Id="App.StartMenu.ShortcutUninstall" />
+ 			<ComponentRef Id="App.StartupFolder.ShortcutTray" />
++			<ComponentRef Id="RemoteSmith.TrayAutostart" />
+ 
+ 			<!--$AutoComonentStart$-->
+ 			<!--$AutoComponentEnd$-->
+diff --git a/res/msi/Package/Fragments/CustomActions.wxs b/res/msi/Package/Fragments/CustomActions.wxs
+index 3a9811eb8a46..545d7ff4ac60 100644
+--- a/res/msi/Package/Fragments/CustomActions.wxs
++++ b/res/msi/Package/Fragments/CustomActions.wxs
+@@ -8,6 +8,8 @@
+ 		<CustomAction Id="RemoveRuntimeGeneratedFiles" DllEntry="RemoveRuntimeGeneratedFiles" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+ 		<CustomAction Id="TerminateProcesses" DllEntry="TerminateProcesses" Impersonate="yes" Execute="immediate" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+ 		<CustomAction Id="TerminateBrokers" DllEntry="TerminateProcesses" Impersonate="yes" Execute="immediate" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
++		<!-- RemoteSmith: stop the sidecar tray before its files are removed or replaced. -->
++		<CustomAction Id="TerminateRemoteSmithTray" DllEntry="TerminateProcesses" Impersonate="yes" Execute="immediate" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+ 		<CustomAction Id="AddFirewallRules" DllEntry="AddFirewallRules" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+ 		<CustomAction Id="RemoveFirewallRules" DllEntry="AddFirewallRules" Impersonate="no" Execute="deferred" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
+ 		<CustomAction Id="SetPropertyIsServiceRunning" DllEntry="SetPropertyIsServiceRunning" Impersonate="yes" Execute="immediate" Return="ignore" BinaryRef="Custom_Actions_Dll"/>
