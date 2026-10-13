@@ -32,7 +32,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/remotesmith_trust/lan_first.rs
 
 diff --git a/src/client.rs b/src/client.rs
-index c95e6465f674..1b4ee9f1fe7c 100644
+index 1234a6417bae..9958fd0cc7bf 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -424,7 +424,12 @@ impl Client {
@@ -49,7 +49,7 @@ index c95e6465f674..1b4ee9f1fe7c 100644
          // to-do: remember the port for each peer, so that we can retry easier
          if hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer) {
              let addr = if hbb_common::is_ip_str(peer) {
-@@ -455,6 +460,42 @@ impl Client {
+@@ -459,6 +464,42 @@ impl Client {
          };
          // RemoteSmith: on ID routes the identity hbbs vouches for is the real peer ID.
          interface.get_lch().write().unwrap().remotesmith_signed_id = peer.to_owned();
@@ -92,7 +92,7 @@ index c95e6465f674..1b4ee9f1fe7c 100644
          let (rendezvous_server, servers, contained) = if other_server.is_empty() {
              crate::get_rendezvous_server(1_000).await
          } else {
-@@ -1010,6 +1051,14 @@ impl Client {
+@@ -1023,6 +1064,14 @@ impl Client {
                              signed_id_pk = ph.pk.into();
                              relay_server = ph.relay_server;
                              peer_addr = AddrMangle::decode(&ph.socket_addr);
@@ -107,7 +107,7 @@ index c95e6465f674..1b4ee9f1fe7c 100644
                              feedback = ph.feedback;
                              webrtc_sdp_answer = ph.webrtc_sdp_answer;
                              let s = udp.0.take();
-@@ -2848,6 +2897,8 @@ pub struct LoginConfigHandler {
+@@ -2861,6 +2910,8 @@ pub struct LoginConfigHandler {
      id: String,
      /// RemoteSmith: the ID the host signed in this round's handshake (DEF-3).
      pub remotesmith_signed_id: String,
@@ -116,7 +116,7 @@ index c95e6465f674..1b4ee9f1fe7c 100644
      /// RemoteSmith: automatic reconnect policy, kept across rounds (DEF-7).
      pub remotesmith_retry: crate::remotesmith_trust::reconnect::RetryPolicy,
      pub conn_type: ConnType,
-@@ -3680,6 +3731,13 @@ impl LoginConfigHandler {
+@@ -3693,6 +3744,13 @@ impl LoginConfigHandler {
      pub fn handle_peer_info(&mut self, pi: &PeerInfo) {
          // RemoteSmith: logged in, so the session is up and any reconnect streak is over.
          self.remotesmith_retry.on_connected();

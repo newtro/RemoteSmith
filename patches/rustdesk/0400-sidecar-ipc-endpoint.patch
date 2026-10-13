@@ -56,7 +56,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/remotesmith/winsec.rs
 
 diff --git a/src/core_main.rs b/src/core_main.rs
-index b5a451ed842a..0b0698a0f63f 100644
+index 5fca8120a689..a8cc0d969b99 100644
 --- a/src/core_main.rs
 +++ b/src/core_main.rs
 @@ -379,7 +379,12 @@ pub fn core_main() -> Option<Vec<String>> {
@@ -73,7 +73,7 @@ index b5a451ed842a..0b0698a0f63f 100644
              return None;
          } else if args[0] == "--install-service" {
 diff --git a/src/ipc.rs b/src/ipc.rs
-index fdb1e147824f..dc4d51f844c6 100644
+index 404672267b76..1d6dd42c894c 100644
 --- a/src/ipc.rs
 +++ b/src/ipc.rs
 @@ -497,6 +497,8 @@ pub enum Data {
@@ -85,7 +85,7 @@ index fdb1e147824f..dc4d51f844c6 100644
      #[cfg(not(any(target_os = "android", target_os = "ios")))]
      Whiteboard((String, crate::whiteboard::CustomEvent)),
      ControlPermissionsRemoteModify(Option<bool>),
-@@ -1120,6 +1122,16 @@ async fn handle(data: Data, stream: &mut Connection) {
+@@ -1133,6 +1135,16 @@ async fn handle(data: Data, stream: &mut Connection) {
                      .await
              );
          }
@@ -103,10 +103,10 @@ index fdb1e147824f..dc4d51f844c6 100644
          Data::HasNoActiveConns(None) => {
              allow_err!(
 diff --git a/src/lib.rs b/src/lib.rs
-index 649f3ef955b0..34d90d90213c 100644
+index 9a1ad7c55f9d..41ded1862dc2 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -73,3 +73,7 @@ pub mod privacy_mode;
+@@ -77,3 +77,7 @@ pub mod privacy_mode;
  pub mod virtual_display_manager;
  
  mod kcp_stream;
@@ -1134,7 +1134,7 @@ index 000000000000..380aa669046f
 +}
 diff --git a/src/remotesmith/protocol.rs b/src/remotesmith/protocol.rs
 new file mode 100644
-index 000000000000..e07dc0e7b6c2
+index 000000000000..aa88c6fc7d93
 --- /dev/null
 +++ b/src/remotesmith/protocol.rs
 @@ -0,0 +1,1026 @@
@@ -3651,7 +3651,7 @@ index 000000000000..a7498aff1785
 +}
 diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
 new file mode 100644
-index 000000000000..be24f643574d
+index 000000000000..2cae610d94a4
 --- /dev/null
 +++ b/src/remotesmith/tests.rs
 @@ -0,0 +1,1008 @@
@@ -4714,10 +4714,10 @@ index 000000000000..437fa8e4c863
 +    Ok(Box::leak(sa) as *mut SECURITY_ATTRIBUTES)
 +}
 diff --git a/src/server.rs b/src/server.rs
-index 88341631b477..0c9d012b7150 100644
+index fa1c46f2f159..fa9ea5ec5e0d 100644
 --- a/src/server.rs
 +++ b/src/server.rs
-@@ -681,6 +681,9 @@ pub async fn start_server(is_server: bool, no_server: bool) {
+@@ -683,6 +683,9 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                  std::process::exit(-1);
              }
          });
