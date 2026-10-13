@@ -112,10 +112,10 @@ index a3c3d68f0508..7cbc1e5ed4c2 100644
  
      let _restore_session_guard = crate::common::SimpleCallOnReturn {
 diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
-index 46110a620039..88c31af47c4b 100644
+index 5628f57d2f3c..f0b9a35a9526 100644
 --- a/src/remotesmith/mod.rs
 +++ b/src/remotesmith/mod.rs
-@@ -30,6 +30,8 @@ mod relay;
+@@ -26,6 +26,8 @@ mod relay;
  mod server;
  #[cfg(windows)]
  mod winsec;

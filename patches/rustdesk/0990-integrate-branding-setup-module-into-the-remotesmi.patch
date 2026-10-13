@@ -726,7 +726,7 @@ index 54c9a18b81f9..000000000000
 -    }
 -}
 diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
-index 5628f57d2f3c..46110a620039 100644
+index f0b9a35a9526..88c31af47c4b 100644
 --- a/src/remotesmith/mod.rs
 +++ b/src/remotesmith/mod.rs
 @@ -11,6 +11,10 @@
