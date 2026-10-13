@@ -27,8 +27,16 @@ at all.
 - `vendor/rustdesk`: upstream RustDesk 1.5.0 as a submodule. RemoteSmith's changes are the
   patches in `patches/`, applied with `scripts/apply-patches.sh`.
 - `sidecar/`: the tray app. `deploy/server/`: the hbbs/hbbr deployment.
-- Build instructions that reproduce CI: [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) and
-  [docs/CI.md](docs/CI.md). The plan is in [docs/PLAN.md](docs/PLAN.md).
+- Local macOS build from a fresh clone (details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)):
+
+  ```sh
+  git submodule update --init --recursive --depth 1
+  scripts/apply-patches.sh    # without this you would be building stock RustDesk
+  scripts/bootstrap-mac.sh    # toolchain into ~/.cache/remotesmith (idempotent)
+  scripts/build-mac.sh        # -> build/mac/RemoteSmith.app; refuses an unpatched or partial stack
+  ```
+
+- CI: [docs/CI.md](docs/CI.md). The plan is in [docs/PLAN.md](docs/PLAN.md).
 
 ## License and credits
 
