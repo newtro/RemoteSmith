@@ -7,7 +7,9 @@ AC-45 (whole-product review finding 8, the AC-45 part). With the ID server down 
 blackholed, a connect by ID waited up to CONNECT_TIMEOUT (18 s) for the rendezvous TCP
 connect alone, after DNS/STUN/WebRTC setup, then showed a generic error. Client::start now
 bounds only the phase up to the rendezvous connection being up, 10 s from the start of the
-connect (the LAN-first attempt included), and ends it with "Server unreachable: ...". Once the
+connect (the LAN-first attempt included), and ends it with "Server unreachable: ..."; a
+rendezvous connect that fails outright (refused, unresolvable, no route) reads the same, with
+the OS cause appended. Once the
 server answered, punch, relay and data timeouts are upstream's; address routes never use the
 server and leave the phase at once. The text says "failed", so a first connect is not
 auto-retried, while a dropped session's reconnect streak still retries it.
@@ -15,14 +17,14 @@ The absolute 60 s reconnect deadline across in-flight attempts stays deferred.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/client.rs                            |  15 ++-
+ src/client.rs                            |  20 +++-
  src/remotesmith_trust/mod.rs             |   1 +
- src/remotesmith_trust/server_deadline.rs | 126 +++++++++++++++++++++++
- 3 files changed, 141 insertions(+), 1 deletion(-)
+ src/remotesmith_trust/server_deadline.rs | 144 +++++++++++++++++++++++
+ 3 files changed, 163 insertions(+), 2 deletions(-)
  create mode 100644 src/remotesmith_trust/server_deadline.rs
 
 diff --git a/src/client.rs b/src/client.rs
-index a3ae00670829..a86f642f8a52 100644
+index ba02eeef5575..6fa3ce686daf 100644
 --- a/src/client.rs
 +++ b/src/client.rs
 @@ -378,7 +378,12 @@ impl Client {
@@ -80,10 +82,15 @@ index a3ae00670829..a86f642f8a52 100644
      ) -> ResultType<(
          (
              Stream,
-@@ -880,6 +891,8 @@ impl Client {
+@@ -879,7 +890,12 @@ impl Client {
+             crate::refresh_rendezvous_server();
          }
          log::info!("rendezvous server: {}", rendezvous_server);
-         let mut socket = socket?;
+-        let mut socket = socket?;
++        // RemoteSmith (AC-45): a refused / unresolvable / unroutable ID server is "server
++        // unreachable" too, not a bare OS error.
++        let mut socket = socket
++            .map_err(|e| crate::remotesmith_trust::server_deadline::unreachable_because(&e))?;
 +        // RemoteSmith (AC-45): the ID server answered; from here on upstream's timeouts apply.
 +        server_phase.done();
          let mut my_addr = socket.local_addr();
@@ -100,10 +107,10 @@ index aa1326ce5840..3867b537490f 100644
 +pub mod server_deadline;
 diff --git a/src/remotesmith_trust/server_deadline.rs b/src/remotesmith_trust/server_deadline.rs
 new file mode 100644
-index 000000000000..59929dce2b47
+index 000000000000..1b7ca100768c
 --- /dev/null
 +++ b/src/remotesmith_trust/server_deadline.rs
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,144 @@
 +//! "Server unreachable" within 10 s (RemoteSmith AC-45, §8 "Lightsail down").
 +//!
 +//! A connect by ID first has to reach the ID server: upstream allows `CONNECT_TIMEOUT` (18 s)
@@ -126,6 +133,16 @@ index 000000000000..59929dce2b47
 +/// reason the user sees; contains "failed" so a first connect is not auto-retried (upstream's
 +/// rule for failed connects), while a dropped session's reconnect streak still retries it.
 +pub const SERVER_UNREACHABLE: &str = "Server unreachable: the ID server did not answer within 10 s, so connecting failed. Check the network, or connect by the peer's LAN IP address.";
++
++/// The error for a rendezvous connect that failed outright (refused: the VM is up but hbbs is
++/// stopped; no route; the name does not resolve) before the deadline: the same reason, with the
++/// cause.
++pub fn unreachable_because(cause: &dyn std::fmt::Display) -> hbb_common::anyhow::Error {
++    anyhow!(
++        "Server unreachable: cannot connect to the ID server ({}), so connecting failed. Check the network, or connect by the peer's LAN IP address.",
++        cause
++    )
++}
 +
 +/// Shared between the connect and its bound: set once the server phase is over.
 +#[derive(Clone, Default, Debug)]
@@ -195,6 +212,14 @@ index 000000000000..59929dce2b47
 +        })
 +        .await;
 +        assert_eq!(r.unwrap(), 7);
++    }
++
++    #[test]
++    fn a_refused_server_reads_as_server_unreachable_too() {
++        let e = unreachable_because(&"Connection refused (os error 61)").to_string();
++        assert!(e.starts_with("Server unreachable: "), "{e}");
++        assert!(e.contains("Connection refused (os error 61)"));
++        assert!(!crate::client::check_if_retry("error", "Connection Error", &e, false));
 +    }
 +
 +    #[tokio::test]

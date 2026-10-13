@@ -10,14 +10,16 @@ as reachable and, with no ID server, was reported "server unreachable". Saved pe
 the pinned host ID (identity option remotesmith-host-id) apart from the connection target:
 discovery matches by the host ID, the ID server is asked only about ID-route peers, and an
 address-only peer that does not answer on the LAN is "offline (not answering on the LAN)".
-A saved peer whose pin is this machine is not listed.
+A peer saved by IP counts as on the LAN only if its host answered discovery from that IP; one
+that moved (DHCP) shows "answers on the LAN at <ip>, not at the saved address". A saved peer
+whose pin is this machine is not listed.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/remotesmith/collect.rs  | 47 ++++++++++++++++++++--
- src/remotesmith/presence.rs | 58 ++++++++++++++++++++++-----
- src/remotesmith/tests.rs    | 80 +++++++++++++++++++++++++++++++++++++
- 3 files changed, 171 insertions(+), 14 deletions(-)
+ src/remotesmith/collect.rs  |  47 ++++++++++++++--
+ src/remotesmith/presence.rs |  94 ++++++++++++++++++++++++++------
+ src/remotesmith/tests.rs    | 104 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 225 insertions(+), 20 deletions(-)
 
 diff --git a/src/remotesmith/collect.rs b/src/remotesmith/collect.rs
 index e8da058cb149..32777103a0d4 100644
@@ -104,15 +106,18 @@ index e8da058cb149..32777103a0d4 100644
                  },
                  || rx.borrow().status.server.state == RegState::Registered,
 diff --git a/src/remotesmith/presence.rs b/src/remotesmith/presence.rs
-index 380aa669046f..f76eb99c8c5c 100644
+index 380aa669046f..cc30185e8b39 100644
 --- a/src/remotesmith/presence.rs
 +++ b/src/remotesmith/presence.rs
-@@ -24,10 +24,24 @@ pub struct Entry {
+@@ -24,10 +24,27 @@ pub struct Entry {
      pub probed: bool,
      /// Last time the peer was reachable by any route (Unix seconds).
      pub last_seen: Option<u64>,
 +    /// Saved by address: only the direct (LAN) route reaches it, the ID server is not asked.
 +    pub direct: bool,
++    /// Saved by address, and the host answered discovery from another address (DHCP moved it):
++    /// the saved address would not reach it.
++    pub lan_elsewhere: Option<std::net::IpAddr>,
  }
  
 +/// Keyed by connection target ([`Probe::target`]).
@@ -132,32 +137,47 @@ index 380aa669046f..f76eb99c8c5c 100644
  /// Pure mapping from probe results to the wire presence.
  pub fn presence_of(e: &Entry, registered: bool) -> Presence {
      if e.lan {
-@@ -39,6 +53,14 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
+@@ -39,6 +56,18 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
      if !e.probed {
          return Presence::Checking;
      }
 +    if e.direct {
-+        // Saved by address: the direct route is the only one, and it did not answer on the LAN.
++        // Saved by address: the direct route is the only one, and it did not answer on the LAN
++        // at that address.
 +        return Presence::Unavailable {
 +            reason: Reason::Offline,
-+            detail: Some("not answering on the LAN (saved by address)".into()),
++            detail: Some(match e.lan_elsewhere {
++                Some(ip) => format!("answers on the LAN at {ip}, not at the saved address"),
++                None => "not answering on the LAN (saved by address)".into(),
++            }),
 +            last_seen: e.last_seen,
 +        };
 +    }
      if e.id_online.is_none() || !registered {
          return Presence::Unavailable {
              reason: Reason::ServerUnreachable,
-@@ -53,14 +75,26 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
+@@ -53,14 +82,43 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
      }
  }
  
 -fn apply(table: &Table, ids: &[String], lan: &HashSet<String>, online: Option<&HashSet<String>>) {
-+/// Record one probe round. `lan` holds the host IDs that answered discovery, `online` the
-+/// targets the ID server reported online (`None`: it could not be asked).
++/// The IP of an address target (`ip`, `ip:port`, `[v6]:port`); `None` for host:port.
++pub fn target_ip(target: &str) -> Option<std::net::IpAddr> {
++    use std::net::{IpAddr, SocketAddr};
++    target
++        .parse::<IpAddr>()
++        .ok()
++        .or_else(|| target.parse::<SocketAddr>().ok().map(|s| s.ip()))
++        .map(|ip| ip.to_canonical())
++}
++
++/// Record one probe round. `lan` maps the host IDs that answered discovery to the address they
++/// answered from, `online` holds the targets the ID server reported online (`None`: it could not
++/// be asked). A peer saved by IP counts as on the LAN only if its host answered from that IP.
 +pub fn apply(
 +    table: &Table,
 +    peers: &[Probe],
-+    lan: &HashSet<String>,
++    lan: &HashMap<String, std::net::IpAddr>,
 +    online: Option<&HashSet<String>>,
 +) {
      let now = now_secs();
@@ -171,7 +191,13 @@ index 380aa669046f..f76eb99c8c5c 100644
 +    for p in peers {
 +        let e = t.entry(p.target.clone()).or_default();
 +        e.direct = p.direct;
-+        e.lan = lan.contains(&p.host);
++        let answered = lan.get(&p.host).map(|ip| ip.to_canonical());
++        let saved_ip = if p.direct { target_ip(&p.target) } else { None };
++        e.lan_elsewhere = match (answered, saved_ip) {
++            (Some(a), Some(s)) if a != s => Some(a),
++            _ => None,
++        };
++        e.lan = answered.is_some() && e.lan_elsewhere.is_none();
 +        e.id_online = if p.direct {
 +            None
 +        } else {
@@ -180,7 +206,35 @@ index 380aa669046f..f76eb99c8c5c 100644
          e.probed = true;
          if e.lan || e.id_online == Some(true) {
              e.last_seen = Some(now);
-@@ -218,7 +252,7 @@ pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
+@@ -160,10 +218,10 @@ fn ping_packet() -> Option<Vec<u8>> {
+ 
+ /// One bounded discovery round: broadcast upstream's discovery ping on every IPv4 interface and
+ /// collect pongs until [`LAN_ROUND`] has passed (absolute) or [`LAN_MAX_PACKETS`] arrived.
+-/// Returns the saved peers that answered.
+-pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
++/// Returns the saved peers that answered, with the address each answered from.
++pub fn discover_lan(saved: &HashSet<String>) -> HashMap<String, std::net::IpAddr> {
+     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+-    let mut found = HashSet::new();
++    let mut found = HashMap::new();
+     if saved.is_empty() {
+         return found;
+     }
+@@ -195,11 +253,11 @@ pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
+     while Instant::now() < deadline && packets < LAN_MAX_PACKETS && found.len() < saved.len() {
+         let mut got_any = false;
+         for s in &sockets {
+-            while let Ok((n, _)) = s.recv_from(&mut buf) {
++            while let Ok((n, from)) = s.recv_from(&mut buf) {
+                 got_any = true;
+                 packets += 1;
+                 if let Some(id) = accept_pong(&buf[..n], saved) {
+-                    found.insert(id);
++                    found.entry(id).or_insert(from.ip());
+                 }
+                 if packets >= LAN_MAX_PACKETS {
+                     break;
+@@ -218,7 +276,7 @@ pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
  /// this host is registered with the rendezvous server (an offline answer is only trusted then).
  pub fn run(
      table: Table,
@@ -189,7 +243,7 @@ index 380aa669046f..f76eb99c8c5c 100644
      registered: impl Fn() -> bool,
      changed: impl Fn(),
  ) {
-@@ -232,7 +266,7 @@ pub fn run(
+@@ -232,14 +290,14 @@ pub fn run(
              return;
          }
      };
@@ -198,7 +252,15 @@ index 380aa669046f..f76eb99c8c5c 100644
      let mut last_probe: Option<Instant> = None;
      loop {
          let cur = ids();
-@@ -247,10 +281,14 @@ pub fn run(
+         let due = last_probe.map_or(true, |t| t.elapsed() >= PROBE_INTERVAL);
+         if !(due || cur != last_ids) || cur.is_empty() {
+             if cur.is_empty() && cur != last_ids {
+-                apply(&table, &cur, &HashSet::new(), None);
++                apply(&table, &cur, &HashMap::new(), None);
+                 last_ids = cur;
+                 changed();
+             }
+@@ -247,10 +305,14 @@ pub fn run(
              continue;
          }
          last_probe = Some(Instant::now());
@@ -216,26 +278,27 @@ index 380aa669046f..f76eb99c8c5c 100644
              None
          };
 diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
-index 2cae610d94a4..e3669b316b4b 100644
+index 2cae610d94a4..6c88dd2baa79 100644
 --- a/src/remotesmith/tests.rs
 +++ b/src/remotesmith/tests.rs
 @@ -222,6 +222,7 @@ mod endpoint {
      use super::super::readiness;
      use super::super::server::{self, encode_bounded, ServerConfig};
      use super::*;
-+    use std::collections::HashSet;
++    use std::collections::{HashMap, HashSet};
      use std::time::Duration;
  
      // -------------------------------------------------------------- readiness parsers
-@@ -463,6 +464,7 @@ mod endpoint {
+@@ -463,6 +464,8 @@ mod endpoint {
              id_online: id,
              probed,
              last_seen: Some(7),
 +            direct: false,
++            lan_elsewhere: None,
          };
          assert_eq!(presence::presence_of(&e(false, None, false), true), Presence::Checking);
          assert_eq!(
-@@ -509,6 +511,7 @@ mod endpoint {
+@@ -509,6 +512,7 @@ mod endpoint {
                  id_online: None,
                  probed: true,
                  last_seen: Some(1),
@@ -243,7 +306,7 @@ index 2cae610d94a4..e3669b316b4b 100644
              },
          );
          let saved = vec![
-@@ -517,18 +520,21 @@ mod endpoint {
+@@ -517,18 +521,21 @@ mod endpoint {
                  alias: Some("me".into()),
                  platform: Some(Platform::Macos),
                  saved_at: None,
@@ -265,7 +328,7 @@ index 2cae610d94a4..e3669b316b4b 100644
              },
          ];
          let facts = super::super::host::HostFacts {
-@@ -615,6 +621,80 @@ mod endpoint {
+@@ -615,6 +622,103 @@ mod endpoint {
          // Upstream hides peers whose info has not arrived yet; so do we (and never delete them).
          assert!(collect::parse_peer_file("1".into(), None, "[options]\nalias='x'\n").is_none());
          assert!(collect::parse_peer_file("1".into(), None, "not toml [[[").is_none());
@@ -299,7 +362,8 @@ index 2cae610d94a4..e3669b316b4b 100644
 +        let table: Table = Default::default();
 +        let peers = vec![ip.probe(), by_id.probe(), unpinned.probe()];
 +        // Discovery answered by the IP peer's host ID; the ID server is down (cannot be asked).
-+        let lan: HashSet<String> = ["418222333".to_string()].into();
++        let lan: HashMap<String, std::net::IpAddr> =
++            [("418222333".to_string(), "192.168.1.20".parse().unwrap())].into();
 +        presence::apply(&table, &peers, &lan, None);
 +        let saved = vec![ip.clone(), by_id.clone(), unpinned.clone()];
 +        let facts = super::super::host::HostFacts {
@@ -325,11 +389,33 @@ index 2cae610d94a4..e3669b316b4b 100644
 +        // The ID server is asked only about ID-route peers, and an "online" answer never makes
 +        // an address-only peer reachable.
 +        let online: HashSet<String> = ["555".to_string(), "10.0.0.9:21118".to_string()].into();
-+        presence::apply(&table, &peers, &HashSet::new(), Some(&online));
++        presence::apply(&table, &peers, &HashMap::new(), Some(&online));
 +        let t = table.lock().unwrap().clone();
 +        assert_eq!(t["555"].id_online, Some(true));
 +        assert_eq!(t["10.0.0.9:21118"].id_online, None);
 +        assert!(!t["192.168.1.20"].lan && t["192.168.1.20"].last_seen.is_some(), "last seen kept");
++
++        // DHCP moved the host: it answers discovery from another address, which the saved
++        // address would not reach. Not reachable, and the detail says where it is now.
++        let moved: HashMap<String, std::net::IpAddr> =
++            [("418222333".to_string(), "192.168.1.77".parse().unwrap())].into();
++        presence::apply(&table, &peers, &moved, None);
++        let e = table.lock().unwrap()["192.168.1.20"].clone();
++        assert!(!e.lan);
++        match presence::presence_of(&e, false) {
++            Presence::Unavailable { reason: Reason::Offline, detail: Some(d), .. } => {
++                assert!(d.contains("192.168.1.77"), "{d}")
++            }
++            p => panic!("{p:?}"),
++        }
++        // An ID-route peer answering from anywhere is on the LAN.
++        let any: HashMap<String, std::net::IpAddr> =
++            [("555".to_string(), "192.168.1.9".parse().unwrap())].into();
++        presence::apply(&table, &peers, &any, None);
++        assert!(table.lock().unwrap()["555"].lan);
++        assert_eq!(presence::target_ip("10.0.0.9:21118"), Some("10.0.0.9".parse().unwrap()));
++        assert_eq!(presence::target_ip("[2001:db8::5]:21118"), Some("2001:db8::5".parse().unwrap()));
++        assert_eq!(presence::target_ip("host.example.com:21118"), None);
 +    }
 +
 +    #[test]

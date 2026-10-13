@@ -369,8 +369,10 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
 2. Loopback: on the host, `nc -vz 127.0.0.1 21118` connects (TCP accept), but the host log shows
    `direct access from 127.0.0.1:... refused: interface lo0 is not a LAN interface` and no
    handshake follows (`nc 127.0.0.1 21118 | xxd` prints nothing and the connection closes).
-3. VPN source: join the host and a second device to a VPN (WireGuard/Tailscale). From the second
-   device, `nc -vz <host VPN address> 21118` and `nc -vz <host LAN address> 21118` over the
+3. VPN source (a routed VPN, no NAT onto the LAN: plain WireGuard/Tailscale peer-to-peer, not a
+   Tailscale subnet router or a VPN server on the LAN that masquerades; those make remote users
+   look like a LAN host, which no layer-3 check can tell apart). Join the host and a second
+   device to the VPN. From the second device, `nc -vz <host VPN address> 21118` and `nc -vz <host LAN address> 21118` over the
    VPN. Both are refused in the host log (`interface utun.. is not a LAN interface`, or
    `source is outside the local subnet of en0`); a RemoteSmith controller connecting that way
    gets no session (it reports the peer as gone / timed out, never a password prompt).
@@ -384,7 +386,9 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
    (no log line on the host at all) or, if the VPN subnet counts as local, refused by the app
    (log line as in step 3). Repeat for the MSI install. Uninstall: `show rule` finds none.
 6. Scan flood: `for i in $(seq 200); do nc -z 127.0.0.1 21118; done` on the host: at most one
-   refusal line per second in the log, with "(N more refused in the last second)".
+   refusal line per second in the log, with "(N more refused in the last second)", and the
+   service stays responsive (a LAN connect right after still opens).
+7. Moved by DHCP (C1-3 covers the tray side): not applicable here.
 
 ### C1-2 (AC-43, FLOW-2) LAN-only host shows its fingerprint before any registration
 1. On a host set up with "Direct LAN only" (B1-2) that never had an ID server (fresh profile:
@@ -402,6 +406,9 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
 2. Quit RemoteSmith on that peer: within about 15 s the tray shows it `unavailable: offline`
    with "not answering on the LAN (saved by address)" and a last-seen time, not "server
    unreachable".
+3. Start it again and give the peer a different LAN IP (DHCP reservation change, or a manual
+   address): the tray shows `unavailable: offline` with "answers on the LAN at <new IP>, not at
+   the saved address" (never `reachable`, since a click would dial the old IP).
 
 ### C1-4 (AC-39, AC-43) Forget peer ends its sessions; the next connection enrolls again
 1. Enroll the peer (B3-1) with a remembered password; open a session to it.
@@ -423,5 +430,8 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
 2. Connect to the peer by ID and start a stopwatch: within 10 s the session shows
    "Server unreachable: the ID server did not answer within 10 s ..." (controller log:
    "ID server not reached within 10s; giving up"). No automatic retry starts.
-3. With the server back, connect: the session opens normally (relay included; a relayed session
+3. Stop only hbbs/hbbr on the VM (the PLAN §14 recipe: the VM answers, the port refuses), or
+   point the controller's ID server at an unresolvable name: the session shows
+   "Server unreachable: cannot connect to the ID server (<OS error>) ..." at once.
+4. With the server back, connect: the session opens normally (relay included; a relayed session
    taking longer than 10 s to set up after the server answered is not cut).

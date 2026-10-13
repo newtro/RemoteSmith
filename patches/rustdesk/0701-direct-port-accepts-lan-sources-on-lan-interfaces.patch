@@ -13,7 +13,9 @@ program. Now:
   that are not a VPN product's virtual adapter; never loopback, utun/tun/tap, ppp, ipsec,
   bridge, WireGuard, Tailscale, ZeroTier, ...), and the source must be on that address's
   subnet. Anything else is dropped unread and logged (rate-limited). Unknown interfaces fail
-  closed.
+  closed. The interface list is cached for 2 s, so a flood of the port is not a flood of
+  enumerations. Limitation: a VPN gateway or router on the LAN that NATs remote users onto its
+  own LAN address looks like a LAN host; that is outside what a layer-3 check can see.
 - Windows (netsh install script and the MSI custom action): the inbound program rule is split
   into UDP, TCP on every port but 21118 (as upstream), and TCP 21118 from LocalSubnet only,
   without edge traversal. Same rule name, so uninstall still removes them all; the MSI remove
@@ -21,12 +23,12 @@ program. Now:
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- res/msi/CustomActions/FirewallRules.cpp | 110 ++++-
+ res/msi/CustomActions/FirewallRules.cpp | 110 +++-
  src/platform/windows.rs                 |  13 +-
- src/remotesmith_trust/direct_access.rs  | 560 ++++++++++++++++++++++++
+ src/remotesmith_trust/direct_access.rs  | 650 ++++++++++++++++++++++++
  src/remotesmith_trust/mod.rs            |   1 +
- src/rendezvous_mediator.rs              |   5 +
- 5 files changed, 672 insertions(+), 17 deletions(-)
+ src/rendezvous_mediator.rs              |   8 +-
+ 5 files changed, 764 insertions(+), 18 deletions(-)
  create mode 100644 src/remotesmith_trust/direct_access.rs
 
 diff --git a/res/msi/CustomActions/FirewallRules.cpp b/res/msi/CustomActions/FirewallRules.cpp
@@ -227,10 +229,10 @@ index a3c3d68f0508..b2b96a541d05 100644
  pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
 diff --git a/src/remotesmith_trust/direct_access.rs b/src/remotesmith_trust/direct_access.rs
 new file mode 100644
-index 000000000000..49ffc4d8f2f8
+index 000000000000..a54b399f58f8
 --- /dev/null
 +++ b/src/remotesmith_trust/direct_access.rs
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,650 @@
 +//! The direct-access port (21118 by default) accepts LAN peers only (RemoteSmith DEF-14, AC-51).
 +//!
 +//! Upstream's direct server listens on every interface and serves any source. RemoteSmith keeps
@@ -340,6 +342,18 @@ index 000000000000..49ffc4d8f2f8
 +    "f5 networks",
 +    "checkpoint",
 +    "check point",
++    "zscaler",
++    "sophos",
++    "barracuda",
++    "pritunl",
++    "nebula",
++    // Host-internal virtual networks (VM and WSL guests), never the physical LAN. A Hyper-V
++    // *external* switch ("vEthernet (<name>)" bound to the NIC) stays allowed.
++    "vmware",
++    "virtualbox",
++    "host-only",
++    "(wsl",
++    "default switch",
 +];
 +
 +/// Interface name prefixes that are never LAN on Linux/BSD.
@@ -459,6 +473,33 @@ index 000000000000..49ffc4d8f2f8
 +    }
 +}
 +
++/// macOS getifaddrs may return link-local IPv6 addresses with the KAME-embedded scope in the
++/// second 16-bit group (fe80:N::...); the socket's own address never has it.
++fn strip_embedded_scope(ip: std::net::Ipv6Addr) -> std::net::Ipv6Addr {
++    let mut s = ip.segments();
++    if (s[0] & 0xffc0) == 0xfe80 {
++        s[1] = 0;
++    }
++    std::net::Ipv6Addr::from(s)
++}
++
++/// This machine's interfaces, at most 2 s old: one listing serves a burst of connections, so a
++/// flood of the port cannot turn into a flood of interface enumerations.
++pub fn local_interfaces_cached() -> Vec<Iface> {
++    use std::sync::Mutex;
++    use std::time::{Duration, Instant};
++    static CACHE: Mutex<Option<(Instant, Vec<Iface>)>> = Mutex::new(None);
++    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some((at, v)) = c.as_ref() {
++        if at.elapsed() < Duration::from_secs(2) {
++            return v.clone();
++        }
++    }
++    let v = local_interfaces();
++    *c = Some((Instant::now(), v.clone()));
++    v
++}
++
 +/// This machine's interfaces, now.
 +pub fn local_interfaces() -> Vec<Iface> {
 +    default_net::get_interfaces()
@@ -475,7 +516,11 @@ index 000000000000..49ffc4d8f2f8
 +                .ipv4
 +                .iter()
 +                .map(|n| (IpAddr::V4(n.addr), n.prefix_len))
-+                .chain(i.ipv6.iter().map(|n| (IpAddr::V6(n.addr), n.prefix_len)))
++                .chain(
++                    i.ipv6
++                        .iter()
++                        .map(|n| (IpAddr::V6(strip_embedded_scope(n.addr)), n.prefix_len)),
++                )
 +                .collect(),
 +            name: i.name,
 +        })
@@ -512,7 +557,7 @@ index 000000000000..49ffc4d8f2f8
 +/// The gate `direct_server` runs on every accepted connection before handing it on. Logs and
 +/// returns false for a refused one; the caller drops the stream unread.
 +pub async fn admit(local: SocketAddr, peer: SocketAddr) -> bool {
-+    let ifaces = match hbb_common::tokio::task::spawn_blocking(local_interfaces).await {
++    let ifaces = match hbb_common::tokio::task::spawn_blocking(local_interfaces_cached).await {
 +        Ok(v) => v,
 +        Err(e) => {
 +            hbb_common::log::error!("direct access: cannot list interfaces: {e}");
@@ -753,6 +798,23 @@ index 000000000000..49ffc4d8f2f8
 +        assert!(!w(Kind::Tunnel, "Teredo Tunneling Pseudo-Interface"));
 +        assert!(!w(Kind::Other, "Wintun Userspace Tunnel"));
 +        assert!(!w(Kind::Loopback, "Loopback Pseudo-Interface 1"));
++        for desc in [
++            "vEthernet (WSL) Hyper-V Virtual Ethernet Adapter",
++            "vEthernet (Default Switch) Hyper-V Virtual Ethernet Adapter #2",
++            "VMware Network Adapter VMnet8 VMware Virtual Ethernet Adapter for VMnet8",
++            "Ethernet 2 VirtualBox Host-Only Ethernet Adapter",
++            "Zscaler Network Adapter",
++        ] {
++            assert!(!w(Kind::Ethernet, desc), "{desc}");
++        }
++        assert_eq!(
++            strip_embedded_scope("fe80:11::1896:9345:916b:b72b".parse().unwrap()),
++            "fe80::1896:9345:916b:b72b".parse::<std::net::Ipv6Addr>().unwrap()
++        );
++        assert_eq!(
++            strip_embedded_scope("2001:db8:1::1".parse().unwrap()),
++            "2001:db8:1::1".parse::<std::net::Ipv6Addr>().unwrap()
++        );
 +        let ifs = vec![
 +            iface(12, "{A}", Kind::Ethernet, "Ethernet Realtek PCIe GbE", &[("192.168.1.40", 24)]),
 +            iface(30, "{B}", Kind::Ethernet, "OpenVPN TAP-Windows6", &[("10.8.0.6", 24)]),
@@ -765,6 +827,36 @@ index 000000000000..49ffc4d8f2f8
 +            check(Os::Windows, &mapped("10.8.0.6", 21118), &mapped("10.8.0.1", 5), &ifs),
 +            Err(Refusal::NotLan { .. })
 +        ));
++    }
++
++    /// Real sockets on this machine, through the dual-stack listener direct_server uses: a
++    /// connection from this host's own LAN address is admitted, one over loopback is not.
++    #[hbb_common::tokio::test]
++    async fn live_listener_admits_lan_and_refuses_loopback() {
++        use hbb_common::tokio::net::TcpStream;
++        let listener = hbb_common::tcp::listen_any(0).await.unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let accept_one = |to: SocketAddr| {
++            let listener = &listener;
++            async move {
++                let _c = TcpStream::connect(to).await.unwrap();
++                let (s, peer) = listener.accept().await.unwrap();
++                admit(s.local_addr().unwrap(), peer).await
++            }
++        };
++        assert!(!accept_one(sa(&format!("127.0.0.1:{port}"))).await, "loopback admitted");
++        let lan = local_interfaces().into_iter().find_map(|i| {
++            is_lan_interface(this_os(), &i)
++                .then(|| i.nets.iter().find(|(ip, p)| ip.is_ipv4() && *p >= 8 && *p <= 30).map(|(ip, _)| *ip))
++                .flatten()
++        });
++        match lan {
++            Some(ip) => assert!(
++                accept_one(SocketAddr::new(ip, port)).await,
++                "this host's own LAN address {ip} refused"
++            ),
++            None => eprintln!("no IPv4 LAN interface on this machine; LAN half skipped"),
++        }
 +    }
 +
 +    #[test]
@@ -801,10 +893,18 @@ index b37269296eb7..0d23668ff3fa 100644
  pub mod password_epoch;
 +pub mod direct_access;
 diff --git a/src/rendezvous_mediator.rs b/src/rendezvous_mediator.rs
-index ecac01867bbe..b6a350d4ce31 100644
+index ecac01867bbe..81929f1c86bd 100644
 --- a/src/rendezvous_mediator.rs
 +++ b/src/rendezvous_mediator.rs
-@@ -1425,6 +1425,11 @@ async fn direct_server(server: ServerPtr) {
+@@ -1419,12 +1419,18 @@ async fn direct_server(server: ServerPtr) {
+             }
+             if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await {
+                 stream.set_nodelay(true).ok();
+-                log::info!("direct access from {}", addr);
++                // RemoteSmith: logged by direct_access::admit (rate-limited for refusals).
++                log::debug!("direct access from {}", addr);
+                 let local_addr = stream
+                     .local_addr()
                      .unwrap_or(Config::get_any_listen_addr(true));
                  let server = server.clone();
                  tokio::spawn(async move {
