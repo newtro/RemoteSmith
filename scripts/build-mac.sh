@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the Flutter macOS app (arm64, unsigned) from vendor/rustdesk the way upstream CI does.
 # Output: build/mac/<PRODUCT_NAME>.app, i.e. RemoteSmith.app once the branding patches are applied
-# (+ build/mac/build-*.log). Run scripts/bootstrap-mac.sh first.
+# (+ build/mac/build-*.log), with the sidecar embedded as a login-item helper (scripts/lib/mac-bundle.sh).
+# Run scripts/bootstrap-mac.sh first.
 #
 # Mirrors, at RustDesk 1.5.0:
 #   bridge.yml:86-104            generate the flutter_rust_bridge files (CI does this on Linux)
@@ -9,8 +10,11 @@
 #   flutter-build.yml:911-920    MIN_MACOS_VERSION=12.3 edits, then
 #                                ./build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit
 #
-# Usage: scripts/build-mac.sh [--skip-bridge]
+# Usage: scripts/build-mac.sh [--skip-bridge] [--archive <path.xcarchive> --team <TEAMID>]
 #   --skip-bridge   reuse the existing generated bridge files even if the sources changed
+#   --archive       also `xcodebuild archive` the Runner (signed with the team's Apple Development
+#                   identity) while build.py's outputs and the CI edits are still in place, and add
+#                   the service + tray helper to it. scripts/release-mac.sh exports it.
 #
 # The cargo target dir is shared across worktrees at ~/.cache/remotesmith/target-mac (build.py and
 # the Xcode project hard-code ../../target/release, so vendor/rustdesk/target is a symlink to it).
@@ -19,14 +23,24 @@ set -euo pipefail
 # shellcheck source=lib/mac-env.sh
 source "$(dirname "$0")/lib/mac-env.sh"
 
+# shellcheck source=lib/mac-bundle.sh
+source "$(dirname "$0")/lib/mac-bundle.sh"
+
 skip_bridge=0
-for arg in "$@"; do
-  case "$arg" in
+archive_path=""
+team=""
+while (($#)); do
+  case "$1" in
     --skip-bridge) skip_bridge=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
-    *) die "unknown argument: $arg" ;;
+    --archive) archive_path="${2:?--archive needs a path}"; shift ;;
+    --team) team="${2:?--team needs a team id}"; shift ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
   esac
+  shift
 done
+[[ -z "$archive_path" || -n "$team" ]] || die "--archive needs --team"
+[[ -z "$archive_path" || "$archive_path" == *.xcarchive ]] || die "--archive path must end in .xcarchive"
 
 [[ -f "$RUSTDESK_DIR/build.py" ]] || die "vendor/rustdesk is not checked out; run: git submodule update --init --recursive --depth 1"
 [[ -f "$RUSTDESK_DIR/libs/hbb_common/Cargo.toml" ]] || die "libs/hbb_common is not checked out; run: git submodule update --init --recursive --depth 1"
@@ -211,6 +225,41 @@ app_src="$RUSTDESK_DIR/flutter/build/macos/Build/Products/Release/$app_name.app"
 app_out="$OUT_DIR/$app_name.app"
 rm -rf "$app_out"
 ditto "$app_src" "$app_out"
+
+# --- RemoteSmith bundle extras: the sidecar as a login-item helper (scripts/lib/mac-bundle.sh) ---
+app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_src/Contents/Info.plist")"
+app_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_src/Contents/Info.plist")"
+build_tray_helper "$OUT_DIR" "$app_version" "$app_build" "$app_src/Contents/Resources/AppIcon.icns"
+tray_helper="$OUT_DIR/$TRAY_HELPER_NAME"
+embed_bundle_extras "$app_out" "$tray_helper" "$CARGO_TARGET_CACHE/release/service"
+
+# --- release archive (scripts/release-mac.sh) ----------------------------------------------------
+# Flutter's documented route to a distributable macOS app is an Xcode archive of the Runner scheme
+# after `flutter build macos` has generated Flutter/ephemeral and installed the pods (build.py just
+# did both, and the Rust dylib in ../../target/release is the one it built). It runs here, inside
+# the build lock and before the CI edits are restored, so the archive sees exactly what build.py
+# built. Command-line build settings apply to every target, Pods included: arm64 only (the dylib
+# is single-arch, as in build.py), CI's MIN_MACOS_VERSION, and automatic signing with the team's
+# Apple Development identity; -exportArchive later re-signs everything with Developer ID.
+if [[ -n "$archive_path" ]]; then
+  log "xcodebuild archive -> $archive_path (team $team)"
+  rm -rf "$archive_path"
+  mkdir -p "$(dirname "$archive_path")"
+  archive_log="$OUT_DIR/archive-$(date +%Y%m%d-%H%M%S).log"
+  if ! (cd flutter/macos && xcodebuild archive -workspace Runner.xcworkspace -scheme Runner -configuration Release \
+          -archivePath "$archive_path" -derivedDataPath "$OUT_DIR/archive-derived-data" -allowProvisioningUpdates \
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION" \
+          DEVELOPMENT_TEAM="$team" CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY="Apple Development" \
+          COMPILER_INDEX_STORE_ENABLE=NO) >"$archive_log" 2>&1; then
+    grep -E 'error:|ARCHIVE FAILED' "$archive_log" | tail -20 >&2
+    die "xcodebuild archive failed; full log: $archive_log"
+  fi
+  archived_app="$archive_path/Products/Applications/$app_name.app"
+  [[ -x "$archived_app/Contents/MacOS/$app_name" ]] || die "archive has no $app_name.app (log: $archive_log)"
+  embed_bundle_extras "$archived_app" "$tray_helper" "$CARGO_TARGET_CACHE/release/service"
+  reseal_with_extras "$archived_app"
+  echo "archive: $archive_path (signed by $(signing_authority "$archived_app"))"
+fi
 # Make the local copy launchable. Xcode leaves the app ad-hoc signed WITH the hardened runtime, and
 # then library validation refuses the ad-hoc FlutterMacOS.framework ("different Team IDs"), so the
 # app dies in dyld. That is the same "unsigned" app CI uploads; CI only launches it after signing

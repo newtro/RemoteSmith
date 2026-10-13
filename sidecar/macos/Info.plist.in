@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Info.plist of the login-item helper "RemoteSmith Tray.app" that scripts/lib/mac-bundle.sh
+     builds from the sidecar and embeds at RemoteSmith.app/Contents/Library/LoginItems/.
+     The bundle id must match remotesmithTrayBundleId in patch 0601 (SMAppService.loginItem).
+     @VERSION@, @BUILD@ and @MIN_MACOS@ are filled in by the script. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>remotesmith-tray</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.johnnycode.remotesmith.tray</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>RemoteSmith Tray</string>
+	<key>CFBundleDisplayName</key>
+	<string>RemoteSmith Tray</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@BUILD@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>@MIN_MACOS@</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>RemoteSmith, AGPL-3.0</string>
+</dict>
+</plist>

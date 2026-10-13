@@ -126,11 +126,30 @@ pub fn uninstall_run_key() -> io::Result<bool> {
     }
 }
 
+/// True when `exe` is the login-item helper embedded in RemoteSmith.app
+/// (`…/Contents/Library/LoginItems/RemoteSmith Tray.app/Contents/MacOS/…`). That copy is started
+/// at login by the app through SMAppService (patch 0601), so it must not also get a LaunchAgent.
+pub fn is_bundled_login_item(exe: &Path) -> bool {
+    let comps: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    comps.windows(4).any(|w| {
+        w[0] == "Contents"
+            && w[1] == "Library"
+            && w[2] == "LoginItems"
+            && w[3].to_string_lossy().ends_with(".app")
+    })
+}
+
 /// CLI entry: install for the current user and OS. Returns a message for stdout.
 pub fn install() -> io::Result<String> {
     let exe = std::env::current_exe()?;
     #[cfg(target_os = "macos")]
     {
+        if is_bundled_login_item(&exe) {
+            return Err(io::Error::other(
+                "this copy is RemoteSmith.app's login item and already starts at login \
+                 (System Settings > General > Login Items); --install-autostart is for a standalone build",
+            ));
+        }
         let home = dirs::home_dir().ok_or_else(|| io::Error::other("no home directory"))?;
         let p = install_launch_agent(&home, &exe, &crate::logging::log_dir())?;
         Ok(format!(
@@ -249,6 +268,19 @@ mod tests {
         let bad = dir.path().join("file");
         std::fs::write(&bad, b"x").unwrap();
         assert!(install_launch_agent(dir.path(), Path::new("/x/tray"), &bad).is_err());
+    }
+
+    #[test]
+    fn detects_bundled_login_item() {
+        assert!(is_bundled_login_item(Path::new(
+            "/Applications/RemoteSmith.app/Contents/Library/LoginItems/RemoteSmith Tray.app/Contents/MacOS/remotesmith-tray"
+        )));
+        assert!(!is_bundled_login_item(Path::new(
+            "/Users/me/src/sidecar/target/release/remotesmith-tray"
+        )));
+        assert!(!is_bundled_login_item(Path::new(
+            "/Applications/RemoteSmith.app/Contents/MacOS/remotesmith-tray"
+        )));
     }
 
     #[test]
