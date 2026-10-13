@@ -108,6 +108,10 @@ check_patch_stack() { # repo-dir pin label patches-subdir
     return 1
   fi
   commits="$(git -C "$dir" rev-list --reverse HEAD "^$pin")"
+  if [[ -z "$commits" ]] && ((n)); then
+    echo "$label: none of the $n patches/$sub patches is applied (HEAD is the upstream pin)" >&2
+    return 1
+  fi
   for c in $commits; do
     if ((i >= n)); then
       echo "$label: commit $(git -C "$dir" log -1 --format='%h %s' "$c") is not in patches/$sub (run scripts/export-patches.sh)" >&2
