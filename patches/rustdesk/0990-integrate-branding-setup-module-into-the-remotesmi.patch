@@ -18,10 +18,10 @@ re-export it from the module root.
  create mode 100644 src/remotesmith/setup.rs
 
 diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
-index ba9df1c76701..659459fe3b69 100644
+index f8fa58bd8dbb..2fe00866486e 100644
 --- a/src/flutter_ffi.rs
 +++ b/src/flutter_ffi.rs
-@@ -2516,7 +2516,7 @@ pub fn is_custom_client() -> SyncReturn<bool> {
+@@ -2534,7 +2534,7 @@ pub fn is_custom_client() -> SyncReturn<bool> {
      SyncReturn(crate::common::is_custom_client())
  }
  

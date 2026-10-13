@@ -248,7 +248,7 @@ index bca2739b889c..5880a9c93a18 100644
      if (pNetFwRule2 != NULL)
      {
 diff --git a/src/platform/windows.rs b/src/platform/windows.rs
-index a3c3d68f0508..b2b96a541d05 100644
+index 7cbc1e5ed4c2..f19fd404357b 100644
 --- a/src/platform/windows.rs
 +++ b/src/platform/windows.rs
 @@ -1576,10 +1576,19 @@ fn get_after_install(
