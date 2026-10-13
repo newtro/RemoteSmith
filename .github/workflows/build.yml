@@ -713,8 +713,7 @@ jobs:
           build_tray_helper "$RUNNER_TEMP" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" \
             "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" "$app/Contents/Resources/AppIcon.icns"
           embed_bundle_extras "$app" "$RUNNER_TEMP/$TRAY_HELPER_NAME" vendor/rustdesk/target/release/service
-          codesign --force --deep --sign - --entitlements vendor/rustdesk/flutter/macos/Runner/Release.entitlements "$app"
-          codesign --verify --deep --strict "$app"
+          adhoc_seal "$app" vendor/rustdesk/flutter/macos/Runner/Release.entitlements
           "$app/Contents/Library/LoginItems/$TRAY_HELPER_NAME/Contents/MacOS/remotesmith-tray" --version
 
       - name: create unsigned dmg

@@ -54,17 +54,42 @@ signing_authority() {
   codesign -dvv "$1" 2>&1 | sed -n 's/^Authority=//p' | head -n1
 }
 
+# signing_identity_hash <code>: SHA-1 of the leaf certificate <code> is signed with, which is how
+# `security find-identity` names the identity. Signing by hash, not by name, cannot be ambiguous
+# when the keychain holds two certificates with the same name (-allowProvisioningUpdates can add
+# a new one).
+signing_identity_hash() {
+  local dir hash code
+  code="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  dir="$(mktemp -d)"
+  (cd "$dir" && codesign -d --extract-certificates "$code" 2>/dev/null) || true
+  [[ -f "$dir/codesign0" ]] && hash="$(shasum -a 1 "$dir/codesign0" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+  rm -rf "$dir"
+  echo "${hash:-}"
+}
+
 # reseal_with_extras <app>: after embed_bundle_extras, sign the new nested code with the identity
 # the app already carries (hardened runtime, as Xcode signed the rest), then re-seal the app,
 # keeping its identifier, entitlements, requirements and flags. Inside out, as codesign requires.
 reseal_with_extras() {
   local app="$1" id
-  id="$(signing_authority "$app")"
+  id="$(signing_identity_hash "$app")"
   [[ -n "$id" ]] || die "$app is not signed with a certificate; cannot re-seal it"
+  security find-identity -v -p codesigning | grep -q " $id " \
+    || die "the identity that signed $app ($(signing_authority "$app"), $id) is not in the keychain"
   local args=(--force --options runtime --timestamp=none --sign "$id")
   codesign "${args[@]}" "$app/Contents/MacOS/service"
   codesign "${args[@]}" "$app/Contents/Library/LoginItems/$TRAY_HELPER_NAME"
   codesign --force --timestamp=none --sign "$id" \
     --preserve-metadata=identifier,entitlements,requirements,flags,runtime "$app"
   codesign --verify --deep --strict "$app" || die "re-sealed $app does not verify"
+}
+
+# adhoc_seal <app> <entitlements>: ad-hoc signature for local and CI builds, without the hardened
+# runtime (an ad-hoc hardened app fails library validation on the ad-hoc Flutter frameworks).
+# Nested code first, without entitlements; then the app alone with upstream's entitlements.
+adhoc_seal() {
+  codesign --force --deep --sign - "$1"
+  codesign --force --sign - --entitlements "$2" "$1"
+  codesign --verify --deep --strict "$1"
 }

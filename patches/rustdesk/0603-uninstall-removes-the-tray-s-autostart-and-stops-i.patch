@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:28:09 -0400
+Subject: remotesmith(0603): uninstall removes the tray's autostart and stops
+ it
+
+macOS: uninstalling the service unregisters the tray login item (SMAppService),
+removes a standalone LaunchAgent, quits the tray and records it as removed so
+reopening the app does not bring it back until the service is installed again.
+Windows: the installer adds an HKLM Run value for remotesmith-tray.exe; upgrade
+stops the tray; uninstall stops it and deletes the HKLM and HKCU Run values.
+Serves B5 / AC-39 / FLOW-1.
+---
+ src/platform/macos.rs             |   4 +
+ src/platform/windows.rs           |   9 ++
+ src/remotesmith/mod.rs            |   2 +
+ src/remotesmith/tray_autostart.rs | 136 ++++++++++++++++++++++++++++++
+ 4 files changed, 151 insertions(+)
+ create mode 100644 src/remotesmith/tray_autostart.rs
+
+diff --git a/src/platform/macos.rs b/src/platform/macos.rs
+index 813068efdc50..ac81b3aecfd7 100644
+--- a/src/platform/macos.rs
++++ b/src/platform/macos.rs
+@@ -201,6 +201,8 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
+         return true;
+     }
+ 
++    // RemoteSmith: installing the service brings the tray login item back (patch 0603).
++    crate::remotesmith::tray_autostart::macos_allow_tray();
+     let Some(install_script) = PRIVILEGES_SCRIPTS_DIR.get_file("install.scpt") else {
+         return false;
+     };
+@@ -399,6 +401,8 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
+                     uninstalled
+                 );
+                 if uninstalled {
++                    // RemoteSmith: uninstall also removes the tray's autostart (patch 0603, AC-39).
++                    crate::remotesmith::tray_autostart::macos_remove_tray();
+                     if !show_new_window {
+                         let _ = crate::ipc::close_all_instances();
+                         // leave ipc a little time
+diff --git a/src/platform/windows.rs b/src/platform/windows.rs
+index a3c3d68f0508..7cbc1e5ed4c2 100644
+--- a/src/platform/windows.rs
++++ b/src/platform/windows.rs
+@@ -1744,6 +1744,7 @@ reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
+ {mk_shortcut_commands}
+ {uninstall_shortcut_commands}
+ {tray_shortcuts}
++{remotesmith_tray}
+ {shortcuts}
+ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
+ {dels}
+@@ -1766,6 +1767,8 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
+         dels = if debug { "" } else { &dels },
+         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
+         import_config = get_import_config(&exe),
++        // RemoteSmith (patch 0603): the tray starts at login when it was installed with the app.
++        remotesmith_tray = crate::remotesmith::tray_autostart::windows_install_cmds(&path),
+     );
+     run_cmds(cmds, debug, "install")?;
+     run_after_run_cmds(silent);
+@@ -1847,6 +1850,7 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String>
+     {uninstall_cert_cmd}
+     reg delete {subkey} /f
+     {uninstall_amyuni_idd}
++    {remotesmith_tray}
+     if exist \"{path}\" rd /s /q \"{path}\"
+     if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
+     if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
+@@ -1855,6 +1859,8 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String>
+         before_uninstall=get_before_uninstall(kill_self),
+         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
+         app_name = crate::get_app_name(),
++        // RemoteSmith (patch 0603, AC-39): stop the tray and remove its autostart.
++        remotesmith_tray = crate::remotesmith::tray_autostart::windows_uninstall_cmds(),
+     ))
+ }
+ 
+@@ -3551,6 +3557,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
+ chcp 65001
+ sc stop {app_name}
+ taskkill /F /IM {app_name}.exe{filter}
++{remotesmith_tray_stop}
+ {reg_cmd}
+ {copy_exe}
+ {rename_exe}
+@@ -3565,6 +3572,8 @@ taskkill /F /IM {app_name}.exe{filter}
+         rename_exe = rename_exe_cmd(&src_exe, &path)?,
+         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
+         sleep = if debug { "timeout 300" } else { "" },
++        // RemoteSmith (patch 0603): stop the tray so its exe can be replaced.
++        remotesmith_tray_stop = crate::remotesmith::tray_autostart::windows_stop_cmds(),
+     );
+ 
+     let _restore_session_guard = crate::common::SimpleCallOnReturn {
+diff --git a/src/remotesmith/mod.rs b/src/remotesmith/mod.rs
+index 46110a620039..88c31af47c4b 100644
+--- a/src/remotesmith/mod.rs
++++ b/src/remotesmith/mod.rs
+@@ -30,6 +30,8 @@ mod relay;
+ mod server;
+ #[cfg(windows)]
+ mod winsec;
++/// Tray autostart and its removal on uninstall (patch range 0600).
++pub mod tray_autostart;
+ 
+ #[cfg(test)]
+ mod tests;
+diff --git a/src/remotesmith/tray_autostart.rs b/src/remotesmith/tray_autostart.rs
+new file mode 100644
+index 000000000000..92a4d87555f6
+--- /dev/null
++++ b/src/remotesmith/tray_autostart.rs
+@@ -0,0 +1,136 @@
++//! Autostart of the RemoteSmith tray (the sidecar, DEC-20) and its removal when RemoteSmith is
++//! uninstalled (AC-39). Patch range 0600.
++//!
++//! * macOS: the app embeds the tray as a login-item helper that `AppDelegate.swift` registers with
++//!   SMAppService (patch 0601). Uninstalling the service (RustDesk's macOS "uninstall") unregisters
++//!   it, removes a standalone `--install-autostart` LaunchAgent, quits the tray, and records that
++//!   the tray was removed, so reopening the app does not register it again until the service is
++//!   installed again.
++//! * Windows: the installer adds an HKLM `Run` value for `remotesmith-tray.exe` next to the app
++//!   (the MSI does the same in res/msi, patch 0602); uninstall and upgrade stop every tray process,
++//!   and uninstall deletes that value and the per-user one `--install-autostart` writes.
++
++/// Bundle id of the embedded helper app (`sidecar/macos/Info.plist.in`).
++pub const TRAY_BUNDLE_ID: &str = "ai.johnnycode.remotesmith.tray";
++/// The sidecar's standalone LaunchAgent label (`sidecar/src/autostart.rs`), the same id.
++pub const TRAY_LAUNCH_AGENT_LABEL: &str = "ai.johnnycode.remotesmith.tray";
++/// User default (app domain) that tells `AppDelegate.swift` the tray was removed on purpose.
++pub const TRAY_REMOVED_DEFAULTS_KEY: &str = "RemoteSmithTrayRemoved";
++/// The tray executable name on Windows and its `Run` value name (`sidecar/src/autostart.rs`).
++pub const TRAY_EXE: &str = "remotesmith-tray.exe";
++pub const TRAY_RUN_VALUE: &str = "RemoteSmithTray";
++const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
++
++/// Install-script lines (cmd, elevated): start the tray at every user's login if it was installed
++/// next to the app in `path`.
++pub fn windows_install_cmds(path: &str) -> String {
++    format!(
++        "if exist \"{path}\\{TRAY_EXE}\" reg add HKLM\\{RUN_KEY} /f /v {TRAY_RUN_VALUE} /t REG_SZ /d \"\\\"{path}\\{TRAY_EXE}\\\"\""
++    )
++}
++
++/// Stop every tray process (all sessions; the script runs elevated) so its exe can be replaced.
++pub fn windows_stop_cmds() -> String {
++    format!("taskkill /F /IM {TRAY_EXE} >nul 2>&1")
++}
++
++/// Uninstall-script lines: stop the tray and delete both autostart values. `reg delete` of a
++/// missing value only prints an error; the script carries on.
++pub fn windows_uninstall_cmds() -> String {
++    format!(
++        "{stop}\nreg delete HKLM\\{RUN_KEY} /f /v {TRAY_RUN_VALUE} >nul 2>&1\nreg delete HKCU\\{RUN_KEY} /f /v {TRAY_RUN_VALUE} >nul 2>&1",
++        stop = windows_stop_cmds()
++    )
++}
++
++/// macOS, in the user's GUI process after the service was uninstalled: unregister the login item,
++/// remove a standalone LaunchAgent, quit the tray, and remember that it was removed.
++#[cfg(target_os = "macos")]
++pub fn macos_remove_tray() {
++    use hbb_common::log;
++    use objc::runtime::{Class, Object, BOOL, YES};
++    use objc::{class, msg_send, sel, sel_impl};
++
++    unsafe fn ns_string(s: &str) -> *mut Object {
++        use cocoa::foundation::NSString;
++        NSString::alloc(cocoa::base::nil).init_str(s)
++    }
++    // SAFETY: plain Foundation / ServiceManagement calls on objects we own or that are singletons.
++    unsafe {
++        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
++        let key = ns_string(TRAY_REMOVED_DEFAULTS_KEY);
++        let _: () = msg_send![defaults, setBool: YES forKey: key];
++        let _: BOOL = msg_send![defaults, synchronize];
++        // SMAppService is macOS 13+, and ServiceManagement is loaded by the app's Swift code.
++        match Class::get("SMAppService") {
++            Some(cls) => {
++                let ident = ns_string(TRAY_BUNDLE_ID);
++                let service: *mut Object = msg_send![cls, loginItemServiceWithIdentifier: ident];
++                if !service.is_null() {
++                    let mut err: *mut Object = std::ptr::null_mut();
++                    let ok: BOOL = msg_send![service, unregisterAndReturnError: &mut err];
++                    log::info!("RemoteSmith: tray login item unregistered: {}", ok == YES);
++                }
++            }
++            None => log::info!("RemoteSmith: SMAppService unavailable; no tray login item to remove"),
++        }
++    }
++    let uid = unsafe { hbb_common::libc::getuid() };
++    let _ = std::process::Command::new("/bin/launchctl")
++        .arg("bootout")
++        .arg(format!("gui/{uid}/{TRAY_LAUNCH_AGENT_LABEL}"))
++        .stderr(std::process::Stdio::null())
++        .status();
++    if let Some(home) = std::env::var_os("HOME") {
++        let plist = std::path::Path::new(&home)
++            .join("Library/LaunchAgents")
++            .join(format!("{TRAY_LAUNCH_AGENT_LABEL}.plist"));
++        if plist.exists() {
++            hbb_common::allow_err!(std::fs::remove_file(&plist));
++        }
++    }
++    let _ = std::process::Command::new("/usr/bin/pkill")
++        .args(["-U", &uid.to_string(), "-x", "remotesmith-tray"])
++        .status();
++}
++
++/// macOS, when the user installs the service: let the app register the tray again.
++#[cfg(target_os = "macos")]
++pub fn macos_allow_tray() {
++    use objc::runtime::Object;
++    use objc::{class, msg_send, sel, sel_impl};
++    // SAFETY: as above.
++    unsafe {
++        use cocoa::foundation::NSString;
++        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
++        let key = NSString::alloc(cocoa::base::nil).init_str(TRAY_REMOVED_DEFAULTS_KEY);
++        let _: () = msg_send![defaults, removeObjectForKey: key];
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn windows_install_adds_hklm_run_value_with_quoted_path() {
++        let c = windows_install_cmds(r"C:\Program Files\RemoteSmith");
++        assert_eq!(
++            c,
++            r#"if exist "C:\Program Files\RemoteSmith\remotesmith-tray.exe" reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /f /v RemoteSmithTray /t REG_SZ /d "\"C:\Program Files\RemoteSmith\remotesmith-tray.exe\"""#
++        );
++    }
++
++    #[test]
++    fn windows_uninstall_stops_tray_and_deletes_both_values() {
++        let c = windows_uninstall_cmds();
++        let lines: Vec<_> = c.lines().collect();
++        assert_eq!(lines[0], "taskkill /F /IM remotesmith-tray.exe >nul 2>&1");
++        assert!(lines.contains(
++            &r"reg delete HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /f /v RemoteSmithTray >nul 2>&1"
++        ));
++        assert!(lines.contains(
++            &r"reg delete HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /f /v RemoteSmithTray >nul 2>&1"
++        ));
++    }
++}

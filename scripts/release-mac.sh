@@ -81,7 +81,7 @@ echo "release $version -> $OUT"
 # --- 2. build + archive --------------------------------------------------------------------------
 log "build + archive (scripts/build-mac.sh --archive)"
 ARCHIVE="$OUT/RemoteSmith.xcarchive"
-"$REPO_ROOT/scripts/build-mac.sh" "${build_args[@]}" --archive "$ARCHIVE" --team "$TEAM"
+"$REPO_ROOT/scripts/build-mac.sh" ${build_args[@]+"${build_args[@]}"} --archive "$ARCHIVE" --team "$TEAM"
 app_name="$(basename "$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' | head -n1)" .app)"
 [[ -n "$app_name" ]] || die "no app in $ARCHIVE"
 
@@ -176,10 +176,12 @@ rm -rf "$stage"
 # signs app bundles. Gatekeeper checks the stapled app inside when it is first opened.
 mnt="$(mktemp -d)"
 hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+trap 'hdiutil detach -quiet "$mnt" 2>/dev/null || true' EXIT
 { echo "## dmg: spctl + stapler on the app inside"
   spctl -a -t exec -vvv "$mnt/$app_name.app" 2>&1; xcrun stapler validate "$mnt/$app_name.app" 2>&1; } | tee -a "$V"
-spctl -a -t exec "$mnt/$app_name.app" || { hdiutil detach -quiet "$mnt"; die "Gatekeeper rejects the app in the dmg"; }
+spctl -a -t exec "$mnt/$app_name.app" || die "Gatekeeper rejects the app in the dmg"
 hdiutil detach -quiet "$mnt"
+trap - EXIT
 rmdir "$mnt" 2>/dev/null || true
 shasum -a 256 "$DMG" "$ZIP" | tee "$OUT/SHA256SUMS"
 

@@ -4,15 +4,17 @@ Date: Mon, 12 Oct 2026 20:03:57 -0400
 Subject: remotesmith(0601): start the bundled menu-bar tray at login
 
 The release build embeds the sidecar (DEC-20) as a login-item helper app,
-Contents/Library/LoginItems/RemoteSmith Tray.app. The main window registers
-it once with SMAppService (macOS 13+) and launches it if it is not running.
-Builds without the helper are unchanged. Serves B5 / FLOW-1 / AC-1.
+Contents/Library/LoginItems/RemoteSmith Tray.app. When the main window starts,
+an installed copy registers it with SMAppService (macOS 13+) whenever the
+system has no record of it; a user's opt-out in Login Items is respected, and
+a tray left over from before an upgrade is replaced by the current one. Builds
+without the helper are unchanged. Serves B5 / FLOW-1 / AC-1 / AC-3.
 ---
- flutter/macos/Runner/AppDelegate.swift | 40 ++++++++++++++++++++++++++
- 1 file changed, 40 insertions(+)
+ flutter/macos/Runner/AppDelegate.swift | 76 ++++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
 
 diff --git a/flutter/macos/Runner/AppDelegate.swift b/flutter/macos/Runner/AppDelegate.swift
-index 46372a5822fc..29b841b279da 100644
+index 46372a5822fc..a22afd8c9ef5 100644
 --- a/flutter/macos/Runner/AppDelegate.swift
 +++ b/flutter/macos/Runner/AppDelegate.swift
 @@ -1,5 +1,6 @@
@@ -22,48 +24,84 @@ index 46372a5822fc..29b841b279da 100644
  
  @main
  class AppDelegate: FlutterAppDelegate {
-@@ -20,5 +21,44 @@ class AppDelegate: FlutterAppDelegate {
+@@ -20,5 +21,80 @@ class AppDelegate: FlutterAppDelegate {
      override func applicationDidFinishLaunching(_ aNotification: Notification) {
          launched = true;
          NSApplication.shared.activate(ignoringOtherApps: true);
 +        remotesmithStartTray()
-+    }
-+}
+     }
+ }
 +
 +// RemoteSmith (DEC-20): the menu-bar sidecar ships as a login-item helper app inside this bundle,
 +// Contents/Library/LoginItems/RemoteSmith Tray.app. When the main window starts (no arguments, so
-+// not --server/--cm/--connect child processes), register it once with SMAppService so it starts at
-+// login, and launch it if it is not running. Unregistering is left to the user (System Settings >
-+// General > Login Items), and a deliberate opt-out is remembered and not undone. Builds without
-+// the helper (plain build.py / flutter build) skip all of this.
++// not --server/--cm/--connect child processes) this registers it with SMAppService so it starts at
++// login, and makes sure the running tray is this bundle's current one.
++// - Registration only happens from an installed copy (/Applications or ~/Applications, not a
++//   translocated or disk-image copy), and is redone whenever the system has no record of it
++//   (first run, after a move or reinstall). A user who turns it off in System Settings > General >
++//   Login Items gets .requiresApproval, which is left alone, and the tray is not started.
++// - Uninstalling the service removes the tray (patch 0603) and sets RemoteSmithTrayRemoved, which
++//   keeps it off until the service is installed again.
++// - A tray still running from before an upgrade (its executable on disk is newer than the
++//   process) is quit and the new one started.
++// Builds without the helper (plain build.py / flutter build) skip all of this.
 +let remotesmithTrayBundleId = "ai.johnnycode.remotesmith.tray"
-+let remotesmithTrayRegisteredKey = "RemoteSmithTrayLoginItemRegistered"
 +
 +func remotesmithStartTray() {
 +    guard CommandLine.arguments.count <= 1 else { return }
 +    let helper = Bundle.main.bundleURL
 +        .appendingPathComponent("Contents/Library/LoginItems/RemoteSmith Tray.app")
 +    guard FileManager.default.fileExists(atPath: helper.path) else { return }
++    if UserDefaults.standard.bool(forKey: "RemoteSmithTrayRemoved") { return }
 +    if #available(macOS 13.0, *) {
 +        let service = SMAppService.loginItem(identifier: remotesmithTrayBundleId)
-+        let defaults = UserDefaults.standard
-+        if service.status == .notRegistered && !defaults.bool(forKey: remotesmithTrayRegisteredKey) {
-+            do {
-+                try service.register()
-+                defaults.set(true, forKey: remotesmithTrayRegisteredKey)
-+            } catch {
-+                NSLog("RemoteSmith: could not register the tray login item: \(error)")
++        switch service.status {
++        case .requiresApproval:
++            return  // turned off by the user
++        case .notRegistered, .notFound:
++            if remotesmithIsInstalledCopy() {
++                do {
++                    try service.register()
++                } catch {
++                    NSLog("RemoteSmith: could not register the tray login item: \(error)")
++                }
++            }
++        default:
++            break
++        }
++    }
++    let exe = helper.appendingPathComponent("Contents/MacOS/remotesmith-tray")
++    // ctime (attribute modification) changes when an upgrade copies the file in; mtime may not.
++    let values = try? exe.resourceValues(forKeys: [.contentModificationDateKey, .attributeModificationDateKey])
++    let built = [values?.contentModificationDate, values?.attributeModificationDate].compactMap { $0 }.max()
++    let running = NSRunningApplication.runningApplications(withBundleIdentifier: remotesmithTrayBundleId)
++    let stale = running.filter { app in
++        if app.bundleURL?.standardizedFileURL.path != helper.standardizedFileURL.path { return true }
++        if let built = built, let launched = app.launchDate, built > launched { return true }
++        return false
++    }
++    if !running.isEmpty && stale.count < running.count { return }  // the current tray is up
++    DispatchQueue.global(qos: .utility).async {
++        for app in stale { app.terminate() }
++        for _ in 0..<30 where stale.contains(where: { !$0.isTerminated }) { usleep(100_000) }
++        for app in stale where !app.isTerminated { app.forceTerminate() }
++        DispatchQueue.main.async {
++            let config = NSWorkspace.OpenConfiguration()
++            config.activates = false
++            config.addsToRecentItems = false
++            NSWorkspace.shared.openApplication(at: helper, configuration: config) { _, error in
++                if let error = error {
++                    NSLog("RemoteSmith: could not start the tray: \(error)")
++                }
 +            }
 +        }
 +    }
-+    let running = NSRunningApplication.runningApplications(withBundleIdentifier: remotesmithTrayBundleId)
-+    guard running.isEmpty else { return }
-+    let config = NSWorkspace.OpenConfiguration()
-+    config.activates = false
-+    config.addsToRecentItems = false
-+    NSWorkspace.shared.openApplication(at: helper, configuration: config) { _, error in
-+        if let error = error {
-+            NSLog("RemoteSmith: could not start the tray: \(error)")
-+        }
-     }
- }
++}
++
++/// An installed copy: under /Applications or ~/Applications, not translocated, not on a disk image.
++func remotesmithIsInstalledCopy() -> Bool {
++    let path = Bundle.main.bundleURL.standardizedFileURL.path
++    if path.contains("/AppTranslocation/") { return false }
++    let home = FileManager.default.homeDirectoryForCurrentUser.path
++    return path.hasPrefix("/Applications/") || path.hasPrefix(home + "/Applications/")
++}

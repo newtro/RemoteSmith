@@ -111,6 +111,16 @@ pub fn install_run_key(exe: &Path) -> io::Result<()> {
     key.set_value(RUN_VALUE_NAME, &run_key_command(exe))
 }
 
+/// The installers (MSI and RemoteSmith's own, patches 0602/0603) register the tray for every user
+/// under HKLM and remove that on uninstall. A per-user value on top would outlive the uninstall.
+#[cfg(windows)]
+pub fn installer_run_value_present() -> bool {
+    let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    hklm.open_subkey(RUN_KEY)
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE_NAME))
+        .is_ok()
+}
+
 #[cfg(windows)]
 pub fn uninstall_run_key() -> io::Result<bool> {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
@@ -159,6 +169,12 @@ pub fn install() -> io::Result<String> {
     }
     #[cfg(windows)]
     {
+        if installer_run_value_present() {
+            return Err(io::Error::other(
+                r"RemoteSmith's installer already starts the tray at login (HKLM\...\Run\RemoteSmithTray, \
+                 removed on uninstall); --install-autostart is for a portable copy",
+            ));
+        }
         install_run_key(&exe)?;
         Ok(format!(
             r"installed HKCU\{RUN_KEY}\{RUN_VALUE_NAME} = {}",

@@ -266,8 +266,7 @@ fi
 # everything with a Developer ID (.github/scripts/sign-macos-app.sh). Locally we re-sign the copy
 # ad hoc without the hardened runtime, keeping upstream's Release.entitlements. Real signing
 # (Apple Development / Developer ID) is scripts/release-mac.sh's job.
-codesign --force --deep --sign - --entitlements "$RUSTDESK_DIR/flutter/macos/Runner/Release.entitlements" "$app_out"
-codesign --verify --deep --strict "$app_out"
+adhoc_seal "$app_out" "$RUSTDESK_DIR/flutter/macos/Runner/Release.entitlements"
 
 elapsed=$(( $(date +%s) - start_ts ))
 log "done in $((elapsed / 60))m$((elapsed % 60))s"
