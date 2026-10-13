@@ -372,7 +372,8 @@ the destination.
    traffic in its connection window).
 4. Free space (`hdiutil detach /Volumes/small`, recreate at 40m, attach) and download `xfer/`
    again, choosing Skip for the existing `a.bin`: the rest arrives byte-identical and the job
-   shows done.
+   shows done. (There is no Restart button on a failed job in v1; re-sending with Skip is the
+   restart. Deferred.)
 
 ### C2-2 (AC-18, AC-48) Upload onto a full disk (host side)
 1. On the Windows host, create a small volume: Disk Management > Action > Create VHD, 10 MB,
@@ -395,9 +396,12 @@ the destination.
    (`pkill -9 RemoteSmith` / Task Manager > End task).
 2. Expect: `a.bin` intact; `big.bin.download` and `big.bin.digest` left behind; no `big.bin`.
 3. Relaunch and start a **new** download of `xfer/` to the same folder (do not Resume), Skip
-   for `a.bin`: once the transfer reaches `big.bin`, its stale staging files are removed and
-   replaced; at the end `big.bin` and `z.txt` are byte-identical and no `*.download`/`*.digest`
-   remains. Repeat with Skip chosen for `big.bin` too: its stale staging files are still removed.
+   for `a.bin`: once the transfer reaches `big.bin`, its stale staging files are replaced; at
+   the end `big.bin` and `z.txt` are byte-identical and no `*.download`/`*.digest` remains.
+4. Ambiguous names are preserved: in an empty destination create `notes.txt.download` (any
+   content, no `.digest`) and download a folder containing `notes.txt`: the job fails with
+   "... already exists and is not transfer staging data; not overwritten", and
+   `notes.txt.download` is unchanged.
 
 ### C2-5 (AC-52) Last display unplugged while viewing All displays
 1. Windows host with one monitor (or a laptop with the lid open and no external display). From

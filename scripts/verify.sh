@@ -41,13 +41,14 @@ fi
 # plus the generated bridge files from a scripts/build-mac.sh run; skipped otherwise.
 if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
       && -f vendor/rustdesk/src/bridge_generated.rs && -L vendor/rustdesk/target ]]; then
-  echo "== fork: RemoteSmith unit tests (cargo test --lib remotesmith, Rust 1.81)"
+  echo "== fork: RemoteSmith unit tests (cargo test --lib remotesmith + transfer handler tests, Rust 1.81)"
   (
     # shellcheck source=scripts/lib/mac-env.sh
     source scripts/lib/mac-env.sh
     cd vendor/rustdesk
     RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" cargo test --locked --lib \
-      --features flutter,hwcodec,unix-file-copy-paste,screencapturekit remotesmith
+      --features flutter,hwcodec,unix-file-copy-paste,screencapturekit \
+      -- remotesmith client::io_loop::tests upload_is_verified_before_done
   )
 else
   echo "== fork: RemoteSmith unit tests skipped (needs scripts/apply-patches.sh + scripts/build-mac.sh first)"
