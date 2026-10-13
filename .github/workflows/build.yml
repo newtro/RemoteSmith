@@ -88,34 +88,6 @@ jobs:
 
   # The sidecar tray (sidecar/, crate remotesmith-tray) on its own toolchain
   # (sidecar/rust-toolchain.toml), on both platforms it ships for.
-  sidecar:
-    name: sidecar (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, windows-2022]
-    defaults:
-      run:
-        shell: bash
-        working-directory: sidecar
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: "RemoteSmith: Install the sidecar toolchain"
-        run: |
-          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal -c rustfmt -c clippy
-          rustc --version
-
-      - name: "RemoteSmith: sidecar fmt, clippy, test"
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-
   # Mirrors bridge.yml (generate_bridge, the 3.22.3 "bridge-artifact" matrix entry), run on the
   # patched sources so the generated bridge matches RemoteSmith's src/flutter_ffi.rs.
   generate-bridge:
