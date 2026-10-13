@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:36:41 -0400
+Subject: remotesmith(0704): forgetting a peer ends its sessions and their
+ cached trust
+
+AC-39, AC-43 (whole-product review finding 9). main_remove_peer only deleted the file; a
+session to that peer kept its in-memory pin, host ID and remembered password, and a retrying
+session could reconnect on the stale pin and re-save the password from handle_peer_info.
+
+Each peer now has a forget generation (remotesmith_trust::forget). A session takes it when it
+starts and writes the peer's config only while it is current, checked and written under one
+lock. Forgetting bumps the generation, closes the peer's live sessions for good (no retry, a
+connect in flight is dropped, the window says why) after dropping their in-memory copy, then
+deletes the file. A stale session that reaches the identity gate reloads the (now empty)
+config and drops its remembered password first, so whatever connects next enrolls afresh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/client.rs                     | 114 +++++++++++++++++++++++++++++-
+ src/flutter_ffi.rs                |  19 +++++
+ src/lang/en.rs                    |   1 +
+ src/remotesmith_trust/forget.rs   |  90 +++++++++++++++++++++++
+ src/remotesmith_trust/identity.rs |   7 ++
+ src/remotesmith_trust/mod.rs      |   1 +
+ 6 files changed, 229 insertions(+), 3 deletions(-)
+ create mode 100644 src/remotesmith_trust/forget.rs
+
+diff --git a/src/client.rs b/src/client.rs
+index 9958fd0cc7bf..a3ae00670829 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -2914,6 +2914,9 @@ pub struct LoginConfigHandler {
+     pub remotesmith_lan_addr: Option<String>,
+     /// RemoteSmith: automatic reconnect policy, kept across rounds (DEF-7).
+     pub remotesmith_retry: crate::remotesmith_trust::reconnect::RetryPolicy,
++    /// RemoteSmith: the peer's forget generation this session's config belongs to; once the
++    /// peer is forgotten, nothing of it is written back (AC-39, remotesmith_trust::forget).
++    remotesmith_forget_gen: u64,
+     pub conn_type: ConnType,
+     pub is_terminal_admin: bool,
+     hash: Hash,
+@@ -3037,6 +3040,9 @@ impl LoginConfigHandler {
+ 
+         self.id = id;
+         self.conn_type = conn_type;
++        // RemoteSmith: taken before the config is read, so a forget racing this load leaves
++        // the session stale rather than holding the deleted pin and password as current.
++        self.remotesmith_forget_gen = crate::remotesmith_trust::forget::generation(&self.id);
+         let config = self.load_config();
+         self.remember = !config.password.is_empty();
+         self.config = config;
+@@ -3137,8 +3143,41 @@ impl LoginConfigHandler {
+     ///
+     /// * `config` - [`PeerConfig`] to save.
+     pub fn save_config(&mut self, config: PeerConfig) {
+-        config.store(&self.id);
+-        self.config = config;
++        // RemoteSmith (AC-39): a session to a peer forgotten meanwhile writes nothing back,
++        // neither its stale pin nor a remembered password.
++        let id = self.id.clone();
++        if crate::remotesmith_trust::forget::store_if_current(&id, self.remotesmith_forget_gen, || {
++            config.store(&id)
++        }) {
++            self.config = config;
++        }
++    }
++
++    /// RemoteSmith (AC-39, AC-43): whether the peer was forgotten since this session's config
++    /// was loaded.
++    pub fn remotesmith_forgotten(&self) -> bool {
++        !crate::remotesmith_trust::forget::is_current(&self.id, self.remotesmith_forget_gen)
++    }
++
++    /// RemoteSmith: drop everything this session remembers of a peer that was forgotten since
++    /// (pin, host ID, remembered password; the reconnect token's password too), then follow the
++    /// config as it is now, so the next login enrolls afresh. Returns whether it did.
++    pub fn remotesmith_reset_if_forgotten(&mut self) -> bool {
++        if !self.remotesmith_forgotten() {
++            return false;
++        }
++        self.remotesmith_forget_gen = crate::remotesmith_trust::forget::generation(&self.id);
++        self.config = self.load_config();
++        self.remember = !self.config.password.is_empty();
++        self.password = Default::default();
++        self.password_source = Default::default();
++        // remotesmith_signed_id stays: it is what this round's host proved, which the identity
++        // gate is about to compare with the (now empty) pin.
++        log::info!(
++            "peer {}: forgotten since this session started; enrolling it afresh",
++            self.id
++        );
++        true
+     }
+ 
+     /// Set an option for handler's [`PeerConfig`].
+@@ -3408,7 +3447,10 @@ impl LoginConfigHandler {
+             } else {
+                 self.config.options.insert(name, "Y".to_owned());
+             }
+-            self.config.store(&self.id);
++            // RemoteSmith (AC-39): never write a forgotten peer's config back.
++            let (id, gen) = (self.id.clone(), self.remotesmith_forget_gen);
++            let config = &self.config;
++            crate::remotesmith_trust::forget::store_if_current(&id, gen, || config.store(&id));
+             return None;
+         }
+ 
+@@ -6042,3 +6084,69 @@ mod kx_tests {
+         assert!(!seen.decrypted && !decrypted);
+     }
+ }
++
++/// RemoteSmith C1 (finding 9, AC-39, AC-43): a session that outlives "Forget peer".
++#[cfg(test)]
++mod remotesmith_forget_tests {
++    use super::*;
++    use crate::remotesmith_trust::{
++        forget,
++        identity::{evaluate, HostIdentity, Verdict, OPTION_FINGERPRINT, OPTION_HOST_ID},
++    };
++
++    /// Removes the (never expected) peer file even when an assertion fails.
++    struct Cleanup(String);
++    impl Drop for Cleanup {
++        fn drop(&mut self) {
++            PeerConfig::remove(&self.0);
++        }
++    }
++
++    #[test]
++    fn a_session_retrying_after_forget_writes_nothing_back_and_enrolls_afresh() {
++        // An ID no real peer has; the stale session must not create its file.
++        let id = format!("remotesmith-forget-test-{}", std::process::id());
++        let _cleanup = Cleanup(id.clone());
++        PeerConfig::remove(&id);
++        let mut lc = LoginConfigHandler::default();
++        lc.id = id.clone();
++        lc.remotesmith_forget_gen = forget::generation(&id);
++        lc.config.options.insert(OPTION_FINGERPRINT.into(), "aaaa bbbb".into());
++        lc.config.options.insert(OPTION_HOST_ID.into(), "123".into());
++        lc.config.password = vec![1, 2, 3];
++        lc.password = b"remembered".to_vec();
++        lc.remember = true;
++        assert!(!lc.remotesmith_forgotten());
++
++        forget::forget(&id);
++        assert!(lc.remotesmith_forgotten());
++        // What handle_peer_info does after the retry logs in: re-save the remembered password.
++        let mut c = lc.load_config();
++        c.password = lc.password.clone();
++        lc.save_config(c);
++        lc.set_option("view-style".into(), "adaptive".into());
++        assert!(!PeerConfig::exists(&id), "a forgotten peer's config was written back");
++        assert_eq!(lc.get_option(OPTION_FINGERPRINT), "aaaa bbbb", "in memory until the gate");
++
++        // The identity gate's first step on the next round: everything remembered is dropped.
++        assert!(lc.remotesmith_reset_if_forgotten());
++        assert!(lc.get_option(OPTION_FINGERPRINT).is_empty());
++        assert!(lc.get_option(OPTION_HOST_ID).is_empty());
++        assert!(lc.password.is_empty() && lc.config.password.is_empty() && !lc.remember);
++        assert!(!lc.remotesmith_forgotten());
++        assert!(!lc.remotesmith_reset_if_forgotten(), "only once");
++        // So whatever answers next is a first use: shown to the user, nothing sent unconfirmed.
++        let offered = HostIdentity {
++            id: "123".into(),
++            fingerprint: "aaaa bbbb".into(),
++        };
++        assert!(matches!(
++            evaluate(
++                &lc.get_option(OPTION_FINGERPRINT),
++                &lc.get_option(OPTION_HOST_ID),
++                Some(&offered)
++            ),
++            Verdict::FirstUse(_)
++        ));
++    }
++}
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index ba9df1c76701..44a7f98674b6 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -1839,6 +1839,25 @@ pub fn main_device_name(name: String) {
+ }
+ 
+ pub fn main_remove_peer(id: String) {
++    // RemoteSmith (AC-39, AC-43): "Forget peer" also ends what live sessions hold. The
++    // generation moves first, so no session can write the pin or the password back from here
++    // on; then the peer's sessions are closed for good (a retry in flight is dropped, no new
++    // one starts) and their in-memory copy is dropped; only then is the file deleted.
++    crate::remotesmith_trust::forget::forget(&id);
++    for s in sessions::get_sessions() {
++        if s.lc.read().unwrap().get_id() != id {
++            continue;
++        }
++        s.lc.write().unwrap().remotesmith_reset_if_forgotten();
++        s.close();
++        crate::client::Interface::msgbox(
++            &*s,
++            "error",
++            "Peer forgotten",
++            "remotesmith-peer-forgotten-session-tip",
++            "",
++        );
++    }
+     PeerConfig::remove(&id);
+ }
+ 
+diff --git a/src/lang/en.rs b/src/lang/en.rs
+index d65f3cc93194..362c3e05b622 100644
+--- a/src/lang/en.rs
++++ b/src/lang/en.rs
+@@ -288,6 +288,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("remotesmith-trust-and-connect", "Trust and connect"),
+         ("remotesmith-forget-peer", "Forget peer"),
+         ("remotesmith-peer-forgotten", "Peer forgotten. Connect again to enroll it."),
++        ("remotesmith-peer-forgotten-session-tip", "This peer was forgotten, so this session ended. Connect again to enroll it."),
+         // RemoteSmith unit B3: reconnect (DEF-7, AC-46).
+         ("remotesmith-disconnected-tip", "The connection was lost and automatic reconnecting has stopped. Input made while disconnected was discarded and will not be replayed."),
+     ].iter().cloned().collect();
+diff --git a/src/remotesmith_trust/forget.rs b/src/remotesmith_trust/forget.rs
+new file mode 100644
+index 000000000000..9ce9b4aca83a
+--- /dev/null
++++ b/src/remotesmith_trust/forget.rs
+@@ -0,0 +1,90 @@
++//! "Forget peer" invalidates what live sessions hold, not just the file (RemoteSmith AC-39,
++//! AC-43).
++//!
++//! Upstream's remove only deletes the peer file. A session to that peer keeps its in-memory
++//! copy (the pinned fingerprint and host ID, the remembered password) and writes it back on the
++//! next save: a session retrying after the forget reconnects on the stale pin, logs in with
++//! the stale password and `handle_peer_info` recreates the file with it, so the peer is never
++//! re-enrolled.
++//!
++//! Each peer ID has a forget generation. A session takes the generation when it starts
++//! (`LoginConfigHandler::initialize`) and may write the peer's config only while it is still
++//! current ([`store_if_current`], which checks and writes under one lock, so a write either
++//! lands before the forget, and is deleted with the file, or not at all). Forgetting bumps the
++//! generation, then closes the peer's live sessions (no retry), then deletes the file. A
++//! session that runs into the identity gate with a stale generation reloads the (now empty)
++//! config and drops its remembered password first ([`LoginConfigHandler::remotesmith_reset_if_forgotten`]),
++//! so whatever connects next enrolls afresh.
++//!
++//! [`LoginConfigHandler::remotesmith_reset_if_forgotten`]: crate::client::LoginConfigHandler::remotesmith_reset_if_forgotten
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++static GENERATIONS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
++
++fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<String, u64>>> {
++    GENERATIONS.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// The peer's current forget generation (0 until it is first forgotten).
++pub fn generation(id: &str) -> u64 {
++    lock()
++        .as_ref()
++        .and_then(|m| m.get(id).copied())
++        .unwrap_or(0)
++}
++
++/// Start forgetting `id`: every generation taken before this call is stale from now on.
++/// Returns the new generation.
++pub fn forget(id: &str) -> u64 {
++    let mut g = lock();
++    let e = g.get_or_insert_with(HashMap::new).entry(id.to_owned()).or_insert(0);
++    *e += 1;
++    hbb_common::log::info!("peer {}: forgotten (generation {}); its sessions end", id, *e);
++    *e
++}
++
++/// Whether `generation` (taken by a session) is still current for `id`.
++pub fn is_current(id: &str, generation: u64) -> bool {
++    self::generation(id) == generation
++}
++
++/// Run `store` (a write of `id`'s peer config) only if `generation` is still current, under the
++/// lock [`forget`] takes, so the check and the write cannot straddle a forget. Returns whether it
++/// ran.
++pub fn store_if_current(id: &str, generation: u64, store: impl FnOnce()) -> bool {
++    let g = lock();
++    let current = g.as_ref().and_then(|m| m.get(id).copied()).unwrap_or(0);
++    if current != generation {
++        hbb_common::log::info!(
++            "peer {}: not saving its config: it was forgotten while this session ran",
++            id
++        );
++        return false;
++    }
++    store();
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_forget_makes_older_generations_stale_and_blocks_their_writes() {
++        let id = "forget-test-peer-1";
++        let g0 = generation(id);
++        assert!(is_current(id, g0));
++        let mut wrote = 0;
++        assert!(store_if_current(id, g0, || wrote += 1));
++        let g1 = forget(id);
++        assert_eq!(g1, g0 + 1);
++        assert!(!is_current(id, g0));
++        assert!(!store_if_current(id, g0, || wrote += 1), "stale session cannot write");
++        assert!(store_if_current(id, g1, || wrote += 1), "a session started after may");
++        assert_eq!(wrote, 2);
++        // Other peers are unaffected.
++        assert!(is_current("forget-test-peer-2", generation("forget-test-peer-2")));
++    }
++}
+diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
+index e0ec722032bc..d468594f0b48 100644
+--- a/src/remotesmith_trust/identity.rs
++++ b/src/remotesmith_trust/identity.rs
+@@ -218,6 +218,13 @@ pub async fn gate(
+     is_secured: bool,
+     sign_pk: Option<&[u8]>,
+ ) -> Gate {
++    // RemoteSmith (AC-39): a peer forgotten since this session started is enrolled afresh: its
++    // stale pin and remembered password are dropped before anything is compared or sent.
++    interface
++        .get_lch()
++        .write()
++        .unwrap()
++        .remotesmith_reset_if_forgotten();
+     let (peer, signed_id, pinned_fp, pinned_id) = {
+         let lc = interface.get_lch();
+         let lc = lc.read().unwrap();
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index 0d23668ff3fa..aa1326ce5840 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -7,3 +7,4 @@ pub mod held_input;
+ pub mod relay_pin;
+ pub mod password_epoch;
+ pub mod direct_access;
++pub mod forget;

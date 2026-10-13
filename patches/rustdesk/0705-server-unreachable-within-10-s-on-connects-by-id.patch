@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:36:47 -0400
+Subject: remotesmith(0705): server unreachable within 10 s on connects by ID
+
+AC-45 (whole-product review finding 8, the AC-45 part). With the ID server down or
+blackholed, a connect by ID waited up to CONNECT_TIMEOUT (18 s) for the rendezvous TCP
+connect alone, after DNS/STUN/WebRTC setup, then showed a generic error. Client::start now
+bounds only the phase up to the rendezvous connection being up, 10 s from the start of the
+connect (the LAN-first attempt included), and ends it with "Server unreachable: ...". Once the
+server answered, punch, relay and data timeouts are upstream's; address routes never use the
+server and leave the phase at once. The text says "failed", so a first connect is not
+auto-retried, while a dropped session's reconnect streak still retries it.
+The absolute 60 s reconnect deadline across in-flight attempts stays deferred.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/client.rs                            |  15 ++-
+ src/remotesmith_trust/mod.rs             |   1 +
+ src/remotesmith_trust/server_deadline.rs | 126 +++++++++++++++++++++++
+ 3 files changed, 141 insertions(+), 1 deletion(-)
+ create mode 100644 src/remotesmith_trust/server_deadline.rs
+
+diff --git a/src/client.rs b/src/client.rs
+index a3ae00670829..a86f642f8a52 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -378,7 +378,12 @@ impl Client {
+         debug_assert!(peer == interface.get_id());
+         interface.update_direct(None);
+         interface.update_received(false);
+-        match Self::_start(peer, key, token, conn_type, interface.clone()).await {
++        // RemoteSmith (AC-45): "server unreachable" within 10 s; only reaching the ID server is
++        // bounded, nothing after it.
++        use crate::remotesmith_trust::server_deadline as rs_deadline;
++        let phase = rs_deadline::Phase::new();
++        let connect = Self::_start(peer, key, token, conn_type, interface.clone(), phase.clone());
++        match rs_deadline::bound(&phase, rs_deadline::SERVER_DEADLINE, connect).await {
+             Err(err) => {
+                 let err_str = err.to_string();
+                 if err_str.starts_with("Failed") {
+@@ -410,6 +415,7 @@ impl Client {
+         token: &str,
+         conn_type: ConnType,
+         interface: impl Interface,
++        server_phase: crate::remotesmith_trust::server_deadline::Phase,
+     ) -> ResultType<(
+         (
+             Stream,
+@@ -432,6 +438,8 @@ impl Client {
+         }
+         // to-do: remember the port for each peer, so that we can retry easier
+         if hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer) {
++            // RemoteSmith (AC-45): an address route never involves the ID server.
++            server_phase.done();
+             let addr = if hbb_common::is_ip_str(peer) {
+                 check_port(peer, RELAY_PORT + 1)
+             } else {
+@@ -590,6 +598,7 @@ impl Client {
+             rendezvous_server.clone(),
+             servers.clone(),
+             contained,
++            server_phase.clone(),
+         );
+         // The fallback request exists only to carry a TCP punch, so it is pointless once TCP
+         // punch is off — it would reach `connect()` with nothing to try and just open a second
+@@ -618,6 +627,7 @@ impl Client {
+             rendezvous_server,
+             servers,
+             contained,
++            server_phase,
+         )
+         .boxed();
+         if has_webrtc_offerer {
+@@ -844,6 +854,7 @@ impl Client {
+         mut rendezvous_server: String,
+         servers: Vec<String>,
+         contained: bool,
++        server_phase: crate::remotesmith_trust::server_deadline::Phase,
+     ) -> ResultType<(
+         (
+             Stream,
+@@ -880,6 +891,8 @@ impl Client {
+         }
+         log::info!("rendezvous server: {}", rendezvous_server);
+         let mut socket = socket?;
++        // RemoteSmith (AC-45): the ID server answered; from here on upstream's timeouts apply.
++        server_phase.done();
+         let mut my_addr = socket.local_addr();
+         let mut signed_id_pk = Vec::new();
+         let mut relay_server = "".to_owned();
+diff --git a/src/remotesmith_trust/mod.rs b/src/remotesmith_trust/mod.rs
+index aa1326ce5840..3867b537490f 100644
+--- a/src/remotesmith_trust/mod.rs
++++ b/src/remotesmith_trust/mod.rs
+@@ -8,3 +8,4 @@ pub mod relay_pin;
+ pub mod password_epoch;
+ pub mod direct_access;
+ pub mod forget;
++pub mod server_deadline;
+diff --git a/src/remotesmith_trust/server_deadline.rs b/src/remotesmith_trust/server_deadline.rs
+new file mode 100644
+index 000000000000..59929dce2b47
+--- /dev/null
++++ b/src/remotesmith_trust/server_deadline.rs
+@@ -0,0 +1,126 @@
++//! "Server unreachable" within 10 s (RemoteSmith AC-45, §8 "Lightsail down").
++//!
++//! A connect by ID first has to reach the ID server: upstream allows `CONNECT_TIMEOUT` (18 s)
++//! for the TCP connect alone, after DNS, STUN and WebRTC setup, so with the server blackholed
++//! the user waits about 20 s for a generic error. RemoteSmith bounds that phase only: from the
++//! start of the connect (LAN-first attempt included) until the rendezvous connection is up. Once
++//! the server answered, the punch, relay and data timeouts are upstream's, unchanged. Routes
++//! that never use the server (an IP or host:port) leave the phase at once.
++
++use hbb_common::{anyhow::anyhow, tokio, ResultType};
++use std::future::Future;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++use std::time::Duration;
++
++/// The bound on reaching the ID server (AC-45).
++pub const SERVER_DEADLINE: Duration = Duration::from_secs(10);
++
++/// The error a connect ends with when the ID server was not reached in time. Starts with the
++/// reason the user sees; contains "failed" so a first connect is not auto-retried (upstream's
++/// rule for failed connects), while a dropped session's reconnect streak still retries it.
++pub const SERVER_UNREACHABLE: &str = "Server unreachable: the ID server did not answer within 10 s, so connecting failed. Check the network, or connect by the peer's LAN IP address.";
++
++/// Shared between the connect and its bound: set once the server phase is over.
++#[derive(Clone, Default, Debug)]
++pub struct Phase(Arc<AtomicBool>);
++
++impl Phase {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// The rendezvous connection is up, or this route does not use the server.
++    pub fn done(&self) {
++        self.0.store(true, Ordering::SeqCst);
++    }
++
++    pub fn is_done(&self) -> bool {
++        self.0.load(Ordering::SeqCst)
++    }
++}
++
++/// Run `connect`, but fail it with [`SERVER_UNREACHABLE`] if `phase` is not done within
++/// `deadline`. After that the connect runs to its own end.
++pub async fn bound<T>(
++    phase: &Phase,
++    deadline: Duration,
++    connect: impl Future<Output = ResultType<T>>,
++) -> ResultType<T> {
++    tokio::pin!(connect);
++    tokio::select! {
++        r = &mut connect => return r,
++        _ = tokio::time::sleep(deadline) => {}
++    }
++    if !phase.is_done() {
++        hbb_common::log::warn!("ID server not reached within {:?}; giving up", deadline);
++        return Err(anyhow!(SERVER_UNREACHABLE));
++    }
++    connect.await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Instant;
++
++    #[tokio::test]
++    async fn an_unreached_server_fails_at_the_deadline() {
++        let phase = Phase::new();
++        let t = Instant::now();
++        let r: ResultType<()> = bound(&phase, Duration::from_millis(200), std::future::pending()).await;
++        let took = t.elapsed();
++        assert_eq!(r.unwrap_err().to_string(), SERVER_UNREACHABLE);
++        assert!(took >= Duration::from_millis(200) && took < Duration::from_millis(1000), "{took:?}");
++        assert!(SERVER_UNREACHABLE.to_lowercase().starts_with("server unreachable"));
++        // Not retried on a first connect (upstream: "failed" texts are final).
++        assert!(!crate::client::check_if_retry("error", "Connection Error", SERVER_UNREACHABLE, false));
++    }
++
++    #[tokio::test]
++    async fn once_the_server_answered_the_connect_keeps_its_own_timeouts() {
++        let phase = Phase::new();
++        let p = phase.clone();
++        let r = bound(&phase, Duration::from_millis(100), async move {
++            p.done();
++            // Punch/relay take longer than the server bound: not cut.
++            tokio::time::sleep(Duration::from_millis(300)).await;
++            Ok(7)
++        })
++        .await;
++        assert_eq!(r.unwrap(), 7);
++    }
++
++    #[tokio::test]
++    async fn a_fast_result_or_error_passes_through() {
++        let phase = Phase::new();
++        assert_eq!(bound(&phase, SERVER_DEADLINE, async { Ok(1) }).await.unwrap(), 1);
++        let e = bound::<()>(&phase, SERVER_DEADLINE, async { Err(anyhow!("Remote desktop is offline")) })
++            .await
++            .unwrap_err();
++        assert_eq!(e.to_string(), "Remote desktop is offline");
++    }
++
++    /// The real rendezvous connect against a blackholed address (TEST-NET-1, never routed):
++    /// upstream's 18 s connect is cut at the bound.
++    #[tokio::test]
++    async fn a_blackholed_rendezvous_connect_is_cut_at_the_bound() {
++        let phase = Phase::new();
++        let p = phase.clone();
++        let t = Instant::now();
++        let r = bound(&phase, Duration::from_millis(500), async move {
++            let s = hbb_common::socket_client::connect_tcp(
++                "192.0.2.1:21116",
++                hbb_common::config::CONNECT_TIMEOUT,
++            )
++            .await?;
++            p.done();
++            Ok(s)
++        })
++        .await;
++        let took = t.elapsed();
++        // Either the bound fired, or this network refused at once (no route): never 18 s.
++        assert!(took < Duration::from_secs(3), "{took:?}");
++        assert!(r.is_err(), "connected to TEST-NET-1");
++    }
++}

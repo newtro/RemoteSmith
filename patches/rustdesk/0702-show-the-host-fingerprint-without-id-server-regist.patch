@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:36:31 -0400
+Subject: remotesmith(0702): show the host fingerprint without ID-server
+ registration
+
+FLOW-2, AC-43 (whole-product review finding 3). The tray (host facts) and Settings
+("fingerprint" over IPC) showed the host key fingerprint only once an ID server had confirmed
+the key, so a LAN-only host that never registered had nothing to compare during enrollment.
+Both now show the fingerprint of the signing key the host's handshake signs with
+(Config::get_key_pair, as server::identity_handshake uses), which is exactly what a controller
+pins from the direct route. Test: two fresh, never-registered host keys each show a
+fingerprint, they differ, and each equals the pin taken from that host's direct handshake.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ipc.rs                        | 10 ++++----
+ src/remotesmith/host.rs           | 22 ++++++++++------
+ src/remotesmith_trust/identity.rs | 42 ++++++++++++++++++++++++++++++-
+ 3 files changed, 60 insertions(+), 14 deletions(-)
+
+diff --git a/src/ipc.rs b/src/ipc.rs
+index 1d6dd42c894c..a191384b51b9 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -966,11 +966,11 @@ async fn handle(data: Data, stream: &mut Connection) {
+                 } else if name == "rendezvous_servers" {
+                     value = Some(Config::get_rendezvous_servers().join(","));
+                 } else if name == "fingerprint" {
+-                    value = if Config::get_key_confirmed() {
+-                        Some(crate::common::pk_to_fingerprint(Config::get_key_pair().1))
+-                    } else {
+-                        None
+-                    };
++                    // RemoteSmith (FLOW-2, AC-43): the signing key's fingerprint even when no ID
++                    // server ever confirmed it, so a LAN-only host can be enrolled.
++                    value = crate::remotesmith_trust::identity::own_fingerprint(
++                        &Config::get_key_pair().1,
++                    );
+                 } else if name == "hide_cm" {
+                     value = if crate::hbbs_http::sync::is_pro() || crate::common::is_custom_client()
+                     {
+diff --git a/src/remotesmith/host.rs b/src/remotesmith/host.rs
+index e2e8dc97ca97..efaad3902c3c 100644
+--- a/src/remotesmith/host.rs
++++ b/src/remotesmith/host.rs
+@@ -34,15 +34,21 @@ impl HostFacts {
+ }
+ 
+ /// The host's public-key fingerprint in the format RustDesk shows it (`ipc` config
+-/// "fingerprint"), once the key is confirmed by the rendezvous server.
++/// "fingerprint"): the key this host signs every handshake with (`server::identity_handshake`),
++/// which is what a controller pins on first use on the direct route and what hbbs vouches for
++/// on ID routes.
++///
++/// RemoteSmith: shown whether or not an ID server ever confirmed the key. Upstream waits for
++/// `key_confirmed` (set by an ID-server registration), so a LAN-only host that never registered
++/// had nothing to compare with during enrollment (FLOW-2, AC-43). Generates the key pair if
++/// there is none yet, exactly as the first handshake would.
+ pub fn key_fingerprint() -> Option<String> {
+-    if Config::get_key_confirmed() {
+-        let pk = Config::get_key_pair().1;
+-        if !pk.is_empty() {
+-            return Some(crate::common::pk_to_fingerprint(pk));
+-        }
+-    }
+-    None
++    fingerprint_of(&Config::get_key_pair().1)
++}
++
++/// `pk`'s fingerprint, or `None` for a missing or malformed key.
++pub fn fingerprint_of(pk: &[u8]) -> Option<String> {
++    crate::remotesmith_trust::identity::own_fingerprint(pk)
+ }
+ 
+ /// Cached ledger read (the file changes at most once per boot).
+diff --git a/src/remotesmith_trust/identity.rs b/src/remotesmith_trust/identity.rs
+index dab342561b55..e0ec722032bc 100644
+--- a/src/remotesmith_trust/identity.rs
++++ b/src/remotesmith_trust/identity.rs
+@@ -57,6 +57,13 @@ pub fn fingerprint(sign_pk: &[u8]) -> String {
+     crate::common::pk_to_fingerprint(sign_pk.to_vec())
+ }
+ 
++/// The fingerprint a host shows for its own signing key `pk` (the key its handshake signs
++/// with), or `None` for a missing or malformed key. Independent of ID-server registration
++/// (FLOW-2, AC-43): a LAN-only host is enrolled by this very value.
++pub fn own_fingerprint(pk: &[u8]) -> Option<String> {
++    (pk.len() == sign::PUBLICKEYBYTES).then(|| fingerprint(pk))
++}
++
+ fn normalize(fp: &str) -> String {
+     fp.chars()
+         .filter(|c| !c.is_whitespace() && *c != ':')
+@@ -419,7 +426,15 @@ pub(crate) mod test_support {
+     /// A stand-in host on loopback. Returns its address, its signing key and, once the
+     /// controller answered, whether the key exchange completed.
+     pub(crate) async fn host_stub(id: &'static str, mode: Host) -> (String, Vec<u8>, oneshot::Receiver<bool>) {
+-        let (sign_pk, sign_sk) = sign::gen_keypair();
++        host_stub_keyed(id, mode, sign::gen_keypair()).await
++    }
++
++    /// [`host_stub`] with a given signing key pair (a host profile's own key).
++    pub(crate) async fn host_stub_keyed(
++        id: &'static str,
++        mode: Host,
++        (sign_pk, sign_sk): (sign::PublicKey, sign::SecretKey),
++    ) -> (String, Vec<u8>, oneshot::Receiver<bool>) {
+         let (_, other_sk) = sign::gen_keypair();
+         let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
+             .await
+@@ -584,6 +599,31 @@ mod tests {
+         assert!(done.await.unwrap());
+     }
+ 
++    /// C1 (finding 3, FLOW-2, AC-43): two fresh LAN-only hosts (each a new key pair that no ID
++    /// server ever confirmed) each show a fingerprint, the two differ, and each is exactly the
++    /// value a controller pins from that host's direct handshake.
++    #[tokio::test]
++    async fn lan_only_hosts_show_the_fingerprint_the_direct_handshake_pins() {
++        let mut shown = Vec::new();
++        for id in ["100000001", "100000002"] {
++            let (pk, sk) = sign::gen_keypair();
++            let on_host = crate::remotesmith::host::fingerprint_of(&pk.0)
++                .expect("a never-registered host still shows its fingerprint");
++            let (host, _, done) =
++                super::test_support::host_stub_keyed(id, Host::Honest, (pk, sk)).await;
++            let mut conn = connect_tcp(host, 3000).await.unwrap();
++            let (signed_id, sign_pk) = direct_handshake(&mut conn, None, 3000).await.unwrap();
++            let offered = proven_identity(conn.is_secured(), &signed_id, Some(&sign_pk)).unwrap();
++            assert_eq!(offered.fingerprint, on_host, "the controller pins what the host shows");
++            assert_eq!(evaluate("", "", Some(&offered)), Verdict::FirstUse(offered.clone()));
++            assert!(done.await.unwrap());
++            shown.push(on_host);
++        }
++        assert_ne!(shown[0], shown[1]);
++        assert_eq!(crate::remotesmith::host::fingerprint_of(&[1, 2, 3]), None);
++        assert_eq!(crate::remotesmith::host::fingerprint_of(&[]), None);
++    }
++
+     #[tokio::test]
+     async fn direct_handshake_without_expected_id_accepts_and_reports_the_signed_id() {
+         let (host, _, _done) = host_stub("555", Host::Honest).await;

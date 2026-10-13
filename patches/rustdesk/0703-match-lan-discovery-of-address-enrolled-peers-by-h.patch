@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:36:31 -0400
+Subject: remotesmith(0703): match LAN discovery of address-enrolled peers by
+ host ID
+
+AC-20, AC-21, DEF-3 (whole-product review finding 7). A peer enrolled by IP is saved (and
+dialled) under its address, but answers LAN discovery with its RustDesk ID, so it never showed
+as reachable and, with no ID server, was reported "server unreachable". Saved peers now carry
+the pinned host ID (identity option remotesmith-host-id) apart from the connection target:
+discovery matches by the host ID, the ID server is asked only about ID-route peers, and an
+address-only peer that does not answer on the LAN is "offline (not answering on the LAN)".
+A saved peer whose pin is this machine is not listed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/remotesmith/collect.rs  | 47 ++++++++++++++++++++--
+ src/remotesmith/presence.rs | 58 ++++++++++++++++++++++-----
+ src/remotesmith/tests.rs    | 80 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 171 insertions(+), 14 deletions(-)
+
+diff --git a/src/remotesmith/collect.rs b/src/remotesmith/collect.rs
+index e8da058cb149..32777103a0d4 100644
+--- a/src/remotesmith/collect.rs
++++ b/src/remotesmith/collect.rs
+@@ -34,12 +34,45 @@ pub struct Shared {
+ }
+ 
+ /// A saved peer, as read from RustDesk's peer configs.
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Debug, Clone, PartialEq, Default)]
+ pub struct SavedPeer {
++    /// The connection target: the peer's file name, an ID or (enrolled by address) an IP or
++    /// host:port. What Connect dials.
+     pub id: String,
+     pub alias: Option<String>,
+     pub platform: Option<Platform>,
+     pub saved_at: Option<u64>,
++    /// RemoteSmith: the RustDesk ID the pinned host proved (identity `remotesmith-host-id`),
++    /// when one is pinned. For a peer saved by ID it equals `id`; for one saved by address it is
++    /// what LAN discovery answers with (DEF-3, AC-20).
++    pub host_id: Option<String>,
++}
++
++impl SavedPeer {
++    /// Saved by address (IP or host:port): only the direct route reaches it.
++    pub fn is_direct(&self) -> bool {
++        hbb_common::is_ip_str(&self.id) || hbb_common::is_domain_port_str(&self.id)
++    }
++
++    /// The host identity presence matches discovery answers with: the pinned host ID, else the
++    /// connection target.
++    pub fn identity(&self) -> &str {
++        self.host_id.as_deref().unwrap_or(&self.id)
++    }
++
++    /// What the presence prober needs for this peer.
++    pub fn probe(&self) -> presence::Probe {
++        presence::Probe {
++            target: self.id.clone(),
++            host: self.identity().to_owned(),
++            direct: self.is_direct(),
++        }
++    }
++
++    /// Whether this saved peer is the machine itself (by target or by pinned identity).
++    pub fn is_me(&self, my_id: Option<&String>) -> bool {
++        my_id.map_or(false, |me| &self.id == me || self.host_id.as_ref() == Some(me))
++    }
+ }
+ 
+ #[derive(Debug, Clone, Default, PartialEq)]
+@@ -108,6 +141,12 @@ pub fn parse_peer_file(id: String, saved_at: Option<u64>, text: &str) -> Option<
+             .or_else(|| non_empty(&f.info.hostname)),
+         platform: platform_of(&f.info.platform),
+         saved_at,
++        host_id: f
++            .options
++            .get(crate::remotesmith_trust::identity::OPTION_HOST_ID)
++            .map(|h| h.trim())
++            .filter(|h| !h.is_empty())
++            .map(clamp),
+         id,
+     })
+ }
+@@ -292,7 +331,7 @@ pub fn build(
+     let table = presence.lock().unwrap_or_else(|e| e.into_inner()).clone();
+     let peers = saved
+         .iter()
+-        .filter(|p| Some(&p.id) != my_id.as_ref())
++        .filter(|p| !p.is_me(my_id.as_ref()))
+         .map(|p| Peer {
+             id: p.id.clone(),
+             alias: p.alias.clone(),
+@@ -371,8 +410,8 @@ pub fn start(source: Source) -> Shared {
+                         .lock()
+                         .unwrap_or_else(|e| e.into_inner())
+                         .iter()
+-                        .filter(|p| Some(&p.id) != my_id.as_ref())
+-                        .map(|p| p.id.clone())
++                        .filter(|p| !p.is_me(my_id.as_ref()))
++                        .map(|p| p.probe())
+                         .collect()
+                 },
+                 || rx.borrow().status.server.state == RegState::Registered,
+diff --git a/src/remotesmith/presence.rs b/src/remotesmith/presence.rs
+index 380aa669046f..f76eb99c8c5c 100644
+--- a/src/remotesmith/presence.rs
++++ b/src/remotesmith/presence.rs
+@@ -24,10 +24,24 @@ pub struct Entry {
+     pub probed: bool,
+     /// Last time the peer was reachable by any route (Unix seconds).
+     pub last_seen: Option<u64>,
++    /// Saved by address: only the direct (LAN) route reaches it, the ID server is not asked.
++    pub direct: bool,
+ }
+ 
++/// Keyed by connection target ([`Probe::target`]).
+ pub type Table = Arc<Mutex<HashMap<String, Entry>>>;
+ 
++/// One saved peer to probe. The connection target and the host identity differ for a peer
++/// enrolled by address: it is saved (and dialled) as `192.168.1.20`, while LAN discovery
++/// answers with the host's RustDesk ID, which the identity pin records (DEF-3).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Probe {
++    pub target: String,
++    /// The pinned host ID, else the target.
++    pub host: String,
++    pub direct: bool,
++}
++
+ /// Pure mapping from probe results to the wire presence.
+ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
+     if e.lan {
+@@ -39,6 +53,14 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
+     if !e.probed {
+         return Presence::Checking;
+     }
++    if e.direct {
++        // Saved by address: the direct route is the only one, and it did not answer on the LAN.
++        return Presence::Unavailable {
++            reason: Reason::Offline,
++            detail: Some("not answering on the LAN (saved by address)".into()),
++            last_seen: e.last_seen,
++        };
++    }
+     if e.id_online.is_none() || !registered {
+         return Presence::Unavailable {
+             reason: Reason::ServerUnreachable,
+@@ -53,14 +75,26 @@ pub fn presence_of(e: &Entry, registered: bool) -> Presence {
+     }
+ }
+ 
+-fn apply(table: &Table, ids: &[String], lan: &HashSet<String>, online: Option<&HashSet<String>>) {
++/// Record one probe round. `lan` holds the host IDs that answered discovery, `online` the
++/// targets the ID server reported online (`None`: it could not be asked).
++pub fn apply(
++    table: &Table,
++    peers: &[Probe],
++    lan: &HashSet<String>,
++    online: Option<&HashSet<String>>,
++) {
+     let now = now_secs();
+     let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
+-    t.retain(|k, _| ids.contains(k));
+-    for id in ids {
+-        let e = t.entry(id.clone()).or_default();
+-        e.lan = lan.contains(id);
+-        e.id_online = online.map(|o| o.contains(id));
++    t.retain(|k, _| peers.iter().any(|p| &p.target == k));
++    for p in peers {
++        let e = t.entry(p.target.clone()).or_default();
++        e.direct = p.direct;
++        e.lan = lan.contains(&p.host);
++        e.id_online = if p.direct {
++            None
++        } else {
++            online.map(|o| o.contains(&p.target))
++        };
+         e.probed = true;
+         if e.lan || e.id_online == Some(true) {
+             e.last_seen = Some(now);
+@@ -218,7 +252,7 @@ pub fn discover_lan(saved: &HashSet<String>) -> HashSet<String> {
+ /// this host is registered with the rendezvous server (an offline answer is only trusted then).
+ pub fn run(
+     table: Table,
+-    ids: impl Fn() -> Vec<String>,
++    ids: impl Fn() -> Vec<Probe>,
+     registered: impl Fn() -> bool,
+     changed: impl Fn(),
+ ) {
+@@ -232,7 +266,7 @@ pub fn run(
+             return;
+         }
+     };
+-    let mut last_ids: Vec<String> = Vec::new();
++    let mut last_ids: Vec<Probe> = Vec::new();
+     let mut last_probe: Option<Instant> = None;
+     loop {
+         let cur = ids();
+@@ -247,10 +281,14 @@ pub fn run(
+             continue;
+         }
+         last_probe = Some(Instant::now());
+-        let saved: HashSet<String> = cur.iter().cloned().collect();
++        // Discovery answers name the host, so match them by identity; the ID server is asked
++        // by target, and only about peers an ID route can reach.
++        let saved: HashSet<String> = cur.iter().map(|p| p.host.clone()).collect();
+         let lan = discover_lan(&saved);
+         let online = if registered() {
+-            rt.block_on(query_server(cur.clone()))
++            rt.block_on(query_server(
++                cur.iter().filter(|p| !p.direct).map(|p| p.target.clone()).collect(),
++            ))
+         } else {
+             None
+         };
+diff --git a/src/remotesmith/tests.rs b/src/remotesmith/tests.rs
+index 2cae610d94a4..e3669b316b4b 100644
+--- a/src/remotesmith/tests.rs
++++ b/src/remotesmith/tests.rs
+@@ -222,6 +222,7 @@ mod endpoint {
+     use super::super::readiness;
+     use super::super::server::{self, encode_bounded, ServerConfig};
+     use super::*;
++    use std::collections::HashSet;
+     use std::time::Duration;
+ 
+     // -------------------------------------------------------------- readiness parsers
+@@ -463,6 +464,7 @@ mod endpoint {
+             id_online: id,
+             probed,
+             last_seen: Some(7),
++            direct: false,
+         };
+         assert_eq!(presence::presence_of(&e(false, None, false), true), Presence::Checking);
+         assert_eq!(
+@@ -509,6 +511,7 @@ mod endpoint {
+                 id_online: None,
+                 probed: true,
+                 last_seen: Some(1),
++                ..Default::default()
+             },
+         );
+         let saved = vec![
+@@ -517,18 +520,21 @@ mod endpoint {
+                 alias: Some("me".into()),
+                 platform: Some(Platform::Macos),
+                 saved_at: None,
++                ..Default::default()
+             },
+             SavedPeer {
+                 id: "222".into(),
+                 alias: Some("Scott-PC".into()),
+                 platform: Some(Platform::Windows),
+                 saved_at: Some(5),
++                ..Default::default()
+             },
+             SavedPeer {
+                 id: "333".into(),
+                 alias: None,
+                 platform: None,
+                 saved_at: None,
++                ..Default::default()
+             },
+         ];
+         let facts = super::super::host::HostFacts {
+@@ -615,6 +621,80 @@ mod endpoint {
+         // Upstream hides peers whose info has not arrived yet; so do we (and never delete them).
+         assert!(collect::parse_peer_file("1".into(), None, "[options]\nalias='x'\n").is_none());
+         assert!(collect::parse_peer_file("1".into(), None, "not toml [[[").is_none());
++        assert_eq!(p.host_id, None, "no pin, no host identity");
++    }
++
++    /// C1 (finding 7, AC-20): a peer enrolled by address is dialled by its address but answers
++    /// LAN discovery with its host ID; presence maps one to the other through the pin.
++    #[test]
++    fn ip_enrolled_peer_matches_discovery_through_its_pinned_host_id() {
++        let f = "[options]\nremotesmith-host-id = '418222333'\nremotesmith-host-fingerprint = 'aaaa bbbb'\n[info]\nhostname = 'SCOTT-PC'\nplatform = 'Windows'\n";
++        let ip = collect::parse_peer_file("192.168.1.20".into(), Some(5), f).unwrap();
++        assert_eq!(ip.host_id.as_deref(), Some("418222333"));
++        assert!(ip.is_direct());
++        assert_eq!(
++            ip.probe(),
++            presence::Probe { target: "192.168.1.20".into(), host: "418222333".into(), direct: true }
++        );
++        let by_id = collect::parse_peer_file(
++            "555".into(),
++            None,
++            "[options]\nremotesmith-host-id = '555'\n[info]\nplatform = 'Mac OS'\n",
++        )
++        .unwrap();
++        assert!(!by_id.is_direct());
++        assert_eq!(by_id.probe().host, "555");
++        let unpinned = collect::parse_peer_file("10.0.0.9:21118".into(), None, "[info]\nplatform = 'Mac OS'\n").unwrap();
++        assert!(unpinned.is_direct());
++        assert_eq!(unpinned.probe().host, "10.0.0.9:21118");
++
++        let table: Table = Default::default();
++        let peers = vec![ip.probe(), by_id.probe(), unpinned.probe()];
++        // Discovery answered by the IP peer's host ID; the ID server is down (cannot be asked).
++        let lan: HashSet<String> = ["418222333".to_string()].into();
++        presence::apply(&table, &peers, &lan, None);
++        let saved = vec![ip.clone(), by_id.clone(), unpinned.clone()];
++        let facts = super::super::host::HostFacts {
++            online_state: -1,
++            rendezvous_servers: vec!["rs.example.com".into()],
++            my_id: "111".into(),
++            ..Default::default()
++        };
++        let snap = collect::build(Some(&facts), &Readiness::default(), &saved, &table);
++        let presence_of = |id: &str| snap.peers.iter().find(|p| p.id == id).unwrap().presence.clone();
++        assert_eq!(presence_of("192.168.1.20"), Presence::Reachable { route: Route::Lan });
++        assert!(matches!(
++            presence_of("555"),
++            Presence::Unavailable { reason: Reason::ServerUnreachable, .. }
++        ));
++        // Saved by address and silent on the LAN: offline, not "server unreachable" (the ID
++        // server has nothing to do with an address route).
++        assert!(matches!(
++            presence_of("10.0.0.9:21118"),
++            Presence::Unavailable { reason: Reason::Offline, last_seen: None, .. }
++        ));
++
++        // The ID server is asked only about ID-route peers, and an "online" answer never makes
++        // an address-only peer reachable.
++        let online: HashSet<String> = ["555".to_string(), "10.0.0.9:21118".to_string()].into();
++        presence::apply(&table, &peers, &HashSet::new(), Some(&online));
++        let t = table.lock().unwrap().clone();
++        assert_eq!(t["555"].id_online, Some(true));
++        assert_eq!(t["10.0.0.9:21118"].id_online, None);
++        assert!(!t["192.168.1.20"].lan && t["192.168.1.20"].last_seen.is_some(), "last seen kept");
++    }
++
++    #[test]
++    fn a_saved_peer_pinned_to_this_machine_is_not_listed() {
++        let table: Table = Default::default();
++        let saved = vec![collect::SavedPeer {
++            id: "192.168.1.5".into(),
++            host_id: Some("111".into()),
++            ..Default::default()
++        }];
++        let facts = super::super::host::HostFacts { my_id: "111".into(), ..Default::default() };
++        let snap = collect::build(Some(&facts), &Readiness::default(), &saved, &table);
++        assert!(snap.peers.is_empty());
+     }
+ 
+     #[test]
