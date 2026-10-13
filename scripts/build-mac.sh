@@ -51,6 +51,11 @@ To get there: git submodule update --init --recursive --force (discards the patc
   echo "warning: --stock: building UNPATCHED upstream RustDesk (upstream defaults, not RemoteSmith)" >&2
 else
   stack_ok=1
+  # A patch set with no patches would make "exactly the stack" mean "the upstream pin".
+  for sub in rustdesk hbb_common; do
+    load_patches "$sub"
+    ((${#PATCHES[@]})) || die "$PATCHES_ROOT/$sub has no patches; that would be a stock build (use --stock if that is what you want)"
+  done
   check_patch_stack "$RUSTDESK_DIR" "$RD_PIN" vendor/rustdesk rustdesk || stack_ok=0
   check_patch_stack "$HBB_DIR" "$HBB_PIN" libs/hbb_common hbb_common || stack_ok=0
   ((stack_ok)) || die "vendor/rustdesk and libs/hbb_common must carry exactly the patches/ stack (problems above).

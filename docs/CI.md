@@ -25,7 +25,7 @@ A newer run on the same ref cancels the older one (`concurrency` group per workf
 | `x86_64-pc-windows-msvc` | windows-2022 | The Windows Flutter app: portable folder, self-extracting exe and MSI. |
 | `aarch64-apple-darwin` | macos-14 | The macOS Flutter app: unsigned `.dmg` and `.app.zip`. |
 
-Every job that touches the source runs `bash scripts/apply-patches.sh` first. If that script doesn't exist yet, the job logs a "Patches skipped" notice and builds stock RustDesk.
+Every job that touches the source runs `bash scripts/apply-patches.sh` first. The build jobs and `generate-bridge` still carry an "if the script is missing, log a Patches skipped notice and build stock" fallback from before the patch workflow existed; the test jobs call it unconditionally, so a tree without it fails the `tests` gate and nothing is built.
 
 The build jobs start only after the `tests` gate, so a run takes roughly the fork Rust test job (a debug build of the whole crate; longest on a cold cache) plus the build. That is the price of never producing artifacts from a red suite. The test jobs run in parallel with each other and with `build-RustDeskTempTopMostWindow`.
 
@@ -89,6 +89,6 @@ The toolchain matches upstream:
 
 ## Local checks
 
-`scripts/verify.sh` runs the same suites locally when their inputs exist (the fork tests need `scripts/apply-patches.sh` and a `scripts/build-mac.sh` run first).
+`scripts/verify.sh` runs the local equivalents when their inputs exist: sidecar fmt/clippy/test (plus Windows-target clippy, not native Windows tests), the fork Rust tests filtered to `rs_keymap` and `remotesmith` (CI runs the whole `--lib` suite and hbb_common's), and the RemoteSmith Flutter tests. The fork tests need `scripts/apply-patches.sh` and a `scripts/build-mac.sh` run first. The exact CI commands work locally too, e.g. `cd vendor/rustdesk && RUSTUP_TOOLCHAIN=1.81 CARGO_TARGET_DIR=~/.cache/remotesmith/target-mac cargo test --locked --lib --features flutter,hwcodec,unix-file-copy-paste,screencapturekit`.
 
 `scripts/verify.sh` runs `actionlint` on the workflows when it is installed (`brew install actionlint`). You can also run `ci-lint` locally with `act push -j ci-lint -P ubuntu-latest=catthehacker/ubuntu:act-latest --container-architecture linux/amd64 --container-daemon-socket -`. The macOS and Windows jobs can't run under `act`, which only runs Linux containers.

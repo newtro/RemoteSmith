@@ -106,8 +106,11 @@ check_patch_stack() { # repo-dir pin label patches-subdir
   load_patches "$sub"
   n=${#PATCHES[@]}
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  if [[ "$branch" != "$PATCH_BRANCH" ]]; then
-    echo "$label: HEAD is ${branch:+branch $branch}${branch:-detached at $(git -C "$dir" rev-parse --short=12 HEAD)}, not branch $PATCH_BRANCH" >&2
+  if [[ -z "$branch" ]]; then
+    echo "$label: HEAD is detached at $(git -C "$dir" rev-parse --short=12 HEAD), not on branch $PATCH_BRANCH" >&2
+    bad=1
+  elif [[ "$branch" != "$PATCH_BRANCH" ]]; then
+    echo "$label: HEAD is on branch $branch, not $PATCH_BRANCH" >&2
     bad=1
   fi
   if ! git -C "$dir" merge-base --is-ancestor "$pin" HEAD 2>/dev/null; then
@@ -142,7 +145,8 @@ check_patch_stack() { # repo-dir pin label patches-subdir
   return "$bad"
 }
 
-# Tracked files with uncommitted changes in a submodule checkout (empty when clean).
+# Uncommitted changes in a submodule checkout, untracked non-ignored files included (they end up
+# in a build too). Empty when clean.
 dirty_summary() { # repo-dir
-  git -C "$1" status --porcelain --untracked-files=no --ignore-submodules=all
+  git -C "$1" status --porcelain --untracked-files=normal --ignore-submodules=all
 }

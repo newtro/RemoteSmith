@@ -81,7 +81,7 @@ scripts/verify.sh            # sidecar, patch, fork Rust + Flutter unit tests, l
   - a fresh or stale checkout (submodules at the upstream pins, a patch missing, a `patches/` file changed since the last apply): run `scripts/apply-patches.sh`;
   - new commits on top of the stack: run `scripts/export-patches.sh` first, so the build is reproducible from `patches/`;
   - a detached HEAD, a reworded commit, or a superproject gitlink staged at a patch commit is also refused.
-  - Uncommitted edits in the submodules are allowed (the normal edit-build loop) but printed as a warning, since they are not in `patches/`.
+  - Uncommitted edits and untracked files in the submodules are allowed (the normal edit-build loop) but printed as a warning, since they are not in `patches/`. An empty `patches/rustdesk` or `patches/hbb_common` is refused too (that would be a stock build).
 - `scripts/build-mac.sh --stock` deliberately builds unpatched upstream RustDesk (`RustDesk.app`, upstream defaults). It requires both submodules at their pinned commits; `git submodule update --init --recursive --force` gets back there and `apply-patches.sh` restores the fork afterwards.
 
 - `scripts/lib/mac-env.sh` holds every version, each with the upstream workflow line it mirrors. Everything lands in `~/.cache/remotesmith/`; your default rustup toolchain is not touched (the build sets `RUSTUP_TOOLCHAIN`).
