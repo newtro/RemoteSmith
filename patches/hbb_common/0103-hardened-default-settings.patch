@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:27:37 -0400
+Subject: remotesmith(0103): hardened default settings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Seed DEFAULT_SETTINGS with approve-mode=password, direct-server=Y and
+enable-lan-discovery=Y (user-changeable), and OVERWRITE_SETTINGS with
+verification-method=use-permanent-password, so the temporary password stays
+disabled and cannot be turned back on, and allow-hide-cm=N, so the renamed
+(custom-client) build can never hide the host's connection window (§6.2a).
+custom.txt (if any) still extends both maps.
+
+Plan: DEC-10, DEF-13, AC-10, AC-60, §4 thin-fork patch 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 81 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index 68c8a3ebe92b..d5902c139a65 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -75,8 +75,8 @@ lazy_static::lazy_static! {
+     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
+     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
+     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
+-    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+-    pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
++    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(remotesmith_default_settings());
++    pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(remotesmith_overwrite_settings());
+     pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+     pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+@@ -85,6 +85,32 @@ lazy_static::lazy_static! {
+     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+ }
+ 
++/// RemoteSmith hardened defaults (DEC-10). The user can change these in Settings.
++/// `approve-mode=password`: sessions need the password, no click-to-accept by default.
++/// `direct-server=Y`: direct IP access (port 21118) on, so the LAN works without the server.
++/// `enable-lan-discovery=Y`: LAN discovery on.
++pub fn remotesmith_default_settings() -> HashMap<String, String> {
++    HashMap::from([
++        ("approve-mode".to_owned(), "password".to_owned()),
++        (keys::OPTION_DIRECT_SERVER.to_owned(), "Y".to_owned()),
++        ("enable-lan-discovery".to_owned(), "Y".to_owned()),
++    ])
++}
++
++/// RemoteSmith fixed settings (DEC-10, AC-10): only the permanent password is accepted,
++/// the temporary (one-time) password stays disabled and cannot be turned back on.
++/// `allow-hide-cm=N`: the renamed (custom-client) build would otherwise honour hide_cm with the
++/// hardened password-only defaults, letting a session run with no host-side indicator (§6.2a).
++pub fn remotesmith_overwrite_settings() -> HashMap<String, String> {
++    HashMap::from([
++        (
++            "verification-method".to_owned(),
++            "use-permanent-password".to_owned(),
++        ),
++        ("allow-hide-cm".to_owned(), "N".to_owned()),
++    ])
++}
++
+ #[cfg(target_os = "android")]
+ lazy_static::lazy_static! {
+     pub static ref ANDROID_RUSTLS_PLATFORM_VERIFIER_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+@@ -3702,3 +3728,54 @@ mod remotesmith_no_default_servers_tests {
+         assert!(!LINK_DOCS_HOME.contains("rustdesk.com"));
+     }
+ }
++
++#[cfg(test)]
++mod remotesmith_hardened_defaults_tests {
++    use super::*;
++
++    // DEC-10 / AC-10: hardened defaults are in place and the temporary password is off.
++    #[test]
++    fn hardened_defaults() {
++        let d = remotesmith_default_settings();
++        assert_eq!(d.get("approve-mode").map(String::as_str), Some("password"));
++        assert_eq!(d.get("direct-server").map(String::as_str), Some("Y"));
++        assert_eq!(d.get("enable-lan-discovery").map(String::as_str), Some("Y"));
++        let o = remotesmith_overwrite_settings();
++        assert_eq!(
++            o.get("verification-method").map(String::as_str),
++            Some("use-permanent-password")
++        );
++        assert_eq!(o.get("allow-hide-cm").map(String::as_str), Some("N"));
++        assert!(!option2bool("allow-hide-cm", "N"));
++        assert!(option2bool(keys::OPTION_DIRECT_SERVER, "Y"));
++    }
++
++    #[test]
++    fn temporary_password_cannot_be_reenabled() {
++        // OVERWRITE_SETTINGS wins over whatever is stored, and the stored value is dropped.
++        let overwrite = RwLock::new(remotesmith_overwrite_settings());
++        let defaults = RwLock::new(remotesmith_default_settings());
++        let mut stored = HashMap::new();
++        stored.insert(
++            "verification-method".to_owned(),
++            "use-both-passwords".to_owned(),
++        );
++        assert_eq!(
++            get_or(&overwrite, &stored, &defaults, "verification-method").as_deref(),
++            Some("use-permanent-password")
++        );
++        assert!(!is_option_can_save(
++            &overwrite,
++            "verification-method",
++            &defaults,
++            "use-both-passwords"
++        ));
++        // A default the user changes is saved; setting it back to the default clears it.
++        assert!(is_option_can_save(&overwrite, "direct-server", &defaults, "N"));
++        assert!(!is_option_can_save(&overwrite, "direct-server", &defaults, "Y"));
++        assert_eq!(
++            get_or(&overwrite, &HashMap::new(), &defaults, "approve-mode").as_deref(),
++            Some("password")
++        );
++    }
++}

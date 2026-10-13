@@ -1,0 +1,1368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:36:34 -0400
+Subject: remotesmith(0104): first-run provisioning (server, LAN only or
+ controller only; password)
+
+On first launch the desktop home page shows a setup dialog until the machine
+has a route and, if it accepts incoming connections, a permanent password:
+- route: ID server host + public key (validated: host[:port] or
+  [IPv6]:port, 44-char base64 Ed25519 key), or paste an exported server
+  config, or "Direct LAN only" (remotesmith-lan-only=Y). A host without a
+  valid key does not count.
+- "Controller only": the machine never accepts incoming connections, using
+  upstream's stop-service option (no rendezvous registration, no direct-IP
+  listener), and needs no password. Settings > General > Start service
+  turns hosting on, and the dialog then asks for the password.
+  Setup closes only once the service confirms it: stop-service=Y is
+  acknowledged and nothing listens on the direct-IP port (a cancelled
+  administrator prompt or macOS's asynchronous stop keeps the dialog open
+  with the reason, even if a password already exists).
+- otherwise a permanent password of at least 12 characters, with a
+  generator (20 chars from the OS CSPRNG, no look-alikes, always a digit,
+  lower and upper case).
+Values go through the same option/password calls as Settings, so they are
+stored in upstream's config (password hashed/encrypted as upstream does).
+Nothing is prefilled; an existing relay/API server is kept.
+
+Direct LAN only is enforced, not just recorded: hbb_common 0104 drops every
+rendezvous source, and here the API server, the exe-name server, id@server
+connections and get_custom_rendezvous_server() return nothing. Choosing a
+server (dialog, Settings, CLI, --config) turns LAN only off; choosing LAN
+only (dialog, CLI) clears the stored servers.
+
+Headless: --option custom-rendezvous-server/key/remotesmith-lan-only/
+stop-service and --password apply the same validation before anything is
+written; --config and --import-config refuse a malformed or key-less
+server; --import-config loads and validates both files before writing
+either, so a rejected import changes nothing. The Settings password dialog minimum goes from 8 to 12. Logic and
+tests live in src/remotesmith.rs; four small FFI functions expose it.
+
+Plan: FLOW-2, DEC-10, DEF-2, AC-40, AC-10.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/common.dart                       |   4 +
+ .../lib/desktop/pages/desktop_home_page.dart  |  10 +-
+ .../desktop/widgets/remotesmith_setup.dart    | 331 +++++++++
+ src/client.rs                                 |   4 +
+ src/common.rs                                 |  16 +-
+ src/core_main.rs                              |  87 ++-
+ src/flutter_ffi.rs                            |  43 ++
+ src/remotesmith.rs                            | 665 ++++++++++++++++++
+ 8 files changed, 1128 insertions(+), 32 deletions(-)
+ create mode 100644 flutter/lib/desktop/widgets/remotesmith_setup.dart
+
+diff --git a/flutter/lib/common.dart b/flutter/lib/common.dart
+index 00c2f4696cbd..8d2665361abc 100644
+--- a/flutter/lib/common.dart
++++ b/flutter/lib/common.dart
+@@ -3633,6 +3633,10 @@ Future<bool> setServerConfig(
+   await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
+   await bind.mainSetOption(key: 'api-server', value: config.apiServer);
+   await bind.mainSetOption(key: 'key', value: config.key);
++  if (config.idServer.isNotEmpty) {
++    // RemoteSmith: an ID server and "Direct LAN only" exclude each other (FLOW-2).
++    await bind.mainSetOption(key: 'remotesmith-lan-only', value: '');
++  }
+   final newApiServer = await bind.mainGetApiServer();
+   if (oldApiServer.isNotEmpty &&
+       oldApiServer != newApiServer &&
+diff --git a/flutter/lib/desktop/pages/desktop_home_page.dart b/flutter/lib/desktop/pages/desktop_home_page.dart
+index 97178a4ae548..3e5461046a67 100644
+--- a/flutter/lib/desktop/pages/desktop_home_page.dart
++++ b/flutter/lib/desktop/pages/desktop_home_page.dart
+@@ -12,6 +12,7 @@ import 'package:flutter_hbb/consts.dart';
+ import 'package:flutter_hbb/desktop/pages/connection_page.dart';
+ import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
+ import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
++import 'package:flutter_hbb/desktop/widgets/remotesmith_setup.dart';
+ import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
+ import 'package:flutter_hbb/models/platform_model.dart';
+ import 'package:flutter_hbb/models/server_model.dart';
+@@ -695,6 +696,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
+   @override
+   void initState() {
+     super.initState();
++    // RemoteSmith: first-run setup when no server/LAN-only choice or no password (FLOW-2).
++    WidgetsBinding.instance
++        .addPostFrameCallback((_) => showRemoteSmithSetupIfNeeded());
+     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
+       await gFFI.serverModel.fetchID();
+       final error = await bind.mainGetError();
+@@ -704,8 +708,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
+       }
+       final v = await mainGetBoolOption(kOptionStopService);
+       if (v != svcStopped.value) {
++        final started = svcStopped.value && !v;
+         svcStopped.value = v;
+         setState(() {});
++        // RemoteSmith: a controller-only machine that starts hosting needs a password.
++        if (started) showRemoteSmithSetupIfNeeded();
+       }
+       if (watchIsCanScreenRecording) {
+         if (bind.mainIsCanScreenRecording(prompt: false)) {
+@@ -900,7 +907,8 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
+     UppercaseValidationRule(),
+     LowercaseValidationRule(),
+     // SpecialCharacterValidationRule(),
+-    MinCharactersValidationRule(8),
++    // RemoteSmith: same minimum as first-run setup and --password (DEC-10).
++    MinCharactersValidationRule(12),
+   ];
+   final maxLength = bind.mainMaxEncryptLen();
+   final statusTip = localPasswordSet
+diff --git a/flutter/lib/desktop/widgets/remotesmith_setup.dart b/flutter/lib/desktop/widgets/remotesmith_setup.dart
+new file mode 100644
+index 000000000000..02eb8d118941
+--- /dev/null
++++ b/flutter/lib/desktop/widgets/remotesmith_setup.dart
+@@ -0,0 +1,331 @@
++// RemoteSmith first-run setup (FLOW-2, AC-40).
++//
++// A fresh build has no rendezvous server. On first launch this asks for the ID server host and
++// its public key (or "Direct LAN only") and a permanent password (or "Controller only", which
++// turns incoming connections off with upstream's stop-service option), then stores them through the
++// same option and password calls the Settings page uses. Validation lives in Rust
++// (src/remotesmith.rs) so the CLI applies the same rules. Nothing is prefilled: the repo is
++// public and carries no personal infrastructure.
++
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:flutter_hbb/common.dart';
++import 'package:flutter_hbb/models/platform_model.dart';
++import 'package:get/get.dart';
++
++const String kRemoteSmithOptionLanOnly = 'remotesmith-lan-only';
++// Upstream's "stop service": no rendezvous registration and no direct-IP listener, so the
++// machine accepts no incoming connections. Settings > General > "Start service" undoes it,
++// after which this setup asks for the permanent password.
++const String kRemoteSmithOptionStopService = 'stop-service';
++const String kRemoteSmithSetupDialogTag = 'remotesmith-setup';
++
++bool _setupShowing = false;
++
++/// Shows the setup dialog when no route (server + key, or LAN only) is set, or when the machine
++/// accepts incoming connections but has no permanent password.
++Future<void> showRemoteSmithSetupIfNeeded() async {
++  if (_setupShowing || bind.isOutgoingOnly()) return;
++  if (!await bind.mainRemotesmithNeedsProvisioning()) return;
++  _setupShowing = true;
++  try {
++    await _showSetupDialog();
++  } finally {
++    _setupShowing = false;
++  }
++}
++
++Future<void> _showSetupDialog() async {
++  final host = TextEditingController(
++      text: await bind.mainGetOption(key: 'custom-rendezvous-server'));
++  final key = TextEditingController(text: await bind.mainGetOption(key: 'key'));
++  // Kept as they are (or taken from a pasted config): the dialog only edits host and key.
++  var relayServer = await bind.mainGetOption(key: 'relay-server');
++  var apiServer = await bind.mainGetOption(key: 'api-server');
++  final p0 = TextEditingController();
++  final p1 = TextEditingController();
++  final passwordAlreadySet =
++      (await bind.mainGetCommon(key: 'permanent-password-set')) == 'true';
++  var lanOnly =
++      (await bind.mainGetOption(key: kRemoteSmithOptionLanOnly)) == 'Y';
++  var controllerOnly =
++      (await bind.mainGetOption(key: kRemoteSmithOptionStopService)) == 'Y';
++  var obscure = true;
++  var serverErr = '';
++  var passErr = '';
++  var confirmErr = '';
++  var saving = false;
++  final maxLength = bind.mainMaxEncryptLen();
++
++  await gFFI.dialogManager.show((setState, close, context) {
++    Future<void> pasteConfig() async {
++      final data = await Clipboard.getData(Clipboard.kTextPlain);
++      final text = data?.text?.trim() ?? '';
++      if (text.isEmpty) return;
++      try {
++        // The export format of Settings > Network > ID/Relay server.
++        final sc = ServerConfig.decode(text);
++        setState(() {
++          host.text = sc.idServer;
++          key.text = sc.key;
++          relayServer = sc.relayServer;
++          apiServer = sc.apiServer;
++          lanOnly = false;
++          serverErr = '';
++        });
++      } catch (_) {
++        setState(() => serverErr =
++            'The clipboard does not hold an exported server config.');
++      }
++    }
++
++    void generate() {
++      final p = bind.mainRemotesmithGeneratePassword();
++      setState(() {
++        p0.text = p;
++        p1.text = p;
++        obscure = false;
++        passErr = '';
++        confirmErr = '';
++      });
++    }
++
++    Future<void> submit() async {
++      if (saving) return;
++      setState(() {
++        serverErr = '';
++        passErr = '';
++        confirmErr = '';
++      });
++      if (!lanOnly) {
++        final err = bind.mainRemotesmithValidateServer(
++            host: host.text.trim(), key: key.text.trim());
++        if (err.isNotEmpty) {
++          setState(() => serverErr = err);
++          return;
++        }
++      }
++      final pass = p0.text.trim();
++      final changePassword =
++          !controllerOnly && (pass.isNotEmpty || !passwordAlreadySet);
++      if (changePassword) {
++        final err = bind.mainRemotesmithValidatePassword(password: pass);
++        if (err.isNotEmpty) {
++          setState(() => passErr = err);
++          return;
++        }
++        if (p1.text.trim() != pass) {
++          setState(() =>
++              confirmErr = translate('The confirmation is not identical.'));
++          return;
++        }
++      }
++      setState(() => saving = true);
++      var closed = false;
++      try {
++        if (lanOnly) {
++          // No server at all: also drop any relay/API server so nothing is contacted.
++          await setServerConfig(null, null, ServerConfig());
++          await bind.mainSetOption(key: kRemoteSmithOptionLanOnly, value: 'Y');
++        } else {
++          await setServerConfig(
++              null,
++              null,
++              ServerConfig(
++                  idServer: host.text.trim(),
++                  key: key.text.trim(),
++                  relayServer: relayServer,
++                  apiServer: apiServer));
++          await bind.mainSetOption(key: kRemoteSmithOptionLanOnly, value: '');
++        }
++        if (changePassword) {
++          final ok =
++              await bind.mainSetPermanentPasswordWithResult(password: pass);
++          if (!ok) {
++            setState(() => passErr =
++                'Could not save the password. Is the RemoteSmith service running?');
++            return;
++          }
++        }
++        final stopped =
++            (await bind.mainGetOption(key: kRemoteSmithOptionStopService)) ==
++                'Y';
++        if (stopped != controllerOnly) {
++          await bind.mainSetOption(
++              key: kRemoteSmithOptionStopService,
++              value: controllerOnly ? 'Y' : '');
++        }
++        // Close only once the service confirms the result. For Controller only that means
++        // stop-service=Y is acknowledged AND nothing listens on the direct port: a cancelled
++        // administrator prompt, or macOS stopping the service asynchronously, must not leave
++        // hosting on behind a closed dialog. Bounded wait for the prompt and the stop.
++        var err = await bind.mainRemotesmithCheckSetup(
++            controllerOnly: controllerOnly);
++        if (controllerOnly && err.isNotEmpty) {
++          setState(() => serverErr = 'Waiting for the service to stop...');
++          for (var i = 0; i < 60 && err.isNotEmpty; i++) {
++            await Future.delayed(const Duration(seconds: 1));
++            err = await bind.mainRemotesmithCheckSetup(controllerOnly: true);
++          }
++        }
++        if (err.isNotEmpty) {
++          setState(() => serverErr = err);
++          return;
++        }
++        closed = true;
++        close();
++      } finally {
++        if (!closed) setState(() => saving = false);
++      }
++    }
++
++    Widget radio(bool value, String label) => RadioListTile<bool>(
++          dense: true,
++          contentPadding: EdgeInsets.zero,
++          value: value,
++          groupValue: lanOnly,
++          title: Text(label),
++          onChanged: (v) => setState(() {
++            lanOnly = v ?? false;
++            serverErr = '';
++          }),
++        );
++
++    return CustomAlertDialog(
++      title: Row(children: [
++        Icon(Icons.settings_ethernet, color: MyTheme.accent),
++        Text('Set up ${bind.mainGetAppNameSync()}').paddingOnly(left: 10),
++      ]),
++      contentBoxConstraints: const BoxConstraints(minWidth: 500, maxWidth: 560),
++      // Scrolls when the window is small (the default 800x600 window cannot fit it all).
++      content: SingleChildScrollView(
++          child: Column(
++        mainAxisSize: MainAxisSize.min,
++        crossAxisAlignment: CrossAxisAlignment.start,
++        children: [
++          Text(
++            'RemoteSmith has no built-in server. Use your own ID/relay server '
++            '(hbbs/hbbr) for connections from outside your network, or connect '
++            'directly on the LAN only.',
++            style: const TextStyle(fontSize: 13),
++          ).marginOnly(bottom: 8),
++          radio(false, 'Use my ID server'),
++          if (!lanOnly) ...[
++            TextField(
++              controller: host,
++              autofocus: true,
++              decoration: const InputDecoration(
++                  labelText: 'ID server host', hintText: 'host or host:port'),
++              onChanged: (_) => setState(() => serverErr = ''),
++            ),
++            TextField(
++              controller: key,
++              decoration: InputDecoration(
++                  labelText: 'Server public key',
++                  hintText: '44 characters, from id_ed25519.pub',
++                  errorText: serverErr.isNotEmpty ? serverErr : null,
++                  errorMaxLines: 3),
++              onChanged: (_) => setState(() => serverErr = ''),
++            ),
++            Align(
++              alignment: Alignment.centerRight,
++              child: TextButton.icon(
++                onPressed: pasteConfig,
++                icon: const Icon(Icons.content_paste, size: 16),
++                label: const Text('Paste exported config'),
++              ),
++            ),
++          ],
++          radio(true, 'Direct LAN only (no server)'),
++          if (lanOnly && serverErr.isNotEmpty)
++            Text(serverErr, style: const TextStyle(color: Colors.red)),
++          const Divider(height: 24),
++          CheckboxListTile(
++            dense: true,
++            contentPadding: EdgeInsets.zero,
++            controlAffinity: ListTileControlAffinity.leading,
++            value: controllerOnly,
++            title: const Text('Controller only'),
++            subtitle: const Text(
++                'This machine only controls others and never accepts incoming '
++                'connections, so it needs no password. To host later, use '
++                'Settings > General > Start service; you will then be asked for a password.'),
++            onChanged: (v) => setState(() {
++              controllerOnly = v ?? false;
++              passErr = '';
++              confirmErr = '';
++            }),
++          ),
++          if (!controllerOnly) ...[
++            Text(
++              passwordAlreadySet
++                  ? 'A permanent password is already set. Leave these empty to keep it.'
++                  : 'Set the permanent password other machines use to connect '
++                      '(at least 12 characters). The one-time password is disabled.',
++              style: const TextStyle(fontSize: 13),
++            ),
++            Row(children: [
++              Expanded(
++                child: TextField(
++                  controller: p0,
++                  obscureText: obscure,
++                  maxLength: maxLength,
++                  decoration: InputDecoration(
++                      labelText: translate('Password'),
++                      errorText: passErr.isNotEmpty ? passErr : null,
++                      counterText: '',
++                      errorMaxLines: 3),
++                  onChanged: (_) => setState(() => passErr = ''),
++                ),
++              ),
++              IconButton(
++                tooltip: obscure ? 'Show' : 'Hide',
++                icon: Icon(obscure ? Icons.visibility : Icons.visibility_off),
++                onPressed: () => setState(() => obscure = !obscure),
++              ),
++              IconButton(
++                tooltip: 'Copy',
++                icon: const Icon(Icons.copy),
++                onPressed: p0.text.isEmpty
++                    ? null
++                    : () {
++                        Clipboard.setData(ClipboardData(text: p0.text));
++                        showToast(translate('Copied'));
++                      },
++              ),
++            ]),
++            TextField(
++              controller: p1,
++              obscureText: obscure,
++              maxLength: maxLength,
++              decoration: InputDecoration(
++                  labelText: translate('Confirmation'),
++                  errorText: confirmErr.isNotEmpty ? confirmErr : null,
++                  counterText: ''),
++              onChanged: (_) => setState(() => confirmErr = ''),
++              onSubmitted: (_) => submit(),
++            ),
++            Align(
++              alignment: Alignment.centerLeft,
++              child: TextButton.icon(
++                onPressed: generate,
++                icon: const Icon(Icons.casino_outlined, size: 16),
++                label: const Text('Generate a strong password'),
++              ),
++            ),
++            const Text(
++              'Store the password in your password manager.',
++              style: TextStyle(fontSize: 12),
++            ),
++          ],
++        ],
++      )),
++      actions: [
++        dialogButton('Save',
++            icon: const Icon(Icons.done_rounded),
++            onPressed: saving ? null : submit),
++      ],
++      onSubmit: submit,
++    );
++  }, tag: kRemoteSmithSetupDialogTag);
++}
+diff --git a/src/client.rs b/src/client.rs
+index 2ba1dcaf9f14..b0f9874839dc 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -455,6 +455,10 @@ impl Client {
+         }
+ 
+         let other_server = interface.get_lch().read().unwrap().other_server.clone();
++        if other_server.is_some() && Config::is_lan_only() {
++            // RemoteSmith: "Direct LAN only" also covers id@server addresses (FLOW-2).
++            bail!("Direct LAN only is on, so id@server addresses are not used. Connect by the peer's LAN IP address.");
++        }
+         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
+             (a.as_ref(), b.as_ref(), c.as_ref(), "")
+         } else {
+diff --git a/src/common.rs b/src/common.rs
+index eba227fcf8a1..f1b4847979ca 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -772,9 +772,11 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, boo
+     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+     let (mut a, mut b) = get_rendezvous_server_(ms_timeout).await;
+     #[cfg(windows)]
+-    if let Ok(lic) = crate::platform::get_license_from_exe_name() {
+-        if !lic.host.is_empty() {
+-            a = lic.host;
++    if !Config::is_lan_only() {
++        if let Ok(lic) = crate::platform::get_license_from_exe_name() {
++            if !lic.host.is_empty() {
++                a = lic.host;
++            }
+         }
+     }
+     let mut b: Vec<String> = b
+@@ -1117,6 +1119,10 @@ pub fn is_setup(name: &str) -> bool {
+ }
+ 
+ pub fn get_custom_rendezvous_server(custom: String) -> String {
++    // RemoteSmith: "Direct LAN only" overrides every configured or exe-name server (FLOW-2).
++    if Config::is_lan_only() {
++        return "".to_owned();
++    }
+     #[cfg(windows)]
+     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
+         if !lic.host.is_empty() {
+@@ -1151,6 +1157,10 @@ pub fn get_api_server(api: String, custom: String) -> String {
+ }
+ 
+ fn get_api_server_(api: String, custom: String) -> String {
++    // RemoteSmith: "Direct LAN only" uses no API server, whatever is stored (FLOW-2).
++    if Config::is_lan_only() {
++        return "".to_owned();
++    }
+     #[cfg(windows)]
+     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
+         if !lic.api.is_empty() {
+diff --git a/src/core_main.rs b/src/core_main.rs
+index b5a451ed842a..5fca8120a689 100644
+--- a/src/core_main.rs
++++ b/src/core_main.rs
+@@ -444,6 +444,11 @@ pub fn core_main() -> Option<Vec<String>> {
+                 return None;
+             }
+             if args.len() == 2 {
++                // RemoteSmith: same minimum as first-run setup (DEC-10).
++                if let Err(err) = crate::remotesmith::validate_permanent_password(&args[1]) {
++                    println!("{err}");
++                    return None;
++                }
+                 if crate::platform::is_installed() && is_root() {
+                     if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
+                         println!("{err}");
+@@ -500,14 +505,23 @@ pub fn core_main() -> Option<Vec<String>> {
+             return None;
+         } else if args[0] == "--config" {
+             if args.len() == 2 && !args[0].contains("host=") {
++                // encrypted string used in renaming exe.
++                let name = if args[1].ends_with(".exe") {
++                    args[1].to_owned()
++                } else {
++                    format!("{}.exe", args[1])
++                };
++                let lic = crate::custom_server::get_custom_server_from_string(&name);
++                // RemoteSmith: refuse a malformed or key-less server before writing anything.
++                if let Ok(lic) = &lic {
++                    if let Err(err) = crate::remotesmith::validate_server_import(&lic.host, &lic.key)
++                    {
++                        println!("{err}");
++                        return None;
++                    }
++                }
+                 if crate::platform::is_installed() && is_root() {
+-                    // encrypted string used in renaming exe.
+-                    let name = if args[1].ends_with(".exe") {
+-                        args[1].to_owned()
+-                    } else {
+-                        format!("{}.exe", args[1])
+-                    };
+-                    if let Ok(lic) = crate::custom_server::get_custom_server_from_string(&name) {
++                    if let Ok(lic) = lic {
+                         if !lic.host.is_empty() {
+                             crate::ui_interface::set_option("key".into(), lic.key);
+                             crate::ui_interface::set_option(
+@@ -516,6 +530,10 @@ pub fn core_main() -> Option<Vec<String>> {
+                             );
+                             crate::ui_interface::set_option("api-server".into(), lic.api);
+                             crate::ui_interface::set_option("relay-server".into(), lic.relay);
++                            crate::ui_interface::set_option(
++                                crate::remotesmith::OPTION_LAN_ONLY.into(),
++                                "".into(),
++                            );
+                         }
+                     }
+                 } else {
+@@ -528,12 +546,33 @@ pub fn core_main() -> Option<Vec<String>> {
+                 println!("Settings are disabled!");
+                 return None;
+             }
++            // RemoteSmith: reject a malformed server host or key before anything else, and keep
++            // "Direct LAN only" and explicit servers from contradicting each other (FLOW-2).
++            let writes = if args.len() == 3 {
++                match crate::remotesmith::cli_option_writes(&args[1], &args[2]) {
++                    Ok(w) => w,
++                    Err(err) => {
++                        println!("{err}");
++                        return None;
++                    }
++                }
++            } else {
++                Vec::new()
++            };
+             if crate::platform::is_installed() && is_root() {
+                 if args.len() == 2 {
+                     let options = crate::ipc::get_options();
+                     println!("{}", options.get(&args[1]).unwrap_or(&"".to_owned()));
+                 } else if args.len() == 3 {
+-                    crate::ipc::set_option(&args[1], &args[2]);
++                    let mut options = crate::ipc::get_options();
++                    for (k, v) in writes {
++                        if v.is_empty() {
++                            options.remove(&k);
++                        } else {
++                            options.insert(k, v);
++                        }
++                    }
++                    crate::ipc::set_options(options).ok();
+                 }
+             } else {
+                 println!("Installation and administrative privileges required!");
+@@ -737,28 +776,20 @@ pub fn core_main() -> Option<Vec<String>> {
+ }
+ 
+ fn import_config(path: &str) {
+-    use hbb_common::{config::*, get_exe_time, get_modified_time};
++    use hbb_common::config::*;
+     let path2 = path.replace(".toml", "2.toml");
+-    let path2 = std::path::Path::new(&path2);
+-    let path = std::path::Path::new(path);
+     log::info!("import config from {:?} and {:?}", path, path2);
+-    let config: Config = load_path(path.into());
+-    if config.is_empty() {
+-        log::info!("Empty source config, skipped");
+-        return;
+-    }
+-    if get_modified_time(&path) > get_modified_time(&Config::file())
+-        && get_modified_time(&path) < get_exe_time()
+-    {
+-        if store_path(Config::file(), config).is_err() {
+-            log::info!("config written");
+-        }
+-    }
+-    let config2: Config2 = load_path(path2.into());
+-    if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
+-        if store_path(Config2::file(), config2).is_err() {
+-            log::info!("config2 written");
+-        }
++    // RemoteSmith: both files are loaded and validated before either is written, so a rejected
++    // import (malformed or key-less server) leaves the current config untouched (FLOW-2).
++    if let Err(err) = crate::remotesmith::import_config_files(
++        std::path::Path::new(path),
++        std::path::Path::new(&path2),
++        &Config::file(),
++        &Config2::file(),
++        hbb_common::get_exe_time(),
++    ) {
++        log::error!("import config: {err}");
++        println!("{err}");
+     }
+ }
+ 
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index f9cc2d66c251..a376363b8fbb 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -2516,6 +2516,49 @@ pub fn is_custom_client() -> SyncReturn<bool> {
+     SyncReturn(crate::common::is_custom_client())
+ }
+ 
++// RemoteSmith first-run provisioning (FLOW-2, AC-40); logic in src/remotesmith.rs.
++pub fn main_remotesmith_needs_provisioning() -> bool {
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    return crate::remotesmith::provisioning_needed();
++    #[cfg(any(target_os = "android", target_os = "ios"))]
++    return false;
++}
++
++/// "" when valid, otherwise the reason.
++pub fn main_remotesmith_validate_server(host: String, key: String) -> SyncReturn<String> {
++    SyncReturn(
++        crate::remotesmith::validate_server_host(&host)
++            .and_then(|_| crate::remotesmith::validate_server_key(&key))
++            .err()
++            .unwrap_or_default(),
++    )
++}
++
++/// "" when valid, otherwise the reason.
++pub fn main_remotesmith_validate_password(password: String) -> SyncReturn<String> {
++    SyncReturn(
++        crate::remotesmith::validate_permanent_password(&password)
++            .err()
++            .unwrap_or_default(),
++    )
++}
++
++/// "" when the setup dialog may close, otherwise the reason. With `controller_only`, also
++/// requires incoming connections to be confirmed off.
++pub fn main_remotesmith_check_setup(controller_only: bool) -> String {
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    return crate::remotesmith::check_setup(controller_only);
++    #[cfg(any(target_os = "android", target_os = "ios"))]
++    return {
++        let _ = controller_only;
++        String::new()
++    };
++}
++
++pub fn main_remotesmith_generate_password() -> SyncReturn<String> {
++    SyncReturn(crate::remotesmith::generate_password())
++}
++
+ pub fn is_disable_settings() -> SyncReturn<bool> {
+     SyncReturn(config::is_disable_settings())
+ }
+diff --git a/src/remotesmith.rs b/src/remotesmith.rs
+index 59b87a4c887a..54c9a18b81f9 100644
+--- a/src/remotesmith.rs
++++ b/src/remotesmith.rs
+@@ -9,3 +9,668 @@ pub const UPDATE_CHECK_DISABLED: bool = true;
+ 
+ /// Public source repository (AGPL-3.0 corresponding source).
+ pub const SOURCE_URL: &str = "https://github.com/newtro/RemoteSmith";
++
++// ---- First-run provisioning (FLOW-2, AC-40) ---------------------------------------------------
++//
++// A fresh build has no rendezvous server (DEF-2). On first launch the desktop UI asks for the
++// ID server host and its public key, or "Direct LAN only", plus a permanent password, and stores
++// them through upstream's normal option and password paths (the password is hashed and
++// encrypted by upstream's config). Headless setup uses the same keys through the CLI:
++//
++//   RemoteSmith --option custom-rendezvous-server <host[:port]>
++//   RemoteSmith --option key <44-char public key>
++//   RemoteSmith --option remotesmith-lan-only Y        # instead of the two above
++//   RemoteSmith --password <at least 12 characters>
++//
++// Nothing here ever has a default value: the repo is public and must not carry personal
++// infrastructure (DEC-15, AC-33).
++
++/// Option set to "Y" when the user chose direct LAN connections only (no rendezvous server).
++pub const OPTION_LAN_ONLY: &str = "remotesmith-lan-only";
++/// Upstream's option keys for the ID server and its public key.
++pub const OPTION_ID_SERVER: &str = "custom-rendezvous-server";
++pub const OPTION_KEY: &str = "key";
++/// Minimum permanent password length (DEC-10: long random password).
++pub const MIN_PASSWORD_LEN: usize = 12;
++/// Length of passwords made by [`generate_password`].
++pub const GENERATED_PASSWORD_LEN: usize = 20;
++
++/// Checks an ID server address: a host name or IPv4 address with an optional port, or an
++/// IPv6 address as `[address]:port` (the only IPv6 form the client's port handling accepts).
++pub fn validate_server_host(host: &str) -> Result<(), String> {
++    let host = host.trim();
++    if host.is_empty() {
++        return Err("Enter the ID server host.".to_owned());
++    }
++    if host.contains("://") || host.contains('/') {
++        return Err("Enter just the host (and optional :port), without http:// or a path.".to_owned());
++    }
++    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
++        return Err("The host must not contain spaces.".to_owned());
++    }
++    let (name, port) = if let Some(rest) = host.strip_prefix('[') {
++        // [IPv6] or [IPv6]:port
++        let Some((addr, tail)) = rest.split_once(']') else {
++            return Err("Missing ']' in the IPv6 address.".to_owned());
++        };
++        if addr.parse::<std::net::Ipv6Addr>().is_err() {
++            return Err("Invalid IPv6 address.".to_owned());
++        }
++        match tail.strip_prefix(':') {
++            Some(p) if !p.is_empty() => (addr, Some(p)),
++            _ => return Err("Write an IPv6 server as [address]:port, e.g. [2001:db8::1]:21116.".to_owned()),
++        }
++    } else if host.matches(':').count() > 1 {
++        return Err("Write an IPv6 server as [address]:port, e.g. [2001:db8::1]:21116.".to_owned());
++    } else {
++        match host.split_once(':') {
++            Some((n, p)) => (n, Some(p)),
++            None => (host, None),
++        }
++    };
++    if name.is_empty() {
++        return Err("Enter the ID server host.".to_owned());
++    }
++    if !name.contains(':') {
++        let label_ok = |l: &str| {
++            !l.is_empty()
++                && l.len() <= 63
++                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
++                && !l.starts_with('-')
++                && !l.ends_with('-')
++        };
++        if name.len() > 253 || !name.trim_end_matches('.').split('.').all(label_ok) {
++            return Err("Invalid host name.".to_owned());
++        }
++    }
++    if let Some(p) = port {
++        match p.parse::<u16>() {
++            Ok(v) if v > 0 => {}
++            _ => return Err("The port must be a number from 1 to 65535.".to_owned()),
++        }
++    }
++    Ok(())
++}
++
++/// Checks a server public key: the 44-character standard base64 encoding of a 32-byte
++/// Ed25519 key, as found in the server's `id_ed25519.pub`.
++pub fn validate_server_key(key: &str) -> Result<(), String> {
++    let key = key.trim();
++    if key.is_empty() {
++        return Err("Enter the server's public key (the contents of id_ed25519.pub).".to_owned());
++    }
++    if key.len() != 44 {
++        return Err(format!(
++            "The key must be 44 characters (it is {}). Copy all of id_ed25519.pub.",
++            key.chars().count()
++        ));
++    }
++    match crate::decode64(key) {
++        Ok(bytes) if bytes.len() == 32 => Ok(()),
++        _ => Err("The key is not a valid base64 Ed25519 public key.".to_owned()),
++    }
++}
++
++/// Checks a new permanent password (DEC-10). Leading and trailing spaces are not counted,
++/// because the desktop UI trims them before saving.
++pub fn validate_permanent_password(password: &str) -> Result<(), String> {
++    let n = password.trim().chars().count();
++    if n < MIN_PASSWORD_LEN {
++        return Err(format!(
++            "The password must be at least {MIN_PASSWORD_LEN} characters (it is {n})."
++        ));
++    }
++    Ok(())
++}
++
++/// Characters for generated passwords: letters and digits without look-alikes (0/O, 1/l/I),
++/// so a password read off a screen can be typed on the other machine.
++const PASSWORD_CHARS: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
++
++/// A random permanent password from the OS CSPRNG (~115 bits for 20 characters). It always
++/// has a digit, a lower-case and an upper-case letter, so it also passes the Settings
++/// "Set Password" dialog's rules.
++pub fn generate_password() -> String {
++    use hbb_common::rand::{rngs::OsRng, Rng};
++    let mut rng = OsRng;
++    loop {
++        let p: String = (0..GENERATED_PASSWORD_LEN)
++            .map(|_| PASSWORD_CHARS[rng.gen_range(0..PASSWORD_CHARS.len())] as char)
++            .collect();
++        if p.chars().any(|c| c.is_ascii_digit())
++            && p.chars().any(|c| c.is_ascii_lowercase())
++            && p.chars().any(|c| c.is_ascii_uppercase())
++        {
++            return p;
++        }
++    }
++}
++
++/// The route the machine uses, as stored in its options.
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
++pub struct ProvisioningState {
++    /// `custom-rendezvous-server` (or the server baked into the exe name).
++    pub id_server: String,
++    /// `key` (or the key baked into the exe name).
++    pub key: String,
++    /// `remotesmith-lan-only=Y`.
++    pub lan_only: bool,
++    /// `stop-service=Y`: this machine accepts no incoming connections ("Controller only").
++    pub controller_only: bool,
++    /// A usable permanent password is stored.
++    pub has_permanent_password: bool,
++}
++
++/// Whether first-run setup is still needed (FLOW-2, AC-40). Complete means:
++/// - a route: "Direct LAN only", or a valid ID server host together with a valid key
++///   (a host with a missing or malformed key does not count); and
++/// - either "Controller only" (no incoming connections, so no password is needed) or a
++///   permanent password, the only password RemoteSmith accepts.
++pub fn needs_provisioning(s: &ProvisioningState) -> bool {
++    let route_ok = s.lan_only
++        || (validate_server_host(&s.id_server).is_ok() && validate_server_key(&s.key).is_ok());
++    let incoming_ok = s.controller_only || s.has_permanent_password;
++    !route_ok || !incoming_ok
++}
++
++/// Checks a value given to `--option` for one of the provisioning keys. Other keys pass.
++pub fn validate_option(key: &str, value: &str) -> Result<(), String> {
++    match key {
++        OPTION_ID_SERVER if !value.is_empty() => validate_server_host(value),
++        OPTION_KEY if !value.is_empty() => validate_server_key(value),
++        OPTION_LAN_ONLY if !(value.is_empty() || value == "Y") => {
++            Err(format!("{OPTION_LAN_ONLY} must be Y or empty."))
++        }
++        _ => Ok(()),
++    }
++}
++
++/// The option writes a CLI `--option <key> <value>` turns into, after validation. Choosing
++/// "Direct LAN only" also clears every explicit server, and setting an ID server turns
++/// "Direct LAN only" off, so the stored options never contradict each other.
++pub fn cli_option_writes(key: &str, value: &str) -> Result<Vec<(String, String)>, String> {
++    validate_option(key, value)?;
++    let mut writes = vec![(key.to_owned(), value.to_owned())];
++    if key == OPTION_LAN_ONLY && value == "Y" {
++        for k in [OPTION_ID_SERVER, OPTION_KEY, "relay-server", "api-server"] {
++            writes.push((k.to_owned(), String::new()));
++        }
++    } else if key == OPTION_ID_SERVER && !value.is_empty() {
++        writes.push((OPTION_LAN_ONLY.to_owned(), String::new()));
++    }
++    Ok(writes)
++}
++
++/// Checks a server configuration about to be imported (`--config <exe-name string>`, or the
++/// options of an `--import-config` file): an ID server needs a valid host and a valid key.
++pub fn validate_server_import(host: &str, key: &str) -> Result<(), String> {
++    if host.trim().is_empty() {
++        if key.trim().is_empty() {
++            return Ok(());
++        }
++        return Err("The imported config has a key but no ID server host.".to_owned());
++    }
++    validate_server_host(host)?;
++    if key.trim().is_empty() {
++        return Err("The imported config has an ID server but no key.".to_owned());
++    }
++    validate_server_key(key)
++}
++
++/// Checks the options of a config file given to `--import-config`.
++pub fn validate_imported_options(
++    options: &std::collections::HashMap<String, String>,
++) -> Result<(), String> {
++    let get = |k: &str| options.get(k).map(String::as_str).unwrap_or_default();
++    validate_server_import(get(OPTION_ID_SERVER), get(OPTION_KEY))?;
++    validate_option(OPTION_LAN_ONLY, get(OPTION_LAN_ONLY))
++}
++
++/// `--import-config` (upstream's logic, reordered): load both source files and validate the
++/// server options **before** writing either destination, so a rejected import changes nothing.
++/// Upstream's freshness rules are kept: the primary file is copied only when it is newer than
++/// the destination and older than the running exe, the `2` file only when it is newer.
++/// Returns which destinations were written.
++pub fn import_config_files(
++    src: &std::path::Path,
++    src2: &std::path::Path,
++    dst: &std::path::Path,
++    dst2: &std::path::Path,
++    exe_time: std::time::SystemTime,
++) -> Result<(bool, bool), String> {
++    use hbb_common::{
++        config::{load_path, store_path, Config, Config2},
++        get_modified_time,
++    };
++    let config: Config = load_path(src.into());
++    if config.is_empty() {
++        hbb_common::log::info!("Empty source config, skipped");
++        return Ok((false, false));
++    }
++    let config2: Config2 = load_path(src2.into());
++    validate_imported_options(&config2.options)?;
++    let write1 = get_modified_time(src) > get_modified_time(dst) && get_modified_time(src) < exe_time;
++    let write2 = get_modified_time(src2) > get_modified_time(dst2);
++    if write1 {
++        store_path(dst.into(), config).map_err(|e| format!("Could not write {dst:?}: {e}"))?;
++    }
++    if write2 {
++        store_path(dst2.into(), config2).map_err(|e| format!("Could not write {dst2:?}: {e}"))?;
++    }
++    Ok((write1, write2))
++}
++
++/// Whether incoming connections are really off for "Controller only": the service reports
++/// `stop-service=Y` **and** nothing is listening on the direct-IP port any more. A cancelled
++/// privilege prompt leaves (Windows) or never sets (macOS) the flag, and macOS stops the
++/// service asynchronously, so the flag alone is not proof.
++pub fn incoming_stopped(stop_service: &str, direct_port_listening: bool) -> bool {
++    hbb_common::config::option2bool(OPTION_STOP_SERVICE, stop_service) && !direct_port_listening
++}
++
++/// Decides whether the setup dialog may close. With "Controller only" chosen, incoming
++/// connections must be confirmed off, even when a password already makes the general
++/// provisioning check pass.
++pub fn setup_result(
++    state: &ProvisioningState,
++    wants_controller_only: bool,
++    incoming_is_stopped: bool,
++) -> Result<(), String> {
++    if wants_controller_only && !incoming_is_stopped {
++        return Err("Incoming connections are still on: the service was not stopped. Approve the \
++                    administrator prompt and Save again, or untick Controller only and set a \
++                    password."
++            .to_owned());
++    }
++    if needs_provisioning(state) {
++        return Err("Settings were not saved. Is the RemoteSmith service running?".to_owned());
++    }
++    Ok(())
++}
++
++/// True when something is bound to the direct-IP port (the host side still accepts direct
++/// connections). Checked by trying to bind it ourselves; nothing is connected or sent.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn direct_port_listening(port: u16) -> bool {
++    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
++    let v6 = TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_err();
++    let v4 = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_err();
++    v6 || v4
++}
++
++/// The live check behind the dialog's Save: "" when setup may close, otherwise the reason.
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn check_setup(wants_controller_only: bool) -> String {
++    let options = crate::ipc::get_options();
++    let stop = options.get(OPTION_STOP_SERVICE).cloned().unwrap_or_default();
++    let port = options
++        .get("direct-access-port")
++        .and_then(|p| p.parse::<u16>().ok())
++        .filter(|p| *p > 0)
++        .unwrap_or((hbb_common::config::RENDEZVOUS_PORT + 2) as u16);
++    let stopped = incoming_stopped(&stop, direct_port_listening(port));
++    if wants_controller_only && !stopped {
++        return setup_result(&ProvisioningState::default(), true, false)
++            .err()
++            .unwrap_or_default();
++    }
++    if provisioning_needed() {
++        return setup_result(&ProvisioningState::default(), false, true)
++            .err()
++            .unwrap_or_default();
++    }
++    String::new()
++}
++
++/// Builds the provisioning state from an options map (as the service reports it).
++pub fn state_from_options(
++    options: &std::collections::HashMap<String, String>,
++    has_permanent_password: bool,
++) -> ProvisioningState {
++    let get = |k: &str| options.get(k).cloned().unwrap_or_default();
++    ProvisioningState {
++        id_server: get(OPTION_ID_SERVER),
++        key: get(OPTION_KEY),
++        lan_only: get(OPTION_LAN_ONLY) == "Y",
++        controller_only: hbb_common::config::option2bool(
++            OPTION_STOP_SERVICE,
++            &get(OPTION_STOP_SERVICE),
++        ),
++        has_permanent_password,
++    }
++}
++
++/// Upstream's "stop service" option: no rendezvous registration, no direct-IP listener.
++pub const OPTION_STOP_SERVICE: &str = "stop-service";
++
++/// Reads the live provisioning state, from the service over IPC where it runs, otherwise from
++/// the local config (the same files the user-level service writes).
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn provisioning_needed() -> bool {
++    let options = crate::ipc::get_options();
++    let has_password = match crate::ipc::get_config("permanent-password-set") {
++        Ok(Some(v)) => v.trim() == "Y",
++        _ => hbb_common::config::Config::has_permanent_password(),
++    };
++    #[allow(unused_mut)]
++    let mut state = state_from_options(&options, has_password);
++    if state.controller_only {
++        // Only counts while nothing listens on the direct port any more.
++        let port = options
++            .get("direct-access-port")
++            .and_then(|p| p.parse::<u16>().ok())
++            .filter(|p| *p > 0)
++            .unwrap_or((hbb_common::config::RENDEZVOUS_PORT + 2) as u16);
++        state.controller_only = !direct_port_listening(port);
++    }
++    #[cfg(windows)]
++    if state.id_server.is_empty() {
++        // A server baked into the exe name (upstream's custom-server naming) counts as set.
++        if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
++            state.id_server = lic.host;
++            state.key = lic.key;
++        }
++    }
++    needs_provisioning(&state)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn host_validation() {
++        for ok in [
++            "rs.example.com",
++            "rs.example.com:21116",
++            "10.0.0.5",
++            "10.0.0.5:21116",
++            "my-server",
++            "[2001:db8::1]:21116",
++            "  rs.example.com  ",
++        ] {
++            assert!(validate_server_host(ok).is_ok(), "{ok}");
++        }
++        for bad in [
++            "",
++            "   ",
++            "https://rs.example.com",
++            "rs.example.com/path",
++            "rs example.com",
++            "rs.example.com:0",
++            "rs.example.com:99999",
++            "rs.example.com:abc",
++            ":21116",
++            "-bad.example.com",
++            "bad_name.example.com",
++            "[2001:db8::1",
++            "[2001:db8::1]",
++            "[2001:db8::1]:",
++            "2001:db8::1",
++            "::1",
++            "[nope]:21116",
++            "2001:db8::zz",
++        ] {
++            assert!(validate_server_host(bad).is_err(), "{bad}");
++        }
++    }
++
++    #[test]
++    fn key_validation() {
++        // A real-format key: 32 bytes, standard base64 (44 chars with one '=').
++        let key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
++        assert_eq!(key.len(), 44);
++        assert!(validate_server_key(key).is_ok());
++        assert!(validate_server_key(&format!(" {key}\n")).is_ok());
++        assert!(validate_server_key("").is_err());
++        assert!(validate_server_key(&key[..43]).is_err());
++        assert!(validate_server_key(&format!("{key}A")).is_err());
++        // 44 characters but not base64.
++        assert!(validate_server_key("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!=").is_err());
++        // 44 characters of base64 that decode to 33 bytes (no padding).
++        assert!(validate_server_key("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWZn").is_err());
++    }
++
++    #[test]
++    fn password_validation() {
++        assert!(validate_permanent_password("").is_err());
++        assert!(validate_permanent_password("elevenchars").is_err());
++        assert!(validate_permanent_password("   elevenchars   ").is_err());
++        assert!(validate_permanent_password("twelve-chars").is_ok());
++        // Characters, not bytes.
++        assert!(validate_permanent_password("ééééééééééé").is_err());
++    }
++
++    #[test]
++    fn generated_passwords() {
++        let a = generate_password();
++        let b = generate_password();
++        assert_eq!(a.chars().count(), GENERATED_PASSWORD_LEN);
++        assert!(validate_permanent_password(&a).is_ok());
++        assert!(a.bytes().all(|c| PASSWORD_CHARS.contains(&c)));
++        assert_ne!(a, b);
++        for _ in 0..200 {
++            let p = generate_password();
++            assert!(p.chars().any(|c| c.is_ascii_digit()), "{p}");
++            assert!(p.chars().any(|c| c.is_ascii_lowercase()), "{p}");
++            assert!(p.chars().any(|c| c.is_ascii_uppercase()), "{p}");
++        }
++    }
++
++    const KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
++
++    fn opts(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
++        pairs
++            .iter()
++            .map(|(k, v)| (k.to_string(), v.to_string()))
++            .collect()
++    }
++
++    #[test]
++    fn provisioning_state() {
++        let need = |o: &[(&str, &str)], pw: bool| needs_provisioning(&state_from_options(&opts(o), pw));
++        // Fresh install: nothing set.
++        assert!(need(&[], false));
++        assert!(need(&[], true));
++        // Server without a key, or with a malformed key or host: not a usable route.
++        assert!(need(&[(OPTION_ID_SERVER, "rs.example.com")], true));
++        assert!(need(&[(OPTION_ID_SERVER, "rs.example.com"), (OPTION_KEY, "short")], true));
++        assert!(need(&[(OPTION_ID_SERVER, "http://rs"), (OPTION_KEY, KEY)], true));
++        assert!(need(&[(OPTION_KEY, KEY)], true));
++        // A route but no password, and not controller only.
++        assert!(need(&[(OPTION_ID_SERVER, "rs.example.com"), (OPTION_KEY, KEY)], false));
++        assert!(need(&[(OPTION_LAN_ONLY, "Y")], false));
++        // Controller only still needs a route.
++        assert!(need(&[(OPTION_STOP_SERVICE, "Y")], false));
++        // Done.
++        assert!(!need(&[(OPTION_ID_SERVER, "rs.example.com"), (OPTION_KEY, KEY)], true));
++        assert!(!need(&[(OPTION_LAN_ONLY, "Y")], true));
++        assert!(!need(&[(OPTION_LAN_ONLY, "Y"), (OPTION_STOP_SERVICE, "Y")], false));
++        assert!(!need(
++            &[(OPTION_ID_SERVER, "rs.example.com:21116"), (OPTION_KEY, KEY), (OPTION_STOP_SERVICE, "Y")],
++            false
++        ));
++        // Switching a controller-only machine to host (start service) needs the password again.
++        assert!(need(&[(OPTION_LAN_ONLY, "Y"), (OPTION_STOP_SERVICE, "")], false));
++    }
++
++    #[test]
++    fn cli_option_validation() {
++        assert!(validate_option(OPTION_ID_SERVER, "rs.example.com:21116").is_ok());
++        assert!(validate_option(OPTION_ID_SERVER, "http://x").is_err());
++        assert!(validate_option(OPTION_ID_SERVER, "").is_ok()); // clearing is allowed
++        assert!(validate_option(OPTION_KEY, "short").is_err());
++        assert!(validate_option(OPTION_KEY, "").is_ok());
++        assert!(validate_option(OPTION_LAN_ONLY, "Y").is_ok());
++        assert!(validate_option(OPTION_LAN_ONLY, "yes").is_err());
++        assert!(validate_option("direct-server", "anything").is_ok());
++    }
++
++    #[test]
++    fn cli_option_writes_keep_options_consistent() {
++        let w = cli_option_writes(OPTION_LAN_ONLY, "Y").unwrap();
++        for k in [OPTION_ID_SERVER, OPTION_KEY, "relay-server", "api-server"] {
++            assert!(w.contains(&(k.to_owned(), String::new())), "{k} not cleared");
++        }
++        assert_eq!(w[0], (OPTION_LAN_ONLY.to_owned(), "Y".to_owned()));
++        let w = cli_option_writes(OPTION_ID_SERVER, "rs.example.com").unwrap();
++        assert!(w.contains(&(OPTION_LAN_ONLY.to_owned(), String::new())));
++        assert_eq!(cli_option_writes(OPTION_KEY, KEY).unwrap().len(), 1);
++        assert!(cli_option_writes(OPTION_KEY, "short").is_err());
++        assert!(cli_option_writes(OPTION_LAN_ONLY, "N").is_err());
++    }
++
++    #[test]
++    fn import_validation() {
++        assert!(validate_server_import("rs.example.com", KEY).is_ok());
++        assert!(validate_server_import("", "").is_ok());
++        assert!(validate_server_import("rs.example.com", "").is_err());
++        assert!(validate_server_import("rs.example.com", "short").is_err());
++        assert!(validate_server_import("", KEY).is_err());
++        assert!(validate_server_import("https://rs.example.com", KEY).is_err());
++        assert!(validate_imported_options(&opts(&[(OPTION_ID_SERVER, "rs.example.com"), (OPTION_KEY, KEY)])).is_ok());
++        assert!(validate_imported_options(&opts(&[(OPTION_ID_SERVER, "rs.example.com")])).is_err());
++        assert!(validate_imported_options(&opts(&[(OPTION_LAN_ONLY, "yes")])).is_err());
++        assert!(validate_imported_options(&opts(&[])).is_ok());
++    }
++
++    /// The --config path parses the same exe-name string format as upstream's custom server
++    /// naming, then must validate before writing.
++    #[test]
++    fn config_import_string_is_validated() {
++        let good = crate::custom_server::get_custom_server_from_string(&format!(
++            "remotesmith-host=rs.example.com,key={KEY},.exe"
++        ))
++        .unwrap();
++        assert!(validate_server_import(&good.host, &good.key).is_ok());
++        let missing_key = crate::custom_server::get_custom_server_from_string(
++            "remotesmith-host=rs.example.com,.exe",
++        )
++        .unwrap();
++        assert!(validate_server_import(&missing_key.host, &missing_key.key).is_err());
++        let bad_key = crate::custom_server::get_custom_server_from_string(
++            "remotesmith-host=rs.example.com,key=nope,.exe",
++        )
++        .unwrap();
++        assert!(validate_server_import(&bad_key.host, &bad_key.key).is_err());
++    }
++
++    /// "Direct LAN only" overrides the API server and any explicit or exe-name ID server in
++    /// the real selection functions (FLOW-2). OVERWRITE_SETTINGS is used to switch it on so the
++    /// test never writes the user's config files.
++    #[test]
++    fn lan_only_disables_api_and_server_selection() {
++        use hbb_common::config::{Config, OVERWRITE_SETTINGS};
++        let set = |on: bool| {
++            let mut o = OVERWRITE_SETTINGS.write().unwrap();
++            if on {
++                o.insert(OPTION_LAN_ONLY.to_owned(), "Y".to_owned());
++            } else {
++                o.remove(OPTION_LAN_ONLY);
++            }
++        };
++        set(true);
++        let api = crate::common::get_api_server(
++            "http://api.example.com".to_owned(),
++            "rs.example.com".to_owned(),
++        );
++        let custom = crate::common::get_custom_rendezvous_server("rs.example.com".to_owned());
++        let rendezvous = Config::get_rendezvous_server();
++        let servers = Config::get_rendezvous_servers();
++        set(false);
++        assert_eq!(api, "");
++        assert_eq!(custom, "");
++        assert_eq!(rendezvous, "");
++        assert!(servers.is_empty());
++        assert_eq!(
++            crate::common::get_custom_rendezvous_server("rs.example.com".to_owned()),
++            "rs.example.com"
++        );
++    }
++
++    /// Round-2 gate: a cancelled privilege prompt with an existing password must not close
++    /// setup as "Controller only" while hosting stays on.
++    #[test]
++    fn controller_only_requires_confirmed_stop() {
++        let with_password = |stop: &str| {
++            state_from_options(
++                &opts(&[(OPTION_LAN_ONLY, "Y"), (OPTION_STOP_SERVICE, stop)]),
++                true,
++            )
++        };
++        // Cancelled on Windows (flag restored) or macOS (flag never set): refused.
++        assert!(!incoming_stopped("", false));
++        assert!(setup_result(&with_password(""), true, incoming_stopped("", false)).is_err());
++        // macOS: flag set but the service is still listening (async stop): refused.
++        assert!(!incoming_stopped("Y", true));
++        assert!(setup_result(&with_password("Y"), true, incoming_stopped("Y", true)).is_err());
++        // Confirmed: flag set and nothing listening.
++        assert!(incoming_stopped("Y", false));
++        assert!(setup_result(&with_password("Y"), true, incoming_stopped("Y", false)).is_ok());
++        // Without Controller only, the existing password is enough.
++        assert!(setup_result(&with_password(""), false, false).is_ok());
++    }
++
++    #[test]
++    fn direct_port_probe() {
++        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
++        let port = l.local_addr().unwrap().port();
++        assert!(direct_port_listening(port));
++        drop(l);
++        assert!(!direct_port_listening(port));
++    }
++
++    /// Round-2 gate: a rejected --import-config leaves both destination files byte-identical,
++    /// even when the primary file alone would have been accepted.
++    #[test]
++    fn rejected_import_writes_nothing() {
++        let dir = std::env::temp_dir().join(format!(
++            "remotesmith-import-test-{}-{}",
++            std::process::id(),
++            hbb_common::rand::random::<u32>()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let (dst, dst2) = (dir.join("dst.toml"), dir.join("dst2.toml"));
++        std::fs::write(&dst, "id = '111111111'\npassword = 'old'\n").unwrap();
++        std::fs::write(&dst2, "[options]\ncustom-rendezvous-server = 'old.example.com'\n").unwrap();
++        let before = (std::fs::read(&dst).unwrap(), std::fs::read(&dst2).unwrap());
++        std::thread::sleep(std::time::Duration::from_millis(1100));
++        let (src, src2) = (dir.join("src.toml"), dir.join("src2.toml"));
++        // A non-empty source: an id and a key pair (an empty one is skipped by upstream).
++        std::fs::write(
++            &src,
++            "id = '999999999'\npassword = 'new'\nkey_pair = [[1, 2, 3], [4, 5, 6]]\n",
++        )
++        .unwrap();
++        let far_future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
++        // Server without a key: rejected, nothing written.
++        std::fs::write(&src2, "[options]\ncustom-rendezvous-server = 'rs.example.com'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        assert_eq!(std::fs::read(&dst).unwrap(), before.0);
++        assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        // Malformed key and bad lan-only value: rejected too.
++        std::fs::write(&src2, "[options]\ncustom-rendezvous-server = 'rs.example.com'\nkey = 'nope'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        std::fs::write(&src2, "[options]\nremotesmith-lan-only = 'yes'\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        assert_eq!(std::fs::read(&dst).unwrap(), before.0);
++        assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        // A valid pair is imported (both files newer than the destinations).
++        std::fs::write(&src2, format!("[options]\ncustom-rendezvous-server = 'rs.example.com'\nkey = '{KEY}'\n")).unwrap();
++        assert_eq!(
++            import_config_files(&src, &src2, &dst, &dst2, far_future),
++            Ok((true, true))
++        );
++        assert_ne!(std::fs::read(&dst).unwrap(), before.0);
++        let imported: hbb_common::config::Config2 = hbb_common::config::load_path(dst2.clone());
++        assert_eq!(imported.options.get(OPTION_KEY).map(String::as_str), Some(KEY));
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    #[test]
++    fn no_personal_defaults() {
++        // DEC-15 / AC-33: the source carries no server host or key.
++        let src = include_str!("remotesmith.rs");
++        assert!(!src.contains(&["johnnycode", ".ai"].concat()));
++    }
++}

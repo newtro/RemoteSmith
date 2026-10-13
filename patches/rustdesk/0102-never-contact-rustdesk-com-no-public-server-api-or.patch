@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 18:31:25 -0400
+Subject: remotesmith(0102): never contact rustdesk.com (no public server, API
+ or updates)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- id@public connections bail instead of indexing the now-empty
+  RENDEZVOUS_SERVERS.
+- get_api_server() no longer falls back to https://admin.rustdesk.com; "" means
+  no API server, which every caller already handles.
+- The software update check (api.rustdesk.com, stock RustDesk downloads) is
+  disabled in do_check_software_update(), which every update path goes
+  through; the Auto update option is hidden.
+- With no ID server configured (Direct LAN only or not set up), the NAT test,
+  the HTTP TCP proxy and connect-by-ID stop early with a clear error instead
+  of dialling ":21116", and the public-IPv6 probe skips the default public
+  STUN servers (Google, Cloudflare, ...).
+- User-clicked links (download, release notes, EULA, public-server guide) go
+  to github.com/newtro/RemoteSmith.
+- New src/remotesmith.rs holds RemoteSmith-only policy.
+
+Plan: DEF-2, AC-6, AC-40, §4 thin-fork patch 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/consts.dart                       |  2 ++
+ .../lib/desktop/pages/connection_page.dart    |  2 +-
+ .../lib/desktop/pages/desktop_home_page.dart  |  4 +--
+ .../desktop/pages/desktop_setting_page.dart   |  5 ++--
+ flutter/lib/desktop/pages/install_page.dart   |  5 ++--
+ src/client.rs                                 |  9 +++++++
+ src/common.rs                                 | 25 +++++++++++++++++--
+ src/lib.rs                                    |  2 ++
+ src/remotesmith.rs                            | 11 ++++++++
+ 9 files changed, 56 insertions(+), 9 deletions(-)
+ create mode 100644 src/remotesmith.rs
+
+diff --git a/flutter/lib/consts.dart b/flutter/lib/consts.dart
+index 1a80f7af8268..c16bb105d0e2 100644
+--- a/flutter/lib/consts.dart
++++ b/flutter/lib/consts.dart
+@@ -23,6 +23,8 @@ const String kPlatformAdditionsIddImpl = "idd_impl";
+ // RemoteSmith: public source repository (AGPL-3.0 corresponding source, upstream credit).
+ const String kRemoteSmithSourceUrl = 'https://github.com/newtro/RemoteSmith';
+ const String kRustDeskUpstreamUrl = 'https://github.com/rustdesk/rustdesk';
++// RemoteSmith has no update service (see src/remotesmith.rs UPDATE_CHECK_DISABLED).
++const bool kRemoteSmithUpdatesDisabled = true;
+ 
+ const String kPlatformAdditionsRustDeskVirtualDisplays =
+     "rustdesk_virtual_displays";
+diff --git a/flutter/lib/desktop/pages/connection_page.dart b/flutter/lib/desktop/pages/connection_page.dart
+index 1d4928bbd471..d79af5169387 100644
+--- a/flutter/lib/desktop/pages/connection_page.dart
++++ b/flutter/lib/desktop/pages/connection_page.dart
+@@ -41,7 +41,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
+   double? get height => bind.isIncomingOnly() ? null : em * 3;
+ 
+   void onUsePublicServerGuide() {
+-    const url = "https://rustdesk.com/pricing";
++    const url = kRemoteSmithSourceUrl;
+     canLaunchUrlString(url).then((can) {
+       if (can) {
+         launchUrlString(url);
+diff --git a/flutter/lib/desktop/pages/desktop_home_page.dart b/flutter/lib/desktop/pages/desktop_home_page.dart
+index 6d370cbb0d46..97178a4ae548 100644
+--- a/flutter/lib/desktop/pages/desktop_home_page.dart
++++ b/flutter/lib/desktop/pages/desktop_home_page.dart
+@@ -435,7 +435,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
+       final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
+       String btnText = isToUpdate ? 'Update' : 'Download';
+       GestureTapCallback onPressed = () async {
+-        final Uri url = Uri.parse('https://rustdesk.com/download');
++        final Uri url = Uri.parse('$kRemoteSmithSourceUrl/releases');
+         await launchUrl(url);
+       };
+       if (isToUpdate) {
+@@ -451,7 +451,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
+           closeButton: true,
+           help: isToUpdate ? 'Changelog' : null,
+           link: isToUpdate
+-              ? 'https://github.com/rustdesk/rustdesk/releases/tag/${bind.mainGetNewVersion()}'
++              ? '$kRemoteSmithSourceUrl/releases/tag/${bind.mainGetNewVersion()}'
+               : null);
+     }
+     if (systemError.isNotEmpty) {
+diff --git a/flutter/lib/desktop/pages/desktop_setting_page.dart b/flutter/lib/desktop/pages/desktop_setting_page.dart
+index 9ab2aee8e7d6..7dde2ce05815 100644
+--- a/flutter/lib/desktop/pages/desktop_setting_page.dart
++++ b/flutter/lib/desktop/pages/desktop_setting_page.dart
+@@ -482,8 +482,9 @@ class _GeneralState extends State<_General> {
+   Widget other() {
+     final incomingOnly = bind.isIncomingOnly();
+     final outgoingOnly = bind.isOutgoingOnly();
+-    final showAutoUpdate = (isWindows && bind.mainIsInstalled()) ||
+-    (isMacOS && bind.mainIsInstalled() && bind.mainIsInstalledDaemon(prompt: false) && !bind.isCustomClient());
++    final showAutoUpdate = !kRemoteSmithUpdatesDisabled &&
++        ((isWindows && bind.mainIsInstalled()) ||
++            (isMacOS && bind.mainIsInstalled() && bind.mainIsInstalledDaemon(prompt: false) && !bind.isCustomClient()));
+     final children = <Widget>[
+       if (!isWeb && !incomingOnly)
+         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
+diff --git a/flutter/lib/desktop/pages/install_page.dart b/flutter/lib/desktop/pages/install_page.dart
+index fe94b388bf87..daba8d1c92e4 100644
+--- a/flutter/lib/desktop/pages/install_page.dart
++++ b/flutter/lib/desktop/pages/install_page.dart
+@@ -3,6 +3,7 @@ import 'dart:convert';
+ import 'package:file_picker/file_picker.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hbb/common.dart';
++import 'package:flutter_hbb/consts.dart';
+ import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
+ import 'package:flutter_hbb/models/platform_model.dart';
+ import 'package:flutter_hbb/models/state_model.dart';
+@@ -187,9 +188,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
+                           InkWell(
+                             hoverColor: Colors.transparent,
+                             onTap: () => launchUrlString(
+-                                'https://rustdesk.com/privacy.html'),
++                                '$kRemoteSmithSourceUrl/blob/main/LICENSE'),
+                             child: Tooltip(
+-                              message: 'https://rustdesk.com/privacy.html',
++                              message: '$kRemoteSmithSourceUrl/blob/main/LICENSE',
+                               child: Row(children: [
+                                 Icon(Icons.launch_outlined, size: 16)
+                                     .marginOnly(right: 5),
+diff --git a/src/client.rs b/src/client.rs
+index d3e66e73c6c6..2ba1dcaf9f14 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -464,6 +464,10 @@ impl Client {
+             crate::get_rendezvous_server(1_000).await
+         } else {
+             if other_server == PUBLIC_SERVER {
++                // RemoteSmith: there is no public server to fall back to (DEF-2).
++                if RENDEZVOUS_SERVERS.is_empty() {
++                    bail!("No public rendezvous server is configured");
++                }
+                 (
+                     check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),
+                     RENDEZVOUS_SERVERS[1..]
+@@ -476,6 +480,11 @@ impl Client {
+                 (check_port(other_server, RENDEZVOUS_PORT), Vec::new(), true)
+             }
+         };
++        if rendezvous_server.is_empty() {
++            // RemoteSmith: no ID server (Direct LAN only or not set up). Stop here rather than
++            // run the STUN/WebRTC/punch setup, which would query public STUN servers (DEF-2).
++            bail!("No ID server is configured. Connect by the peer's LAN IP address, or set an ID server in Settings > Network.");
++        }
+ 
+         // Same relay gate as the v6 socket below: under any forced relay the v6 punch cannot
+         // be used, so probing v6 reachability is wasted work on every such connection.
+diff --git a/src/common.rs b/src/common.rs
+index 0d46bafe2962..eba227fcf8a1 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -706,6 +706,10 @@ async fn test_nat_type_() -> ResultType<bool> {
+     log::info!("Testing nat ...");
+     let start = std::time::Instant::now();
+     let server1 = Config::get_rendezvous_server();
++    if server1.is_empty() {
++        // RemoteSmith: direct LAN only or not set up yet; nothing to test against (DEF-2).
++        bail!("no rendezvous server configured");
++    }
+     let server2 = crate::increase_port(&server1, -1);
+     let mut msg_out = RendezvousMessage::new();
+     let serial = Config::get_serial();
+@@ -1031,6 +1035,12 @@ pub fn check_software_update() {
+ // Because the url is always `https://api.rustdesk.com/version/latest`.
+ #[tokio::main(flavor = "current_thread")]
+ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
++    // RemoteSmith: no update service (it would ask api.rustdesk.com for stock RustDesk
++    // builds). Updates come from github.com/newtro/RemoteSmith releases (DEF-2, AC-6).
++    if crate::remotesmith::UPDATE_CHECK_DISABLED {
++        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
++        return Ok(());
++    }
+     let (request, url) =
+         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
+     let proxy_conf = Config::get_socks();
+@@ -1159,7 +1169,8 @@ fn get_api_server_(api: String, custom: String) -> String {
+             return format!("http://{}", s);
+         }
+     }
+-    "https://admin.rustdesk.com".to_owned()
++    // RemoteSmith: no fallback to admin.rustdesk.com (DEF-2). Callers treat "" as "no API".
++    "".to_owned()
+ }
+ 
+ #[inline]
+@@ -1304,7 +1315,12 @@ fn tcp_proxy_log_target(url: &str) -> String {
+ 
+ #[inline]
+ fn get_tcp_proxy_addr() -> String {
+-    check_port(Config::get_rendezvous_server(), RENDEZVOUS_PORT)
++    let server = Config::get_rendezvous_server();
++    if server.is_empty() {
++        // RemoteSmith: no server configured; keep tcp_proxy_request's empty-address guard working.
++        return server;
++    }
++    check_port(server, RENDEZVOUS_PORT)
+ }
+ 
+ /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
+@@ -2651,6 +2667,11 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
+ }
+ 
+ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
++    // RemoteSmith: the public IPv6 address only serves hole punching through the ID server.
++    // Without one (Direct LAN only), don't query the default public STUN servers (DEF-2).
++    if Config::get_rendezvous_server().is_empty() {
++        return None;
++    }
+     {
+         // One look and one claim of the minute, under one lock: two connections arriving
+         // together would otherwise both find it over and both probe.
+diff --git a/src/lib.rs b/src/lib.rs
+index 649f3ef955b0..e6918c2dbd0d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -44,6 +44,8 @@ mod clipboard;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ pub mod core_main;
+ mod custom_server;
++/// RemoteSmith-specific policy (no update service, first-run provisioning).
++pub mod remotesmith;
+ mod lang;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ mod port_forward;
+diff --git a/src/remotesmith.rs b/src/remotesmith.rs
+new file mode 100644
+index 000000000000..59b87a4c887a
+--- /dev/null
++++ b/src/remotesmith.rs
+@@ -0,0 +1,11 @@
++//! RemoteSmith-specific policy that does not belong to any one upstream module.
++//!
++//! Kept in its own file so the patches against upstream files stay small (thin fork, §4).
++
++/// RemoteSmith has no update service: upstream's checker asks api.rustdesk.com about stock
++/// RustDesk builds and would offer them as updates (DEF-2, AC-6). Releases are published at
++/// <https://github.com/newtro/RemoteSmith/releases>.
++pub const UPDATE_CHECK_DISABLED: bool = true;
++
++/// Public source repository (AGPL-3.0 corresponding source).
++pub const SOURCE_URL: &str = "https://github.com/newtro/RemoteSmith";

@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 19:34:01 -0400
+Subject: remotesmith(0104): enforce Direct LAN only in rendezvous server
+ selection
+
+With remotesmith-lan-only=Y, Config::get_rendezvous_server() and
+get_rendezvous_servers() return nothing, ahead of every other source: the
+explicit custom-rendezvous-server, the exe-name server, the server-pushed
+rendezvous-servers list and the cached CONFIG2.rendezvous_server. Tests load
+a configured RemoteSmith2.toml, switch it to LAN only and reload it, as a
+restart would.
+
+Plan: FLOW-2, DEF-2, AC-40, AC-8.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 99 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+
+diff --git a/src/config.rs b/src/config.rs
+index d5902c139a65..9ad49dc5ba07 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -147,6 +147,9 @@ const CHARS: &[char] = &[
+ pub const RENDEZVOUS_SERVERS: &[&str] = &[];
+ pub const RS_PUB_KEY: &str = "";
+ 
++/// RemoteSmith: "Y" when the user chose direct LAN connections only (see Config::is_lan_only).
++pub const OPTION_REMOTESMITH_LAN_ONLY: &str = "remotesmith-lan-only";
++
+ pub const RENDEZVOUS_PORT: i32 = 21116;
+ pub const RELAY_PORT: i32 = 21117;
+ pub const WS_RENDEZVOUS_PORT: i32 = 21118;
+@@ -937,7 +940,16 @@ impl Config {
+         }
+     }
+ 
++    /// RemoteSmith "Direct LAN only" (FLOW-2): no rendezvous, relay or API server is used,
++    /// whatever else is configured, cached or derived from the exe name.
++    pub fn is_lan_only() -> bool {
++        Self::get_option(OPTION_REMOTESMITH_LAN_ONLY) == "Y"
++    }
++
+     pub fn get_rendezvous_server() -> String {
++        if Self::is_lan_only() {
++            return "".to_owned();
++        }
+         let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+         if rendezvous_server.is_empty() {
+             rendezvous_server = Self::get_option("custom-rendezvous-server");
+@@ -966,6 +978,9 @@ impl Config {
+     }
+ 
+     pub fn get_rendezvous_servers() -> Vec<String> {
++        if Self::is_lan_only() {
++            return Vec::new();
++        }
+         let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+         if !s.is_empty() {
+             return vec![s];
+@@ -3779,3 +3794,87 @@ mod remotesmith_hardened_defaults_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod remotesmith_lan_only_tests {
++    use super::*;
++
++    static LOCK: Mutex<()> = Mutex::new(());
++
++    /// Swaps in a Config2 loaded from a real toml file (as a restart would) and restores the
++    /// process state afterwards. OVERWRITE_SETTINGS is left untouched by the test itself.
++    struct Profile {
++        saved2: Config2,
++        saved_exe: String,
++    }
++
++    impl Profile {
++        fn load(toml: &str) -> Self {
++            let dir = std::env::temp_dir().join(format!(
++                "remotesmith-lan-only-test-{}-{}",
++                std::process::id(),
++                crate::rand::random::<u32>()
++            ));
++            std::fs::create_dir_all(&dir).unwrap();
++            let file = dir.join("RemoteSmith2.toml");
++            std::fs::write(&file, toml).unwrap();
++            let loaded: Config2 = load_path(file);
++            std::fs::remove_dir_all(&dir).ok();
++            let saved2 = std::mem::replace(&mut *CONFIG2.write().unwrap(), loaded);
++            let saved_exe = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
++            Profile { saved2, saved_exe }
++        }
++    }
++
++    impl Drop for Profile {
++        fn drop(&mut self) {
++            *CONFIG2.write().unwrap() = std::mem::take(&mut self.saved2);
++            *EXE_RENDEZVOUS_SERVER.write().unwrap() = self.saved_exe.clone();
++        }
++    }
++
++    const CONFIGURED: &str = r#"
++rendezvous_server = 'cached.example.com:21116'
++serial = 99
++[options]
++custom-rendezvous-server = 'rs.example.com'
++key = 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY='
++relay-server = 'relay.example.com'
++rendezvous-servers = 'a.example.com,b.example.com'
++"#;
++
++    #[test]
++    fn configured_profile_uses_its_server() {
++        let _g = LOCK.lock().unwrap();
++        let _p = Profile::load(CONFIGURED);
++        assert!(!Config::is_lan_only());
++        assert_eq!(Config::get_rendezvous_server(), "rs.example.com:21116");
++        assert_eq!(Config::get_rendezvous_servers(), vec!["rs.example.com".to_owned()]);
++    }
++
++    #[test]
++    fn lan_only_wins_over_configured_cached_and_exe_routes() {
++        let _g = LOCK.lock().unwrap();
++        // The same profile after the user switched it to LAN only, then restarted.
++        let _p = Profile::load(&CONFIGURED.replace(
++            "[options]\n",
++            "[options]\nremotesmith-lan-only = 'Y'\n",
++        ));
++        assert!(Config::is_lan_only());
++        assert_eq!(Config::get_rendezvous_server(), "");
++        assert!(Config::get_rendezvous_servers().is_empty());
++        // A server baked into the exe name (Windows custom-server naming) is ignored too.
++        *EXE_RENDEZVOUS_SERVER.write().unwrap() = "exe.example.com".to_owned();
++        assert_eq!(Config::get_rendezvous_server(), "");
++        assert!(Config::get_rendezvous_servers().is_empty());
++    }
++
++    #[test]
++    fn cached_route_alone_is_not_used_under_lan_only() {
++        let _g = LOCK.lock().unwrap();
++        let _p = Profile::load(
++            "rendezvous_server = 'cached.example.com:21116'\n[options]\nremotesmith-lan-only = 'Y'\n",
++        );
++        assert_eq!(Config::get_rendezvous_server(), "");
++    }
++}
