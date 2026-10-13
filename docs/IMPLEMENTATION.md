@@ -67,12 +67,23 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
 
 ### Local macOS build
 
+From a fresh clone:
+
 ```sh
-git submodule update --init --recursive --depth 1
+git submodule update --init --recursive --depth 1   # upstream RustDesk 1.5.0 + hbb_common at their pins
+scripts/apply-patches.sh     # branch `remotesmith` in both submodules, one commit per patches/ file
 scripts/bootstrap-mac.sh     # idempotent; Flutter 3.24.5 (+3.22.3 for the bridge), Rust 1.81/1.75 toolchains,
                              # NASM 2.16.03, cargo-expand + flutter_rust_bridge_codegen, vcpkg + arm64-osx packages
 scripts/build-mac.sh         # -> build/mac/RemoteSmith.app (+ build/mac/build-*.log)
+scripts/verify.sh            # sidecar, patch, fork Rust + Flutter unit tests, lint, AC-33 check
 ```
+
+- **`build-mac.sh` builds only the exact patch stack.** Before touching anything it checks that `vendor/rustdesk` and `libs/hbb_common` are each on branch `remotesmith` with exactly one commit per file in `patches/rustdesk` / `patches/hbb_common`, in order, each byte-identical to its patch file (the same sha256-of-export identity `apply-patches.sh` uses). Otherwise it lists what is wrong and stops:
+  - a fresh or stale checkout (submodules at the upstream pins, a patch missing, a `patches/` file changed since the last apply): run `scripts/apply-patches.sh`;
+  - new commits on top of the stack: run `scripts/export-patches.sh` first, so the build is reproducible from `patches/`;
+  - a detached HEAD, a reworded commit, or a superproject gitlink staged at a patch commit is also refused.
+  - Uncommitted edits and untracked files in the submodules are allowed (the normal edit-build loop) but printed as a warning, since they are not in `patches/`. An empty `patches/rustdesk` or `patches/hbb_common` is refused too (that would be a stock build).
+- `scripts/build-mac.sh --stock` deliberately builds unpatched upstream RustDesk (`RustDesk.app`, upstream defaults). It requires both submodules at their pinned commits; `git submodule update --init --recursive --force` gets back there and `apply-patches.sh` restores the fork afterwards.
 
 - `scripts/lib/mac-env.sh` holds every version, each with the upstream workflow line it mirrors. Everything lands in `~/.cache/remotesmith/`; your default rustup toolchain is not touched (the build sets `RUSTUP_TOOLCHAIN`).
 - `bootstrap-mac.sh` and `build-mac.sh` share one machine-wide lock (`~/.cache/remotesmith/build-mac.lock`, via `shlock`) for everything that writes the shared cache. Parallel worktrees queue rather than collide.
@@ -135,4 +146,5 @@ The deviation from PLAN §4 (Docker → systemd) is deliberate. It matches the V
 - `cargo test` and `cargo clippy -- -D warnings` in `sidecar/`.
 - `scripts/apply-patches.sh` must apply cleanly onto the pinned submodules.
 - `cargo check` of `vendor/rustdesk` with the Mac features (fast gate); `scripts/build-mac.sh` (full gate).
+- CI runs the same suites before it builds anything (see [CI.md](CI.md)): sidecar fmt/clippy/test on macOS and Windows, the fork's whole `cargo test --lib` with the Mac features, and the RemoteSmith Flutter tests. The build jobs depend on them, so no artifact comes from a red suite.
 - Two-machine ACs: `docs/test-runs/checklist.md`. The Windows side needs Scott's PC; CI builds the Windows artifact.
