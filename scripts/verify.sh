@@ -78,6 +78,15 @@ done
 for f in deploy/server/*.sh scripts/*.sh; do
   [[ -f "$f" ]] && bash -n "$f"
 done
+if [[ -f scripts/release-mac.sh ]] && command -v shellcheck >/dev/null 2>&1; then
+  echo "== mac build/release scripts: shellcheck"
+  shellcheck -x -P scripts -S warning scripts/build-mac.sh scripts/release-mac.sh scripts/lib/mac-bundle.sh
+fi
+if [[ -f sidecar/macos/Info.plist.in ]]; then
+  echo "== tray helper Info.plist template"
+  sed -e 's/@VERSION@/1.0.0/' -e 's/@BUILD@/1/' -e 's/@MIN_MACOS@/12.3/' sidecar/macos/Info.plist.in \
+    | python3 -c 'import plistlib, sys; p = plistlib.loads(sys.stdin.buffer.read()); assert p["CFBundleIdentifier"] == "ai.johnnycode.remotesmith.tray" and p["LSUIElement"] is True'
+fi
 if compgen -G ".github/workflows/*.yml" >/dev/null; then
   if command -v actionlint >/dev/null; then
     echo "== actionlint"

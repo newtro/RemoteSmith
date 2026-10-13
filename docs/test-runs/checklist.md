@@ -354,3 +354,59 @@ macOS `~/Library/Preferences/ai.johnnycode.RemoteSmith/`, Windows `%APPDATA%\Rem
    Apps & features links go to github.com/newtro/RemoteSmith; the MSI license page shows the
    AGPL notice that credits RustDesk.
 3. Settings > About shows the AGPL notice, "Based on RustDesk" and the source link.
+
+## B5: signed release, bundled tray, install and uninstall (unit B5, patches 0601-0603)
+
+Build with `scripts/release-mac.sh` (Mac) and take the Windows MSI / portable zip from CI
+(`remotesmith-unsigned-windows-x86_64-installers`, `remotesmith-unsigned-windows-x86_64`).
+Already verified by the release script on the build machine: Developer ID signature with the
+hardened runtime on every executable, `spctl` "Notarized Developer ID", stapled ticket, and the
+bundled tray runs (`build/release/<version>/verify.txt`).
+
+### B5-1 (FLOW-1, AC-1) Mac install from the dmg
+1. Download `RemoteSmith-<version>-arm64.dmg` to the Mac (any way that sets quarantine, e.g. a
+   browser), open it, drag RemoteSmith to Applications, eject.
+2. Open RemoteSmith from Applications. Expect Gatekeeper's "downloaded from the Internet" prompt
+   naming RemoteSmith (not "cannot be verified" / "damaged"). Click Open.
+3. Expect the RemoteSmith menu-bar tray icon within a few seconds, and RemoteSmith Tray listed in
+   System Settings > General > Login Items & Extensions > Open at Login (on).
+4. Do the first-run provisioning (B1-1). Then RemoteSmith's own prompts: install the service
+   (administrator password), then grant Accessibility, Screen Recording, Input Monitoring and
+   Screen & System Audio Recording when asked (System Settings > Privacy & Security). Quit and
+   reopen RemoteSmith if it asks.
+5. In Terminal:
+   `"/Applications/RemoteSmith.app/Contents/Library/LoginItems/RemoteSmith Tray.app/Contents/MacOS/remotesmith-tray" --print-menu`.
+   Expect "Service running" and the four permissions as ✓.
+6. Reboot. Without opening RemoteSmith, expect the tray icon after login and the service running
+   (tray Readiness). The other machine shows this Mac as a saved peer once both are set up (AC-1).
+
+### B5-2 (AC-3) Upgrade keeps permissions
+1. Build a newer release (bump the build or just rebuild) and install it over the old one from its
+   dmg (replace in Applications). Open it.
+2. Expect no permission prompt; tray Readiness still shows all four permissions ✓; the tray process
+   is the new one (`pgrep -fl remotesmith-tray`, start time after the install).
+
+### B5-3 (AC-39) Mac uninstall removes the tray autostart
+1. RemoteSmith > Settings > General: uninstall the service (administrator password).
+2. Expect the tray icon to disappear, RemoteSmith Tray gone from Login Items, and
+   `~/Library/LaunchAgents/ai.johnnycode.remotesmith.tray.plist` absent. Reopen RemoteSmith:
+   the tray does not come back. Install the service again and reopen: it does.
+3. To remove the product: uninstall the service as above, then move RemoteSmith.app to the Trash.
+
+### B5-4 (FLOW-1, AC-1, AC-39) Windows MSI install, autostart and uninstall
+1. Run `remotesmith-<version>-x86_64.msi` (double-click; not `/qn`). Finish the installer.
+2. Expect the RemoteSmith tray icon in the notification area right after the installer closes, and
+   `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /v RemoteSmithTray` showing
+   `"C:\Program Files\RemoteSmith\remotesmith-tray.exe"`.
+3. `"C:\Program Files\RemoteSmith\remotesmith-tray.exe" --install-autostart` refuses (installer
+   already registered it). `--print-menu` shows real status.
+4. Sign out and in (or reboot): the tray starts by itself.
+5. Uninstall from Settings > Apps. Expect no reboot prompt, no `remotesmith-tray.exe` process, and
+   `reg query ...\Run /v RemoteSmithTray` failing in both HKLM and HKCU.
+
+### B5-5 (AC-39) Windows portable + RemoteSmith's own installer
+1. Unzip the portable folder, run `RemoteSmith.exe`, and install from its UI.
+2. Expect the HKLM `Run` value `RemoteSmithTray` pointing at the install folder's
+   `remotesmith-tray.exe`; the tray starts at the next sign-in.
+3. Uninstall (Settings > Apps, or RemoteSmith's uninstall). Expect the tray process gone and both
+   `Run` values gone.
