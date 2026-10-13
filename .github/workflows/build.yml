@@ -85,6 +85,36 @@ jobs:
           tar -xzf actionlint.tar.gz actionlint
           ./actionlint -color .github/workflows/*.yml
 
+  # The sidecar tray (sidecar/, crate remotesmith-tray) on its own toolchain
+  # (sidecar/rust-toolchain.toml), on both platforms it ships for.
+  sidecar:
+    name: sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    defaults:
+      run:
+        shell: bash
+        working-directory: sidecar
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: "RemoteSmith: Install the sidecar toolchain"
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal -c rustfmt -c clippy
+          rustc --version
+
+      - name: "RemoteSmith: sidecar fmt, clippy, test"
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
   # Mirrors bridge.yml (generate_bridge, the 3.22.3 "bridge-artifact" matrix entry), run on the
   # patched sources so the generated bridge matches RemoteSmith's src/flutter_ffi.rs.
   generate-bridge:
@@ -428,6 +458,19 @@ jobs:
           name: topmostwindow-artifacts-x64
           path: "./vendor/rustdesk/rustdesk"
 
+      # The sidecar tray ships next to the app exe, so it is in the portable folder, the
+      # self-extracting exe and the MSI (preprocess.py packages every file in the folder; patch
+      # 0602 adds its Run value and launch/terminate actions).
+      - name: "RemoteSmith: Build the sidecar tray"
+        working-directory: sidecar
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal -t x86_64-pc-windows-msvc
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin remotesmith-tray
+          cp target/x86_64-pc-windows-msvc/release/remotesmith-tray.exe ../vendor/rustdesk/rustdesk/
+          ls -l ../vendor/rustdesk/rustdesk/remotesmith-tray.exe
+
       # The portable app folder. The artifact downloads as a zip: unzip and run the exe.
       - name: Upload unsigned
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -651,6 +694,28 @@ jobs:
           echo "APP_PATH=${apps[0]}" >> "$GITHUB_ENV"
           echo "APP_BUNDLE=$(basename "${apps[0]}")" >> "$GITHUB_ENV"
           echo "app: ${apps[0]}"
+
+      # As scripts/build-mac.sh does: the sidecar as Contents/Library/LoginItems/RemoteSmith Tray.app
+      # (patch 0601 registers it). Xcode's ad-hoc seal is redone ad hoc without the hardened
+      # runtime; Developer ID signing happens locally in scripts/release-mac.sh.
+      - name: "RemoteSmith: Embed the sidecar tray"
+        working-directory: .
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' sidecar/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal -t aarch64-apple-darwin
+          # shellcheck source=/dev/null
+          source scripts/lib/mac-env.sh
+          # shellcheck source=/dev/null
+          source scripts/lib/mac-bundle.sh
+          app="vendor/rustdesk/$APP_PATH"
+          plist="$app/Contents/Info.plist"
+          build_tray_helper "$RUNNER_TEMP" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" \
+            "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" "$app/Contents/Resources/AppIcon.icns"
+          embed_bundle_extras "$app" "$RUNNER_TEMP/$TRAY_HELPER_NAME" vendor/rustdesk/target/release/service
+          codesign --force --deep --sign - --entitlements vendor/rustdesk/flutter/macos/Runner/Release.entitlements "$app"
+          codesign --verify --deep --strict "$app"
+          "$app/Contents/Library/LoginItems/$TRAY_HELPER_NAME/Contents/MacOS/remotesmith-tray" --version
 
       - name: create unsigned dmg
         run: |
