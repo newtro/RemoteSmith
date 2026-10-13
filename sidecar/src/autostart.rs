@@ -111,6 +111,16 @@ pub fn install_run_key(exe: &Path) -> io::Result<()> {
     key.set_value(RUN_VALUE_NAME, &run_key_command(exe))
 }
 
+/// The installers (MSI and RemoteSmith's own, patches 0602/0603) register the tray for every user
+/// under HKLM and remove that on uninstall. A per-user value on top would outlive the uninstall.
+#[cfg(windows)]
+pub fn installer_run_value_present() -> bool {
+    let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+    hklm.open_subkey(RUN_KEY)
+        .and_then(|k| k.get_value::<String, _>(RUN_VALUE_NAME))
+        .is_ok()
+}
+
 #[cfg(windows)]
 pub fn uninstall_run_key() -> io::Result<bool> {
     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
@@ -126,11 +136,30 @@ pub fn uninstall_run_key() -> io::Result<bool> {
     }
 }
 
+/// True when `exe` is the login-item helper embedded in RemoteSmith.app
+/// (`…/Contents/Library/LoginItems/RemoteSmith Tray.app/Contents/MacOS/…`). That copy is started
+/// at login by the app through SMAppService (patch 0601), so it must not also get a LaunchAgent.
+pub fn is_bundled_login_item(exe: &Path) -> bool {
+    let comps: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    comps.windows(4).any(|w| {
+        w[0] == "Contents"
+            && w[1] == "Library"
+            && w[2] == "LoginItems"
+            && w[3].to_string_lossy().ends_with(".app")
+    })
+}
+
 /// CLI entry: install for the current user and OS. Returns a message for stdout.
 pub fn install() -> io::Result<String> {
     let exe = std::env::current_exe()?;
     #[cfg(target_os = "macos")]
     {
+        if is_bundled_login_item(&exe) {
+            return Err(io::Error::other(
+                "this copy is RemoteSmith.app's login item and already starts at login \
+                 (System Settings > General > Login Items); --install-autostart is for a standalone build",
+            ));
+        }
         let home = dirs::home_dir().ok_or_else(|| io::Error::other("no home directory"))?;
         let p = install_launch_agent(&home, &exe, &crate::logging::log_dir())?;
         Ok(format!(
@@ -140,6 +169,12 @@ pub fn install() -> io::Result<String> {
     }
     #[cfg(windows)]
     {
+        if installer_run_value_present() {
+            return Err(io::Error::other(
+                r"RemoteSmith's installer already starts the tray at login (HKLM\...\Run\RemoteSmithTray, \
+                 removed on uninstall); --install-autostart is for a portable copy",
+            ));
+        }
         install_run_key(&exe)?;
         Ok(format!(
             r"installed HKCU\{RUN_KEY}\{RUN_VALUE_NAME} = {}",
@@ -204,7 +239,9 @@ mod tests {
         assert!(p.contains("<string>ai.johnnycode.remotesmith.tray</string>"));
         assert!(p.contains("<string>/Applications/Remote Smith &amp; Co.app/x</string>"));
         assert!(p.contains("<key>SuccessfulExit</key>\n\t\t<false/>"));
-        assert!(p.contains("<string>/L/tray.launchd.log</string>"));
+        // Path::join uses the platform separator (this test also runs on Windows in CI).
+        let log = Path::new("/L").join("tray.launchd.log");
+        assert!(p.contains(&format!("<string>{}</string>", log.to_string_lossy())));
     }
 
     #[cfg(target_os = "macos")]
@@ -249,6 +286,19 @@ mod tests {
         let bad = dir.path().join("file");
         std::fs::write(&bad, b"x").unwrap();
         assert!(install_launch_agent(dir.path(), Path::new("/x/tray"), &bad).is_err());
+    }
+
+    #[test]
+    fn detects_bundled_login_item() {
+        assert!(is_bundled_login_item(Path::new(
+            "/Applications/RemoteSmith.app/Contents/Library/LoginItems/RemoteSmith Tray.app/Contents/MacOS/remotesmith-tray"
+        )));
+        assert!(!is_bundled_login_item(Path::new(
+            "/Users/me/src/sidecar/target/release/remotesmith-tray"
+        )));
+        assert!(!is_bundled_login_item(Path::new(
+            "/Applications/RemoteSmith.app/Contents/MacOS/remotesmith-tray"
+        )));
     }
 
     #[test]

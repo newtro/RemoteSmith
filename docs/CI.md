@@ -79,6 +79,7 @@ The toolchain matches upstream:
    Artifact files are named `remotesmith-*`.
 7. **Small shell fixes so actionlint and shellcheck pass:** quoting around `$(which flutter)` and `$VCPKG_ROOT`, and the `$runner_res` quote. The behavior is the same.
 8. **Pinned action versions:** upstream's SHAs everywhere except `actions/cache`. Upstream's `bridge.yml` uses a v3 SHA; this workflow uses v5.1.0. Swatinem/rust-cache gets `workspaces: vendor/rustdesk -> target`, and run-vcpkg gets `vcpkgJsonGlob: vendor/rustdesk/vcpkg.json`.
+9. **The sidecar tray (RemoteSmith-only).** Job `sidecar` runs `cargo fmt --check`, `clippy -D warnings` and `cargo test` in `sidecar/` on macos-14 and windows-2022 with the sidecar's own toolchain (`sidecar/rust-toolchain.toml`). The Windows build adds `remotesmith-tray.exe` to the portable folder before upload, so it is in the zip, the self-extracting exe and the MSI. The macOS build embeds it as `Contents/Library/LoginItems/RemoteSmith Tray.app` (`scripts/lib/mac-bundle.sh`) and re-seals the unsigned app ad hoc.
 
 ## Local checks
 

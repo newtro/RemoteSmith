@@ -47,6 +47,7 @@ deploy/server/               hbbs/hbbr 1.1.16 deployment for the Lightsail VM (s
   | 0300–0399 | peer identity / TOFU, LAN-first timeout, reconnect rules (DEF-3, DEF-7, DEF-8) |
   | 0400–0499 | RemoteSmith IPC endpoint and presence data (DEF-4, DEF-17) |
   | 0500–0599 | session indicator, readiness reporting hooks (§6.2a, §6.3) |
+  | 0600–0699 | release packaging: bundled sidecar autostart and its removal on uninstall, macOS and Windows (DEC-14, DEC-20, AC-39) |
   | 0900–0999 | build and CI fixes needed to build at all (keep these minimal) |
 - **Rebasing to a new upstream release:** bump the submodule pin, run `apply-patches.sh`, fix the patches that fail, then run `export-patches.sh`.
 
@@ -99,6 +100,12 @@ There is no local Developer ID cert. Signing follows the iSmith pattern (`/Volum
 - `-exportNotarizedApp`, then `stapler validate`.
 
 Local dev builds sign with the developer's own `Apple Development` certificate (configured locally, never committed), so TCC permissions persist across rebuilds. CI produces unsigned Mac artifacts; signing and notarization happen locally in `scripts/release-mac.sh`, because the cloud cert needs the Xcode account.
+
+`scripts/release-mac.sh` does the whole release: `build-mac.sh --archive` (build.py, then `xcodebuild archive` of the Runner with the team's Apple Development identity, inside the build lock while build.py's outputs and CI edits are in place), the export and notarization above, verification (every Mach-O Developer ID + hardened runtime + timestamp, `spctl`, `stapler validate`) and `build/release/<version>/RemoteSmith-<version>-arm64.dmg` plus a zip. The dmg itself is unsigned (the Developer ID key is only reachable through Xcode's export, which signs app bundles); the app inside is stapled. Entitlements are upstream's `Release.entitlements`, unchanged.
+
+**Bundle extras** (`scripts/lib/mac-bundle.sh`, used by `build-mac.sh`, the release archive and CI): upstream's `service` binary in `Contents/MacOS` (build.py copies it in after `flutter build`, so an archive lacks it), and the sidecar as an `LSUIElement` login-item helper, `Contents/Library/LoginItems/RemoteSmith Tray.app` (bundle id `ai.johnnycode.remotesmith.tray`). Patch 0601 registers the helper with `SMAppService.loginItem` when the main window of an installed copy (/Applications or ~/Applications, not translocated) starts and the system has no record of it, launches it if it is not running, and replaces a tray left running from before an upgrade. The user turns it off in System Settings > General > Login Items, which is respected. Patch 0603: uninstalling the service unregisters the login item, removes a standalone LaunchAgent, quits the tray and sets `RemoteSmithTrayRemoved` (app defaults) until the service is installed again. The bundled copy refuses `--install-autostart`, which stays for standalone sidecar builds.
+
+**Windows:** CI builds `remotesmith-tray.exe` (sidecar toolchain, `x86_64-pc-windows-msvc`) into the portable folder, so it is in the portable zip, the self-extracting exe and the MSI. Patch 0602 gives the MSI an HKLM `Run` value `RemoteSmithTray`, starts the tray for the installing user after install, and stops it before removal. Patch 0603 does the same for RemoteSmith's own installer (HKLM `Run` at install; upgrade stops the tray; uninstall stops it and deletes the HKLM and HKCU values). Portable use: `remotesmith-tray.exe --install-autostart` (HKCU `Run`); it refuses when an installer already registered the tray.
 
 Bundle id: `ai.johnnycode.remotesmith`. App name: `RemoteSmith`.
 
