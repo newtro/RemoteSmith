@@ -15,6 +15,8 @@ program. Now:
   so the adapter owning the local address is the one that received the connection.
 - Windows adapters must be hardware-backed (GetIfTable2 HardwareInterface); a virtual adapter
   counts only if it carries a hardware adapter's MAC (a Hyper-V external switch's host adapter).
+  The hardware-MAC inventory comes from the full GetIfTable2 table, since the IP enumeration
+  omits a NIC an external switch unbound from IP.
 - direct_server checks each accepted connection before any handshake byte: the local address
   it reached must belong to a physical LAN interface (macOS enN; Windows wired/Wi-Fi adapters
   that are not a VPN product's virtual adapter; never loopback, utun/tun/tap, ppp, ipsec,
@@ -28,15 +30,20 @@ program. Now:
   on LAN and wireless interface types only, without edge traversal. Same rule name, so uninstall still removes them all; the MSI remove
   now loops until none is left.
 
+Known limits (deferred; need an attacker on a VPN with an overlapping LAN prefix; identity and
+password layers still apply): IP_BOUND_IF pins the reply path but is no ingress filter against
+asymmetric-routing/proxy-ARP VPN setups; Windows VPN clients that enable weak host mode (e.g.
+GlobalProtect) defeat the destination-owner check.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  Cargo.toml                              |    4 +
  res/msi/CustomActions/FirewallRules.cpp |  126 ++-
  src/platform/windows.rs                 |   13 +-
- src/remotesmith_trust/direct_access.rs  | 1039 +++++++++++++++++++++++
+ src/remotesmith_trust/direct_access.rs  | 1128 +++++++++++++++++++++++
  src/remotesmith_trust/mod.rs            |    1 +
  src/rendezvous_mediator.rs              |   69 +-
- 6 files changed, 1234 insertions(+), 18 deletions(-)
+ 6 files changed, 1323 insertions(+), 18 deletions(-)
  create mode 100644 src/remotesmith_trust/direct_access.rs
 
 diff --git a/Cargo.toml b/Cargo.toml
@@ -268,10 +275,10 @@ index a3c3d68f0508..b2b96a541d05 100644
  pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
 diff --git a/src/remotesmith_trust/direct_access.rs b/src/remotesmith_trust/direct_access.rs
 new file mode 100644
-index 000000000000..08c7a7a9157b
+index 000000000000..cef5854f170d
 --- /dev/null
 +++ b/src/remotesmith_trust/direct_access.rs
-@@ -0,0 +1,1039 @@
+@@ -0,0 +1,1128 @@
 +//! The direct-access port (21118 by default) accepts LAN peers only (RemoteSmith DEF-14, AC-51).
 +//!
 +//! Upstream's direct server listens on every interface and serves any source. RemoteSmith keeps
@@ -300,6 +307,16 @@ index 000000000000..08c7a7a9157b
 +//!   Default Switch adapter has a generated MAC).
 +//!
 +//! The subnet check applies on top, on every platform.
++//!
++//! Known limits (deferred; both need an attacker on a VPN that carries an overlapping LAN
++//! prefix, and the identity and password layers still apply):
++//! - macOS: `IP_BOUND_IF` pins the reply path, it is not an ingress filter. A VPN set up with
++//!   asymmetric routing or proxy ARP, so that replies to the peer leave through the LAN
++//!   interface and still reach it, can complete a handshake.
++//! - Windows: VPN clients that turn on weak host receive/send or forwarding on their adapter
++//!   (GlobalProtect does) let a packet that came in over the VPN reach the LAN adapter's
++//!   address, which defeats the destination-owner check; the LAN/wireless-typed firewall rule
++//!   still filters by interface type.
 +
 +use std::net::{IpAddr, SocketAddr};
 +
@@ -585,16 +602,55 @@ index 000000000000..08c7a7a9157b
 +    v
 +}
 +
-+/// Windows: `MIB_IF_ROW2` facts by interface index.
++/// One `MIB_IF_ROW2` row: interface index, IANA ifType, hardware facts.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct HwRow {
++    pub index: u32,
++    pub if_type: u32,
++    pub hw: Hw,
++}
++
++/// Windows: attach the `GetIfTable2` facts to the IP-enumerated interfaces, and add every
++/// hardware row that the IP enumeration did not list as an address-less entry. GetAdaptersAddresses
++/// (default_net) omits a physical NIC that a Hyper-V *external* switch unbound from IP, yet its
++/// MAC is exactly what identifies the switch's host vEthernet adapter, so the MAC inventory must
++/// come from the full interface table (any oper status). Address-less entries own no address,
++/// so they can never admit a connection themselves.
++pub fn merge_hw_inventory(mut ifaces: Vec<Iface>, rows: &[HwRow]) -> Vec<Iface> {
++    for i in ifaces.iter_mut() {
++        i.hw = rows.iter().find(|r| r.index == i.index).map(|r| r.hw);
++    }
++    for r in rows.iter().filter(|r| r.hw.hardware) {
++        if ifaces.iter().any(|i| i.index == r.index) {
++            continue;
++        }
++        let kind = match r.if_type {
++            6 => Kind::Ethernet,  // IF_TYPE_ETHERNET_CSMACD
++            71 => Kind::Wireless, // IF_TYPE_IEEE80211
++            _ => continue,
++        };
++        ifaces.push(Iface {
++            index: r.index,
++            name: format!("{{if {}}}", r.index),
++            description: "hardware adapter without IP (MAC inventory only)".into(),
++            kind,
++            nets: Vec::new(),
++            hw: Some(r.hw),
++        });
++    }
++    ifaces
++}
++
++/// Windows: every `MIB_IF_ROW2` row of the full interface table.
 +#[cfg(windows)]
-+fn windows_hw_table() -> std::collections::HashMap<u32, Hw> {
++fn windows_hw_table() -> Vec<HwRow> {
 +    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
-+    let mut map = std::collections::HashMap::new();
++    let mut out = Vec::new();
 +    unsafe {
 +        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
 +        if GetIfTable2(&mut table).is_err() || table.is_null() {
 +            hbb_common::log::error!("direct access: GetIfTable2 failed; no adapter counts as LAN");
-+            return map;
++            return out;
 +        }
 +        let rows = std::slice::from_raw_parts(
 +            (*table).Table.as_ptr(),
@@ -608,23 +664,24 @@ index 000000000000..08c7a7a9157b
 +                m.copy_from_slice(&r.PhysicalAddress[..6]);
 +                m
 +            });
-+            map.entry(r.InterfaceIndex).or_insert(Hw { hardware, mac });
++            if !out.iter().any(|x: &HwRow| x.index == r.InterfaceIndex) {
++                out.push(HwRow {
++                    index: r.InterfaceIndex,
++                    if_type: r.Type,
++                    hw: Hw { hardware, mac },
++                });
++            }
 +        }
 +        FreeMibTable(table as *const _);
 +    }
-+    map
++    out
 +}
 +
 +/// This machine's interfaces, now.
 +pub fn local_interfaces() -> Vec<Iface> {
-+    #[cfg(windows)]
-+    let hw = windows_hw_table();
-+    default_net::get_interfaces()
++    let listed: Vec<Iface> = default_net::get_interfaces()
 +        .into_iter()
 +        .map(|i| Iface {
-+            #[cfg(windows)]
-+            hw: hw.get(&i.index).copied(),
-+            #[cfg(not(windows))]
 +            hw: None,
 +            index: i.index,
 +            description: [i.friendly_name.as_deref(), i.description.as_deref()]
@@ -645,7 +702,11 @@ index 000000000000..08c7a7a9157b
 +                .collect(),
 +            name: i.name,
 +        })
-+        .collect()
++        .collect();
++    #[cfg(windows)]
++    return merge_hw_inventory(listed, &windows_hw_table());
++    #[cfg(not(windows))]
++    listed
 +}
 +
 +/// At most one refusal line per second, with a count of the ones folded into it, so a scan of
@@ -1125,6 +1186,41 @@ index 000000000000..08c7a7a9157b
 +            check(Os::Windows, &mapped("192.168.1.41", 21118), &mapped("192.168.1.20", 5), &all),
 +            Err(Refusal::NotLan { .. })
 +        ));
++    }
++
++    /// Gate round 2: the physical NIC under a Hyper-V external switch has no IP, so the IP
++    /// enumeration does not list it; the MAC inventory comes from the full interface table.
++    #[test]
++    fn external_switch_matches_a_hardware_nic_that_has_no_ip() {
++        let mac = [0x3c, 0x7c, 0x3f, 0x11, 0x22, 0x33];
++        let listed = vec![
++            iface(9, "{9}", Kind::Ethernet, "vEthernet (LAN) Hyper-V Virtual Ethernet Adapter", &[("192.168.1.40", 24)]),
++            iface(10, "{10}", Kind::Ethernet, "vEthernet (Lab) Hyper-V Virtual Ethernet Adapter #3", &[("172.30.0.1", 20)]),
++        ];
++        let rows = [
++            HwRow { index: 9, if_type: 6, hw: Hw { hardware: false, mac: Some(mac) } },
++            HwRow { index: 10, if_type: 6, hw: Hw { hardware: false, mac: Some([0x00, 0x15, 0x5d, 9, 9, 9]) } },
++            // The physical NIC: hardware, any oper status, no IP, not in `listed`.
++            HwRow { index: 5, if_type: 6, hw: Hw { hardware: true, mac: Some(mac) } },
++            // A hardware row of another type is not inventory.
++            HwRow { index: 7, if_type: 23, hw: Hw { hardware: true, mac: Some([1, 2, 3, 4, 5, 6]) } },
++        ];
++        let all = merge_hw_inventory(listed.clone(), &rows);
++        assert_eq!(all.len(), 3, "the address-less NIC is added, the ppp row is not");
++        let nic = all.iter().find(|i| i.index == 5).unwrap();
++        assert!(nic.nets.is_empty() && nic.hw.unwrap().hardware);
++        assert_eq!(
++            check(Os::Windows, &mapped("192.168.1.40", 21118), &mapped("192.168.1.20", 5), &all),
++            Ok("{9}".into()),
++            "external switch adapter admitted via the unlisted NIC's MAC"
++        );
++        assert!(matches!(
++            check(Os::Windows, &mapped("172.30.0.1", 21118), &mapped("172.30.0.9", 5), &all),
++            Err(Refusal::NotLan { .. })
++        ));
++        // Without the hardware row (inventory from IP enumeration only) it would be refused.
++        let partial = merge_hw_inventory(listed, &rows[..2]);
++        assert!(check(Os::Windows, &mapped("192.168.1.40", 21118), &mapped("192.168.1.20", 5), &partial).is_err());
 +    }
 +
 +    #[test]

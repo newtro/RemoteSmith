@@ -383,9 +383,16 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
    completes (the direct listeners are pinned to en0; `lsof -nP -iTCP:21118 -sTCP:LISTEN` shows
    one listener per en0 address, none on `*`). Windows host: refused (strong host model and
    the LAN/wireless-only firewall rule), and the log shows nothing or a refusal.
+   Known limit (deferred, not a failure of this step): a VPN built with asymmetric routing or
+   proxy ARP for the LAN prefix can still complete a handshake on macOS (IP_BOUND_IF pins the
+   reply path, it does not filter ingress), and on Windows a VPN client that enables weak host
+   mode on its adapter (e.g. GlobalProtect) defeats the destination-owner check. Both need an
+   attacker on such a VPN; the identity check and the password still stand. Note the VPN
+   product if step 3a connects.
 3b. Windows with Hyper-V/WSL: on the PC, `Get-NetAdapter | ft Name,InterfaceDescription,MacAddress,HardwareInterface`.
    Connecting from the LAN works when the PC reaches the LAN through a Hyper-V *external*
-   switch (vEthernet carrying the NIC's MAC); a connection to the PC's `vEthernet (WSL)` or
+   switch (vEthernet carrying the NIC's MAC; the NIC itself has no IP and is matched from the
+   full interface table); a connection to the PC's `vEthernet (WSL)` or
    Default Switch address from a WSL/VM guest is refused (`interface ... is not a LAN interface`).
 4. Routed, non-local subnet: from a device on another VLAN/subnet that can route to the host's
    LAN address (or a phone hotspot NATed through a router port-forward, if available),
