@@ -373,6 +373,10 @@ jobs:
       - name: "RemoteSmith: hbb_common cargo test --lib"
         run: cargo test --locked -p hbb_common --lib -- --test-threads=1
 
+      # File-transfer staging/finalize regressions carried by patch 0801 live in crate `base`.
+      - name: "RemoteSmith: base (file transfer) cargo test --lib"
+        run: "cargo test --locked -p base --lib fs::"
+
   # The fork's RemoteSmith Flutter tests (flutter/test/remotesmith_*_test.dart), with the same
   # Flutter, Flutter patches and bridge files as the aarch64-apple-darwin build job.
   test-fork-flutter-macos:
