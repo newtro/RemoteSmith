@@ -506,6 +506,7 @@ The whole-product review found these v1 behaviours unimplemented. Scott moved th
 - **AC-58 (partly):** refusing a nested self-viewing session, and the "mutual control active" notice. v1 does keep the connect coalescing and Cancel behaviour.
 - **AC-47 (partly):** deferring an upgrade during a session, a migration backup, and refusing a newer config schema. v1 keeps upstream installer behaviour, and the RemoteSmith server kit has its own backup and rollback (AC-44).
 - **AC-14 (partly):** file-transfer priority below interactive input, and the 80% throttle.
+- **Sysinfo upload:** with a custom ID server and no API server set, the client still POSTs `/api/sysinfo` to `<host>:21114`, the Pro API port the OSS server lacks. It times out, then falls back over TCP. Skip it when no API server is configured. (Found during Mac setup, 2026-10-12.)
 
 ## 16. Open questions
 
