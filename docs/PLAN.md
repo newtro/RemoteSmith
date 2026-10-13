@@ -497,6 +497,16 @@ The installer and tray report each capability separately:
 | ASM-6 | Scott's Apple Developer ID can sign and notarize | High (stated) | Permissions reset on every upgrade | Find the cert in Keychain at step 3 |
 | ASM-7 | Upstream's fallback capturer fixes black frames on macOS 26 | Medium | Mac hosting is broken | AC-1/AC-14 on the real Mac |
 
+## 15a. Deferred to v1.1 (decided 2026-10-12)
+
+The whole-product review found these v1 behaviours unimplemented. Scott moved them to v1.1 so v1 can ship as a daily driver:
+
+- **AC-17 (partly) / AC-57:** clipboard size caps with the "too large" notice, plus deterministic convergence for simultaneous copies (Lamport counter + origin). v1 keeps upstream clipboard sync and its echo suppression.
+- **AC-54:** a single audio direction when sessions run both ways. In v1, audio follows each session's own toggle.
+- **AC-58 (partly):** refusing a nested self-viewing session, and the "mutual control active" notice. v1 does keep the connect coalescing and Cancel behaviour.
+- **AC-47 (partly):** deferring an upgrade during a session, a migration backup, and refusing a newer config schema. v1 keeps upstream installer behaviour, and the RemoteSmith server kit has its own backup and rollback (AC-44).
+- **AC-14 (partly):** file-transfer priority below interactive input, and the 80% throttle.
+
 ## 16. Open questions
 
 - **OQ-1** Windows code signing for public releases (for example Azure Trusted Signing). It isn't needed for personal v1, so decide before announcing the open-source release.
