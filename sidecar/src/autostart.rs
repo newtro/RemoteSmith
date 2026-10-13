@@ -239,7 +239,9 @@ mod tests {
         assert!(p.contains("<string>ai.johnnycode.remotesmith.tray</string>"));
         assert!(p.contains("<string>/Applications/Remote Smith &amp; Co.app/x</string>"));
         assert!(p.contains("<key>SuccessfulExit</key>\n\t\t<false/>"));
-        assert!(p.contains("<string>/L/tray.launchd.log</string>"));
+        // Path::join uses the platform separator (this test also runs on Windows in CI).
+        let log = Path::new("/L").join("tray.launchd.log");
+        assert!(p.contains(&format!("<string>{}</string>", log.to_string_lossy())));
     }
 
     #[cfg(target_os = "macos")]

@@ -11,13 +11,29 @@ Windows: the installer adds an HKLM Run value for remotesmith-tray.exe; upgrade
 stops the tray; uninstall stops it and deletes the HKLM and HKCU Run values.
 Serves B5 / AC-39 / FLOW-1.
 ---
+ src/core_main.rs                  |   4 +
  src/platform/macos.rs             |   4 +
  src/platform/windows.rs           |   9 ++
  src/remotesmith/mod.rs            |   2 +
- src/remotesmith/tray_autostart.rs | 136 ++++++++++++++++++++++++++++++
- 4 files changed, 151 insertions(+)
+ src/remotesmith/tray_autostart.rs | 181 ++++++++++++++++++++++++++++++
+ 5 files changed, 200 insertions(+)
  create mode 100644 src/remotesmith/tray_autostart.rs
 
+diff --git a/src/core_main.rs b/src/core_main.rs
+index a8cc0d969b99..b61c6706032d 100644
+--- a/src/core_main.rs
++++ b/src/core_main.rs
+@@ -394,6 +394,10 @@ pub fn core_main() -> Option<Vec<String>> {
+         } else if args[0] == "--uninstall-service" {
+             log::info!("start --uninstall-service");
+             crate::platform::uninstall_service(false, true);
++            // RemoteSmith (patch 0603, AC-39): an explicit uninstall removes the tray's autostart
++            // even when no daemon was installed (uninstall_service returns early then).
++            #[cfg(target_os = "macos")]
++            crate::remotesmith::tray_autostart::macos_remove_tray();
+             return None;
+         } else if args[0] == "--service" {
+             log::info!("start --service");
 diff --git a/src/platform/macos.rs b/src/platform/macos.rs
 index 813068efdc50..ac81b3aecfd7 100644
 --- a/src/platform/macos.rs
@@ -110,10 +126,10 @@ index 46110a620039..88c31af47c4b 100644
  mod tests;
 diff --git a/src/remotesmith/tray_autostart.rs b/src/remotesmith/tray_autostart.rs
 new file mode 100644
-index 000000000000..92a4d87555f6
+index 000000000000..4428489225ba
 --- /dev/null
 +++ b/src/remotesmith/tray_autostart.rs
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,181 @@
 +//! Autostart of the RemoteSmith tray (the sidecar, DEC-20) and its removal when RemoteSmith is
 +//! uninstalled (AC-39). Patch range 0600.
 +//!
@@ -137,11 +153,27 @@ index 000000000000..92a4d87555f6
 +pub const TRAY_RUN_VALUE: &str = "RemoteSmithTray";
 +const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 +
++/// Characters that cmd.exe can't carry safely inside the install script even when quoted (the same
++/// set RustDesk's installer rejects for install values).
++const CMD_UNSAFE: &[char] = &['\0', '"', '%', '\r', '\n', '|', '<', '>'];
++
++/// `^` then `&` escaped for the part of a nested-quoted value that cmd.exe parses unquoted (as
++/// RustDesk's `escape_nested_cmd_ampersands` does for the UninstallString value).
++fn escape_nested(value: &str) -> String {
++    value.replace('^', "^^").replace('&', "^&")
++}
++
 +/// Install-script lines (cmd, elevated): start the tray at every user's login if it was installed
-+/// next to the app in `path`.
++/// next to the app in `path`. `/d "\"…\""` toggles cmd.exe's quoting, so the path between the
++/// escaped quotes is parsed unquoted and gets the nested escaping. A path cmd.exe can't carry at
++/// all yields no command (the tray is then not autostarted, rather than the script breaking).
 +pub fn windows_install_cmds(path: &str) -> String {
++    if path.is_empty() || path.contains(CMD_UNSAFE) {
++        return String::new();
++    }
++    let nested = escape_nested(path);
 +    format!(
-+        "if exist \"{path}\\{TRAY_EXE}\" reg add HKLM\\{RUN_KEY} /f /v {TRAY_RUN_VALUE} /t REG_SZ /d \"\\\"{path}\\{TRAY_EXE}\\\"\""
++        "if exist \"{path}\\{TRAY_EXE}\" reg add HKLM\\{RUN_KEY} /f /v {TRAY_RUN_VALUE} /t REG_SZ /d \"\\\"{nested}\\{TRAY_EXE}\\\"\""
 +    )
 +}
 +
@@ -235,6 +267,35 @@ index 000000000000..92a4d87555f6
 +            c,
 +            r#"if exist "C:\Program Files\RemoteSmith\remotesmith-tray.exe" reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /f /v RemoteSmithTray /t REG_SZ /d "\"C:\Program Files\RemoteSmith\remotesmith-tray.exe\"""#
 +        );
++    }
++
++    #[test]
++    fn windows_install_escapes_metacharacters_in_the_unquoted_part() {
++        let c = windows_install_cmds(r"C:\R&D\A^B");
++        assert_eq!(
++            c,
++            r#"if exist "C:\R&D\A^B\remotesmith-tray.exe" reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /f /v RemoteSmithTray /t REG_SZ /d "\"C:\R^&D\A^^B\remotesmith-tray.exe\"""#
++        );
++        // Outside the quoted `if exist "…"` argument, every `&` is escaped: split the command
++        // at cmd.exe's quote toggles and check the unquoted pieces.
++        let unquoted: String = c.split('"').step_by(2).collect();
++        let bare = unquoted.replace("^^", "").replace("^&", "");
++        assert!(!bare.contains('&'), "unescaped & outside quotes: {c}");
++    }
++
++    #[test]
++    fn windows_install_refuses_paths_cmd_cannot_carry() {
++        for p in [
++            r#"C:\x" & calc & ""#,
++            r"C:\%PATH%",
++            r"C:\a|b",
++            r"C:\a<b",
++            r"C:\a>b",
++            "C:\\a\r\nb",
++            "",
++        ] {
++            assert_eq!(windows_install_cmds(p), "", "accepted {p:?}");
++        }
 +    }
 +
 +    #[test]
