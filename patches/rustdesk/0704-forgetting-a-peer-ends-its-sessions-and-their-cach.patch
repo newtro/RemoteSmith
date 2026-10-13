@@ -12,7 +12,9 @@ Each peer now has a forget generation (remotesmith_trust::forget). A session tak
 with its config load and writes the peer's config only while it is current, each under one
 lock. Forgetting bumps the generation and deletes the file under that lock, then the peer's
 live sessions drop their in-memory copy (staying stale, so they can write nothing) and are
-closed for good (no retry, a connect in flight is dropped, the window says why). A stale session that reaches the identity gate reloads the (now empty)
+closed for good (no retry, a connect in flight is dropped, the window says why). Out-of-session writers (window geometry and flutter options, peer options, alias, forget
+password) run under the same lock and never recreate a forgotten peer's missing file. A stale
+session that reaches the identity gate reloads the (now empty)
 config and drops its remembered password first, so whatever connects next enrolls afresh.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -20,10 +22,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/client.rs                     | 151 +++++++++++++++++++++++++++++-
  src/flutter_ffi.rs                |  20 +++-
  src/lang/en.rs                    |   1 +
- src/remotesmith_trust/forget.rs   | 115 +++++++++++++++++++++++
+ src/remotesmith_trust/forget.rs   | 137 +++++++++++++++++++++++++++
  src/remotesmith_trust/identity.rs |   7 ++
  src/remotesmith_trust/mod.rs      |   1 +
- 6 files changed, 291 insertions(+), 4 deletions(-)
+ src/ui_interface.rs               |  90 ++++++++++++++----
+ 7 files changed, 386 insertions(+), 21 deletions(-)
  create mode 100644 src/remotesmith_trust/forget.rs
 
 diff --git a/src/client.rs b/src/client.rs
@@ -259,10 +262,10 @@ index d65f3cc93194..362c3e05b622 100644
      ].iter().cloned().collect();
 diff --git a/src/remotesmith_trust/forget.rs b/src/remotesmith_trust/forget.rs
 new file mode 100644
-index 000000000000..4f6a51deb78b
+index 000000000000..c6c52f7def67
 --- /dev/null
 +++ b/src/remotesmith_trust/forget.rs
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,137 @@
 +//! "Forget peer" invalidates what live sessions hold, not just the file (RemoteSmith AC-39,
 +//! AC-43).
 +//!
@@ -321,6 +324,22 @@ index 000000000000..4f6a51deb78b
 +    forget_and(id, || {})
 +}
 +
++/// A read-modify-write of `id`'s peer file from outside a session (main window or a session
++/// window's own option writes: window geometry, flutter options, alias, forget password), run
++/// under the forget lock so it cannot straddle a forget: it either lands before (and is deleted
++/// with the file) or after. After a forget it is skipped while the file is gone, so closing a
++/// forgotten peer's window cannot recreate its file. Returns whether it ran.
++pub fn locked_rmw(id: &str, exists: impl FnOnce() -> bool, rmw: impl FnOnce()) -> bool {
++    let g = lock();
++    let forgotten = g.as_ref().map_or(false, |m| m.contains_key(id));
++    if forgotten && !exists() {
++        hbb_common::log::info!("peer {}: forgotten; not recreating its config", id);
++        return false;
++    }
++    rmw();
++    true
++}
++
 +/// Load `id`'s config (`load`) together with the generation it belongs to, under the lock.
 +pub fn load_current<T>(id: &str, load: impl FnOnce() -> T) -> (u64, T) {
 +    let g = lock();
@@ -374,6 +393,12 @@ index 000000000000..4f6a51deb78b
 +        assert!(removed && g2 == g1 + 1);
 +        let (g, v) = load_current(id, || 42);
 +        assert_eq!((g, v), (g2, 42));
++        // Out-of-session writers: skipped for a forgotten peer whose file is gone, run when it
++        // exists again (re-enrolled) and for peers never forgotten.
++        assert!(!locked_rmw(id, || false, || panic!("recreated a forgotten peer")));
++        let mut ran = false;
++        assert!(locked_rmw(id, || true, || ran = true) && ran);
++        assert!(locked_rmw("forget-test-never", || false, || {}));
 +        // Other peers are unaffected.
 +        assert!(is_current("forget-test-peer-2", generation("forget-test-peer-2")));
 +    }
@@ -405,3 +430,119 @@ index 0d23668ff3fa..aa1326ce5840 100644
  pub mod password_epoch;
  pub mod direct_access;
 +pub mod forget;
+diff --git a/src/ui_interface.rs b/src/ui_interface.rs
+index b1eeefde2e6a..957271e5f597 100644
+--- a/src/ui_interface.rs
++++ b/src/ui_interface.rs
+@@ -293,9 +293,12 @@ pub fn peer_has_password(id: String) -> bool {
+ 
+ #[inline]
+ pub fn forget_password(id: String) {
+-    let mut c = PeerConfig::load(&id);
+-    c.password.clear();
+-    c.store(&id);
++    // RemoteSmith (AC-39): serialized with "Forget peer" (remotesmith_trust::forget).
++    crate::remotesmith_trust::forget::locked_rmw(&id, || PeerConfig::exists(&id), || {
++        let mut c = PeerConfig::load(&id);
++        c.password.clear();
++        c.store(&id);
++    });
+ }
+ 
+ #[inline]
+@@ -314,24 +317,31 @@ pub fn get_peer_flutter_option(id: String, name: String) -> String {
+ #[inline]
+ #[cfg(feature = "flutter")]
+ pub fn set_peer_flutter_option(id: String, name: String, value: String) {
+-    let mut c = PeerConfig::load(&id);
+-    if value.is_empty() {
+-        c.ui_flutter.remove(&name);
+-    } else {
+-        c.ui_flutter.insert(name, value);
+-    }
+-    c.store(&id);
++    // RemoteSmith (AC-39): serialized with "Forget peer", and never recreates a forgotten
++    // peer's file (a window closing after the forget saves its geometry here).
++    crate::remotesmith_trust::forget::locked_rmw(&id, || PeerConfig::exists(&id), || {
++        let mut c = PeerConfig::load(&id);
++        if value.is_empty() {
++            c.ui_flutter.remove(&name);
++        } else {
++            c.ui_flutter.insert(name, value);
++        }
++        c.store(&id);
++    });
+ }
+ 
+ #[inline]
+ pub fn set_peer_option(id: String, name: String, value: String) {
+-    let mut c = PeerConfig::load(&id);
+-    if value.is_empty() {
+-        c.options.remove(&name);
+-    } else {
+-        c.options.insert(name, value);
+-    }
+-    c.store(&id);
++    // RemoteSmith (AC-39): serialized with "Forget peer" (remotesmith_trust::forget).
++    crate::remotesmith_trust::forget::locked_rmw(&id, || PeerConfig::exists(&id), || {
++        let mut c = PeerConfig::load(&id);
++        if value.is_empty() {
++            c.options.remove(&name);
++        } else {
++            c.options.insert(name, value);
++        }
++        c.store(&id);
++    });
+ }
+ 
+ #[inline]
+@@ -1776,3 +1786,49 @@ mod tests {
+         assert_eq!(validate_windows_service_video_save_directory("  "), None);
+     }
+ }
++
++/// RemoteSmith C1 gate review (AC-39): a session window's option writes after "Forget peer"
++/// do not recreate the peer file, while a racing write is serialized with the deletion.
++#[cfg(all(test, feature = "flutter"))]
++mod remotesmith_forget_writer_tests {
++    use super::*;
++
++    #[test]
++    fn option_writes_after_forget_do_not_recreate_the_peer() {
++        let id = format!("remotesmith-forget-writer-test-{}", std::process::id());
++        struct Cleanup(String);
++        impl Drop for Cleanup {
++            fn drop(&mut self) {
++                PeerConfig::remove(&self.0);
++            }
++        }
++        let _cleanup = Cleanup(id.clone());
++        let mut c = PeerConfig::default();
++        c.password = vec![1, 2, 3];
++        c.options.insert("remotesmith-host-fingerprint".into(), "aaaa".into());
++        c.store(&id);
++        assert!(PeerConfig::exists(&id));
++        // A writer that loaded before the forget and stores "after" it: under the lock the
++        // forget waits for it, then deletes what it wrote.
++        let writer = {
++            let id = id.clone();
++            std::thread::spawn(move || {
++                crate::remotesmith_trust::forget::locked_rmw(&id, || PeerConfig::exists(&id), || {
++                    let mut c = PeerConfig::load(&id);
++                    std::thread::sleep(std::time::Duration::from_millis(200));
++                    c.ui_flutter.insert("window-geometry".into(), "x".into());
++                    c.store(&id);
++                })
++            })
++        };
++        std::thread::sleep(std::time::Duration::from_millis(50));
++        crate::remotesmith_trust::forget::forget_and(&id, || PeerConfig::remove(&id));
++        assert!(writer.join().unwrap());
++        assert!(!PeerConfig::exists(&id), "a write straddled the forget");
++        // The window closing afterwards (geometry, options, alias, forget password).
++        set_peer_flutter_option(id.clone(), "window-geometry".into(), "y".into());
++        set_peer_option(id.clone(), "view-style".into(), "adaptive".into());
++        forget_password(id.clone());
++        assert!(!PeerConfig::exists(&id), "a forgotten peer's file was recreated");
++    }
++}

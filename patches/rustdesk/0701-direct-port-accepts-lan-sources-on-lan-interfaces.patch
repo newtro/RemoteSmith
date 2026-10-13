@@ -8,6 +8,13 @@ DEF-14, AC-51 (whole-product review finding 1). Upstream's direct server listens
 interface and serves any source, and the Windows installer allows every inbound packet to the
 program. Now:
 
+- macOS (weak host model): the direct server no longer listens on the wildcard address but on
+  each address of each LAN interface, each socket pinned to its interface (IP_BOUND_IF /
+  IPV6_BOUND_IF), refreshed every 3 s, so a handshake that arrived over utun or loopback never
+  completes even when the VPN routes an overlapping subnet. Windows uses the strong host model,
+  so the adapter owning the local address is the one that received the connection.
+- Windows adapters must be hardware-backed (GetIfTable2 HardwareInterface); a virtual adapter
+  counts only if it carries a hardware adapter's MAC (a Hyper-V external switch's host adapter).
 - direct_server checks each accepted connection before any handshake byte: the local address
   it reached must belong to a physical LAN interface (macOS enN; Windows wired/Wi-Fi adapters
   that are not a VPN product's virtual adapter; never loopback, utun/tun/tap, ppp, ipsec,
@@ -18,21 +25,37 @@ program. Now:
   own LAN address looks like a LAN host; that is outside what a layer-3 check can see.
 - Windows (netsh install script and the MSI custom action): the inbound program rule is split
   into UDP, TCP on every port but 21118 (as upstream), and TCP 21118 from LocalSubnet only,
-  without edge traversal. Same rule name, so uninstall still removes them all; the MSI remove
+  on LAN and wireless interface types only, without edge traversal. Same rule name, so uninstall still removes them all; the MSI remove
   now loops until none is left.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- res/msi/CustomActions/FirewallRules.cpp | 110 +++-
- src/platform/windows.rs                 |  13 +-
- src/remotesmith_trust/direct_access.rs  | 650 ++++++++++++++++++++++++
- src/remotesmith_trust/mod.rs            |   1 +
- src/rendezvous_mediator.rs              |   8 +-
- 5 files changed, 764 insertions(+), 18 deletions(-)
+ Cargo.toml                              |    4 +
+ res/msi/CustomActions/FirewallRules.cpp |  126 ++-
+ src/platform/windows.rs                 |   13 +-
+ src/remotesmith_trust/direct_access.rs  | 1039 +++++++++++++++++++++++
+ src/remotesmith_trust/mod.rs            |    1 +
+ src/rendezvous_mediator.rs              |   69 +-
+ 6 files changed, 1234 insertions(+), 18 deletions(-)
  create mode 100644 src/remotesmith_trust/direct_access.rs
 
+diff --git a/Cargo.toml b/Cargo.toml
+index b71886c427e7..1307f6189cd5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -129,6 +129,10 @@ winapi = { version = "0.3", features = [
+ windows = { version = "0.61", features = [
+     "Win32",
+     "Win32_Foundation",
++    # RemoteSmith (AC-51): GetIfTable2 / MIB_IF_ROW2 for the direct-access adapter check.
++    "Win32_NetworkManagement_IpHelper",
++    "Win32_NetworkManagement_Ndis",
++    "Win32_Networking_WinSock",
+     "Win32_Security",
+     "Win32_Security_Authorization",
+     "Win32_Storage_FileSystem",
 diff --git a/res/msi/CustomActions/FirewallRules.cpp b/res/msi/CustomActions/FirewallRules.cpp
-index bca2739b889c..3f602c4946e9 100644
+index bca2739b889c..5880a9c93a18 100644
 --- a/res/msi/CustomActions/FirewallRules.cpp
 +++ b/res/msi/CustomActions/FirewallRules.cpp
 @@ -30,7 +30,17 @@ HRESULT    RemoveFirewallRule(
@@ -46,7 +69,7 @@ index bca2739b889c..3f602c4946e9 100644
 +                                            __in_opt LPCWSTR remoteAddresses);
 +
 +// RemoteSmith (DEF-14, AC-51): the direct-access port (21118) may be reached from the local
-+// subnet only. Upstream's single "allow all inbound to the program" rule is split so that this
++// subnet only, over wired or Wi-Fi interface types. Upstream's single "allow all inbound to the program" rule is split so that this
 +// port is excluded from it and gets a LocalSubnet-scoped rule of its own (same rule name, so
 +// RemoveFirewallRule removes them all). The app also refuses non-LAN sources itself.
 +#define RS_DIRECT_PORT              L"21118"
@@ -118,16 +141,17 @@ index bca2739b889c..3f602c4946e9 100644
  {
      HRESULT hr = S_OK;
      INetFwRules* pNetFwRules = NULL;
-@@ -170,6 +209,8 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
+@@ -170,6 +209,9 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
      BSTR RuleGroupName = NULL;
      BSTR RuleDescription = NULL;
      BSTR RuleAppPath = NULL;
 +    BSTR RuleLocalPorts = NULL;
 +    BSTR RuleRemoteAddresses = NULL;
++    BSTR RuleInterfaceTypes = NULL;
  
      long CurrentProfilesBitMask = 0;
  
-@@ -298,12 +339,48 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
+@@ -298,12 +340,62 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
          goto Cleanup;
      }
  
@@ -178,11 +202,25 @@ index bca2739b889c..3f602c4946e9 100644
 +            WcaLog(LOGMSG_STANDARD, "Failed INetFwRule::put_RemoteAddresses failed with error: 0x %x.\n", hr);
 +            goto Cleanup;
 +        }
++        // The scoped (direct-port) rule: wired and Wi-Fi interface types only, not RAS/VPN.
++        RuleInterfaceTypes = SysAllocString(L"Lan,Wireless");
++        if (NULL == RuleInterfaceTypes)
++        {
++            WcaLog(LOGMSG_STANDARD, "\nERROR: Insufficient memory\n");
++            hr = E_OUTOFMEMORY;
++            goto Cleanup;
++        }
++        hr = pNetFwRule->put_InterfaceTypes(RuleInterfaceTypes);
++        if (FAILED(hr))
++        {
++            WcaLog(LOGMSG_STANDARD, "Failed INetFwRule::put_InterfaceTypes failed with error: 0x %x.\n", hr);
++            goto Cleanup;
++        }
 +    }
  
      hr = pNetFwRule->put_Profiles(CurrentProfilesBitMask);
      if (FAILED(hr))
-@@ -319,7 +396,8 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
+@@ -319,7 +411,8 @@ HRESULT    AddFirewallRuleWithEdgeTraversal(
          goto Cleanup;
      }
  
@@ -192,12 +230,13 @@ index bca2739b889c..3f602c4946e9 100644
          // Check if INetFwRule2 interface is available (i.e Windows7+)
          // If supported, then use EdgeTraversalOptions
          // Else use the EdgeTraversal boolean flag.
-@@ -359,6 +437,8 @@ Cleanup:
+@@ -359,6 +452,9 @@ Cleanup:
      SysFreeString(RuleGroupName);
      SysFreeString(RuleDescription);
      SysFreeString(RuleAppPath);
 +    SysFreeString(RuleLocalPorts);
 +    SysFreeString(RuleRemoteAddresses);
++    SysFreeString(RuleInterfaceTypes);
  
      if (pNetFwRule2 != NULL)
      {
@@ -229,10 +268,10 @@ index a3c3d68f0508..b2b96a541d05 100644
  pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
 diff --git a/src/remotesmith_trust/direct_access.rs b/src/remotesmith_trust/direct_access.rs
 new file mode 100644
-index 000000000000..a54b399f58f8
+index 000000000000..08c7a7a9157b
 --- /dev/null
 +++ b/src/remotesmith_trust/direct_access.rs
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,1039 @@
 +//! The direct-access port (21118 by default) accepts LAN peers only (RemoteSmith DEF-14, AC-51).
 +//!
 +//! Upstream's direct server listens on every interface and serves any source. RemoteSmith keeps
@@ -243,12 +282,24 @@ index 000000000000..a54b399f58f8
 +//! - comes from an address outside the subnet of the local address it reached (so a VPN or a
 +//!   routed network reaching the LAN address is refused too).
 +//!
-+//! The interface is the one that owns the connection's local address. On macOS (weak host
-+//! model) a packet that came in over a VPN can still be addressed to the Wi-Fi address; its
-+//! source is then a VPN address, which the subnet check refuses.
++//! The interface a connection was *received* on is what counts, not only the one owning the
++//! address it reached:
++//! - macOS uses the weak host model: a packet that came in over a VPN (utun) may be addressed to
++//!   the Wi-Fi address, even from a source inside the Wi-Fi subnet when the VPN routes an
++//!   overlapping subnet. So the direct server does not listen on the wildcard address there:
++//!   [`LanListeners`] binds one listener per address of each LAN interface, each pinned to its
++//!   interface with `IP_BOUND_IF` / `IPV6_BOUND_IF`. A socket pinned to en0 only answers out of
++//!   en0, so a handshake that arrived over utun (or loopback) never completes.
++//! - Windows uses the strong host model by default (weak host receive is off): a packet that
++//!   arrives on one adapter for another adapter's address is dropped, so the adapter owning the
++//!   local address is the one that received it. The OS firewall rule for the port is also
++//!   limited to LAN/wireless interface types and the local subnet (platform/windows.rs, the
++//!   MSI's FirewallRules.cpp). Adapters must be positively hardware-backed (`HardwareInterface`
++//!   from GetIfTable2); a Hyper-V vEthernet adapter counts only when it carries the MAC of a
++//!   hardware adapter, which is how an *external* switch's host adapter looks (an internal or
++//!   Default Switch adapter has a generated MAC).
 +//!
-+//! Windows adds an OS firewall rule limiting the port to the local subnet (platform/windows.rs
-+//! and the MSI's FirewallRules.cpp); this check is the boundary on every platform.
++//! The subnet check applies on top, on every platform.
 +
 +use std::net::{IpAddr, SocketAddr};
 +
@@ -290,6 +341,37 @@ index 000000000000..a54b399f58f8
 +    pub kind: Kind,
 +    /// Addresses with their on-link prefix length.
 +    pub nets: Vec<(IpAddr, u8)>,
++    /// Windows: what the adapter is backed by (GetIfTable2). `None` elsewhere, or when it could
++    /// not be read (then a Windows adapter is not LAN: fail closed).
++    pub hw: Option<Hw>,
++}
++
++/// Windows adapter facts from `MIB_IF_ROW2`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub struct Hw {
++    /// `InterfaceAndOperStatusFlags.HardwareInterface`: a physical NIC, not a virtual adapter.
++    pub hardware: bool,
++    pub mac: Option<[u8; 6]>,
++}
++
++/// Windows: hardware-backed, or a virtual adapter carrying a hardware adapter's MAC (the host
++/// adapter of a Hyper-V external switch, bound to that NIC). Internal/Default Switch, VPN, TAP,
++/// Wintun and VM host-only adapters have MACs of their own, so they are not.
++fn windows_hardware_backed(iface: &Iface, all: &[Iface]) -> bool {
++    let Some(hw) = iface.hw else {
++        return false;
++    };
++    if hw.hardware {
++        return true;
++    }
++    let Some(mac) = hw.mac.filter(|m| m.iter().any(|b| *b != 0)) else {
++        return false;
++    };
++    all.iter().any(|o| {
++        o.index != iface.index
++            && o.hw.map_or(false, |h| h.hardware && h.mac == Some(mac))
++            && matches!(o.kind, Kind::Ethernet | Kind::Wireless)
++    })
 +}
 +
 +#[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,8 +429,8 @@ index 000000000000..a54b399f58f8
 +    "barracuda",
 +    "pritunl",
 +    "nebula",
-+    // Host-internal virtual networks (VM and WSL guests), never the physical LAN. A Hyper-V
-+    // *external* switch ("vEthernet (<name>)" bound to the NIC) stays allowed.
++    // Host-internal virtual networks (VM and WSL guests), never the physical LAN. (Backup for
++    // the hardware check; a Hyper-V *external* switch adapter passes it by MAC.)
 +    "vmware",
 +    "virtualbox",
 +    "host-only",
@@ -362,8 +444,9 @@ index 000000000000..a54b399f58f8
 +    "br-", "veth", "virbr", "vmnet", "vboxnet", "awdl", "llw", "bridge", "anpi", "ap",
 +];
 +
-+/// Whether `iface` is a physical LAN interface on `os`.
-+pub fn is_lan_interface(os: Os, iface: &Iface) -> bool {
++/// Whether `iface` is a physical LAN interface on `os`. `all` is the machine's interface list
++/// (Windows matches a virtual adapter's MAC against the hardware ones).
++pub fn is_lan_interface(os: Os, iface: &Iface, all: &[Iface]) -> bool {
 +    if matches!(iface.kind, Kind::Loopback | Kind::Tunnel | Kind::Ppp) {
 +        return false;
 +    }
@@ -377,12 +460,14 @@ index 000000000000..a54b399f58f8
 +                && name.starts_with("en")
 +                && name[2..].chars().all(|c| c.is_ascii_digit())
 +        }
-+        // Windows names adapters freely; the type and the description decide. Only wired and
-+        // Wi-Fi types, and not a VPN product's virtual Ethernet adapter. (Wintun/WireGuard
-+        // adapters have a type default_net does not list, so they never get here.)
++        // Windows names adapters freely. Only wired and Wi-Fi types, positively backed by
++        // hardware (see [`windows_hardware_backed`]), and no VPN/virtual product name as a
++        // second line of defence. (Wintun/WireGuard adapters have a type default_net does not
++        // list, so they never get here.)
 +        Os::Windows => {
 +            let desc = format!("{} {}", name, iface.description.to_ascii_lowercase());
 +            matches!(iface.kind, Kind::Ethernet | Kind::Wireless)
++                && windows_hardware_backed(iface, all)
 +                && !WINDOWS_VPN_MARKERS.iter().any(|m| desc.contains(m))
 +        }
 +        Os::Other => {
@@ -437,7 +522,7 @@ index 000000000000..a54b399f58f8
 +        return Err(Refusal::UnknownInterface);
 +    }
 +    // The same address on two interfaces is ambiguous; every owner must be LAN (fail closed).
-+    if let Some(bad) = owners.iter().find(|i| !is_lan_interface(os, i)) {
++    if let Some(bad) = owners.iter().find(|i| !is_lan_interface(os, i, ifaces)) {
 +        return Err(Refusal::NotLan {
 +            iface: bad.name.clone(),
 +        });
@@ -500,11 +585,47 @@ index 000000000000..a54b399f58f8
 +    v
 +}
 +
++/// Windows: `MIB_IF_ROW2` facts by interface index.
++#[cfg(windows)]
++fn windows_hw_table() -> std::collections::HashMap<u32, Hw> {
++    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
++    let mut map = std::collections::HashMap::new();
++    unsafe {
++        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
++        if GetIfTable2(&mut table).is_err() || table.is_null() {
++            hbb_common::log::error!("direct access: GetIfTable2 failed; no adapter counts as LAN");
++            return map;
++        }
++        let rows = std::slice::from_raw_parts(
++            (*table).Table.as_ptr(),
++            (*table).NumEntries as usize,
++        );
++        for r in rows {
++            // Bit 0 of the flags byte is HardwareInterface.
++            let hardware = (r.InterfaceAndOperStatusFlags._bitfield & 1) != 0;
++            let mac = (r.PhysicalAddressLength == 6).then(|| {
++                let mut m = [0u8; 6];
++                m.copy_from_slice(&r.PhysicalAddress[..6]);
++                m
++            });
++            map.entry(r.InterfaceIndex).or_insert(Hw { hardware, mac });
++        }
++        FreeMibTable(table as *const _);
++    }
++    map
++}
++
 +/// This machine's interfaces, now.
 +pub fn local_interfaces() -> Vec<Iface> {
++    #[cfg(windows)]
++    let hw = windows_hw_table();
 +    default_net::get_interfaces()
 +        .into_iter()
 +        .map(|i| Iface {
++            #[cfg(windows)]
++            hw: hw.get(&i.index).copied(),
++            #[cfg(not(windows))]
++            hw: None,
 +            index: i.index,
 +            description: [i.friendly_name.as_deref(), i.description.as_deref()]
 +                .into_iter()
@@ -576,6 +697,207 @@ index 000000000000..a54b399f58f8
 +    }
 +}
 +
++/// The addresses the direct server listens on where it pins listeners to interfaces (macOS):
++/// every address of every LAN interface, as `(interface index, address:port)`. Link-local IPv6
++/// addresses carry their interface as scope.
++pub fn bind_plan(os: Os, ifaces: &[Iface], port: u16) -> Vec<(u32, SocketAddr)> {
++    use std::net::SocketAddrV6;
++    let mut out = Vec::new();
++    for i in ifaces.iter().filter(|i| is_lan_interface(os, i, ifaces)) {
++        for (ip, _) in &i.nets {
++            let addr = match ip {
++                IpAddr::V4(_) => SocketAddr::new(*ip, port),
++                IpAddr::V6(v6) => {
++                    let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
++                    SocketAddr::V6(SocketAddrV6::new(*v6, port, 0, if link_local { i.index } else { 0 }))
++                }
++            };
++            if !out.iter().any(|(_, a)| *a == addr) {
++                out.push((i.index, addr));
++            }
++        }
++    }
++    out
++}
++
++/// macOS: the direct server's listeners, one per LAN address, each pinned to its interface with
++/// `IP_BOUND_IF` / `IPV6_BOUND_IF` (see the module docs). [`Self::refresh`] follows address
++/// changes; accepted connections come out of [`Self::next`].
++#[cfg(target_os = "macos")]
++pub struct LanListeners {
++    port: u16,
++    tasks: std::collections::HashMap<(u32, SocketAddr), hbb_common::tokio::task::JoinHandle<()>>,
++    failed: std::collections::HashSet<(u32, SocketAddr)>,
++    tx: hbb_common::tokio::sync::mpsc::UnboundedSender<(hbb_common::tokio::net::TcpStream, SocketAddr)>,
++    rx: hbb_common::tokio::sync::mpsc::UnboundedReceiver<(hbb_common::tokio::net::TcpStream, SocketAddr)>,
++}
++
++#[cfg(target_os = "macos")]
++impl LanListeners {
++    pub fn new(port: u16) -> Self {
++        let (tx, rx) = hbb_common::tokio::sync::mpsc::unbounded_channel();
++        Self {
++            port,
++            tasks: Default::default(),
++            failed: Default::default(),
++            tx,
++            rx,
++        }
++    }
++
++    pub fn port(&self) -> u16 {
++        self.port
++    }
++
++    /// Addresses currently listened on.
++    pub fn bound(&self) -> Vec<(u32, SocketAddr)> {
++        self.tasks.keys().copied().collect()
++    }
++
++    /// One listener on `addr`, pinned to interface `index`.
++    pub fn bind_pinned(index: u32, addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
++        use hbb_common::libc;
++        use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
++        let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
++        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
++        if fd < 0 {
++            return Err(std::io::Error::last_os_error());
++        }
++        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
++        let set = |level: libc::c_int, opt: libc::c_int, v: libc::c_int| -> std::io::Result<()> {
++            let r = unsafe {
++                libc::setsockopt(
++                    fd.as_raw_fd(),
++                    level,
++                    opt,
++                    &v as *const _ as *const libc::c_void,
++                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
++                )
++            };
++            if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
++        };
++        set(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
++        if addr.is_ipv4() {
++            set(libc::IPPROTO_IP, libc::IP_BOUND_IF, index as libc::c_int)?;
++        } else {
++            set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
++            set(libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF, index as libc::c_int)?;
++        }
++        let l = std::net::TcpListener::from(fd);
++        // std has no bind-after-options API; do it through socket2-free libc as well.
++        let (raw, len) = sockaddr_of(&addr);
++        if unsafe { libc::bind(l.as_raw_fd(), &raw as *const _ as *const libc::sockaddr, len) } != 0 {
++            return Err(std::io::Error::last_os_error());
++        }
++        if unsafe { libc::listen(l.as_raw_fd(), 128) } != 0 {
++            return Err(std::io::Error::last_os_error());
++        }
++        l.set_nonblocking(true)?;
++        Ok(l)
++    }
++
++    /// Bind listeners for addresses that appeared, drop those whose address went away.
++    pub fn refresh(&mut self) {
++        let plan = bind_plan(this_os(), &local_interfaces_cached(), self.port);
++        self.tasks.retain(|k, t| {
++            let keep = plan.contains(k);
++            if !keep {
++                t.abort();
++                hbb_common::log::info!("direct access: stopped listening on {} (if {})", k.1, k.0);
++            }
++            keep
++        });
++        self.failed.retain(|k| plan.contains(k));
++        for key in plan {
++            if self.tasks.contains_key(&key) {
++                continue;
++            }
++            let (index, addr) = key;
++            let listener = match Self::bind_pinned(index, addr)
++                .and_then(hbb_common::tokio::net::TcpListener::from_std)
++            {
++                Ok(l) => l,
++                Err(e) => {
++                    if self.failed.insert(key) {
++                        hbb_common::log::error!("direct access: cannot listen on {addr} (if {index}): {e}");
++                    }
++                    continue;
++                }
++            };
++            self.failed.remove(&key);
++            hbb_common::log::info!("direct access: listening on {addr} (if {index})");
++            let tx = self.tx.clone();
++            self.tasks.insert(
++                key,
++                hbb_common::tokio::spawn(async move {
++                    loop {
++                        match listener.accept().await {
++                            Ok(c) => {
++                                if tx.send(c).is_err() {
++                                    return;
++                                }
++                            }
++                            Err(e) => {
++                                hbb_common::log::warn!("direct access: accept on {addr}: {e}");
++                                hbb_common::tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++                            }
++                        }
++                    }
++                }),
++            );
++        }
++    }
++
++    /// The next accepted connection, or `None` after `ms` without one.
++    pub async fn next(&mut self, ms: u64) -> Option<(hbb_common::tokio::net::TcpStream, SocketAddr)> {
++        hbb_common::tokio::time::timeout(std::time::Duration::from_millis(ms), self.rx.recv())
++            .await
++            .ok()
++            .flatten()
++    }
++}
++
++#[cfg(target_os = "macos")]
++impl Drop for LanListeners {
++    fn drop(&mut self) {
++        for t in self.tasks.values() {
++            t.abort();
++        }
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn sockaddr_of(addr: &SocketAddr) -> (hbb_common::libc::sockaddr_storage, hbb_common::libc::socklen_t) {
++    use hbb_common::libc;
++    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
++    let len = match addr {
++        SocketAddr::V4(a) => {
++            let sin = libc::sockaddr_in {
++                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
++                sin_family: libc::AF_INET as libc::sa_family_t,
++                sin_port: a.port().to_be(),
++                sin_addr: libc::in_addr { s_addr: u32::from(*a.ip()).to_be() },
++                sin_zero: [0; 8],
++            };
++            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in, sin) };
++            std::mem::size_of::<libc::sockaddr_in>()
++        }
++        SocketAddr::V6(a) => {
++            let sin6 = libc::sockaddr_in6 {
++                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
++                sin6_family: libc::AF_INET6 as libc::sa_family_t,
++                sin6_port: a.port().to_be(),
++                sin6_flowinfo: a.flowinfo(),
++                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
++                sin6_scope_id: a.scope_id(),
++            };
++            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in6, sin6) };
++            std::mem::size_of::<libc::sockaddr_in6>()
++        }
++    };
++    (ss, len as libc::socklen_t)
++}
++
 +/// The TCP local-port list `localport=` takes for "every port but `port`".
 +pub fn tcp_ports_except(port: u16) -> String {
 +    let mut parts = Vec::new();
@@ -605,7 +927,9 @@ index 000000000000..a54b399f58f8
 +    vec![
 +        format!("{base} protocol=udp"),
 +        format!("{base} protocol=tcp localport={}", tcp_ports_except(direct_port)),
-+        format!("{base} protocol=tcp localport={direct_port} remoteip=localsubnet"),
++        // Wired and Wi-Fi interface types only (not RAS/VPN), one rule each.
++        format!("{base} protocol=tcp localport={direct_port} remoteip=localsubnet interfacetype=lan"),
++        format!("{base} protocol=tcp localport={direct_port} remoteip=localsubnet interfacetype=wireless"),
 +    ]
 +}
 +
@@ -621,6 +945,14 @@ index 000000000000..a54b399f58f8
 +            description: desc.into(),
 +            kind,
 +            nets: nets.iter().map(|(a, p)| (a.parse().unwrap(), *p)).collect(),
++            hw: None,
++        }
++    }
++
++    fn win(index: u32, kind: Kind, desc: &str, hardware: bool, mac: u8, nets: &[(&str, u8)]) -> Iface {
++        Iface {
++            hw: Some(Hw { hardware, mac: Some([0x00, 0x15, 0x5d, 1, 2, mac]) }),
++            ..iface(index, &format!("{{{index}}}"), kind, desc, nets)
 +        }
 +    }
 +
@@ -762,21 +1094,55 @@ index 000000000000..a54b399f58f8
 +        ));
 +    }
 +
++    /// Gate review: Windows adapters must be hardware-backed. An unknown virtual adapter with
++    /// an innocent name, a Hyper-V internal switch and a Wi-Fi Direct adapter are refused; the
++    /// host adapter of a Hyper-V external switch (the physical NIC's MAC, NIC itself unbound)
++    /// is accepted.
++    #[test]
++    fn windows_adapters_must_be_hardware_backed() {
++        let nic = win(5, Kind::Ethernet, "Ethernet Intel(R) Ethernet Connection I219-V", true, 0x10, &[]);
++        let external = win(9, Kind::Ethernet, "vEthernet (LAN) Hyper-V Virtual Ethernet Adapter", false, 0x10, &[("192.168.1.40", 24)]);
++        let internal = win(10, Kind::Ethernet, "vEthernet (Lab) Hyper-V Virtual Ethernet Adapter #3", false, 0x77, &[("172.30.0.1", 20)]);
++        let mystery = win(11, Kind::Ethernet, "Ethernet 5 Some Overlay Adapter", false, 0x55, &[("192.168.1.41", 24)]);
++        let wifi_direct = win(12, Kind::Wireless, "Local Area Connection* 2 Microsoft Wi-Fi Direct Virtual Adapter", false, 0x11, &[]);
++        let all = vec![nic.clone(), external.clone(), internal.clone(), mystery.clone(), wifi_direct.clone()];
++        assert!(is_lan_interface(Os::Windows, &nic, &all));
++        assert!(is_lan_interface(Os::Windows, &external, &all), "external switch host adapter");
++        assert!(!is_lan_interface(Os::Windows, &internal, &all), "internal switch");
++        assert!(!is_lan_interface(Os::Windows, &mystery, &all), "unknown virtual adapter");
++        assert!(!is_lan_interface(Os::Windows, &wifi_direct, &all));
++        // Without the hardware table (GetIfTable2 failed): fail closed.
++        let unknown = Iface { hw: None, ..nic.clone() };
++        assert!(!is_lan_interface(Os::Windows, &unknown, &[unknown.clone()]));
++        // The MAC must belong to a *hardware* adapter, not just any other adapter.
++        let twin = win(13, Kind::Ethernet, "Ethernet 6 Clone", false, 0x77, &[]);
++        assert!(!is_lan_interface(Os::Windows, &twin, &[twin.clone(), internal.clone()]));
++        assert_eq!(
++            check(Os::Windows, &mapped("192.168.1.40", 21118), &mapped("192.168.1.20", 5), &all),
++            Ok("{9}".into())
++        );
++        assert!(matches!(
++            check(Os::Windows, &mapped("192.168.1.41", 21118), &mapped("192.168.1.20", 5), &all),
++            Err(Refusal::NotLan { .. })
++        ));
++    }
++
 +    #[test]
 +    fn mac_interface_names() {
-+        let k = |n: &str| is_lan_interface(Os::Macos, &iface(1, n, Kind::Other, "", &[]));
++        let k = |n: &str| is_lan_interface(Os::Macos, &iface(1, n, Kind::Other, "", &[]), &[]);
 +        assert!(k("en0") && k("en12"));
 +        for n in ["utun0", "ipsec0", "ppp0", "gif0", "stf0", "awdl0", "llw0", "bridge0", "bridge100", "anpi0", "lo0", "en", "enx", "vmenet0"] {
 +            assert!(!k(n), "{n}");
 +        }
 +        // A loopback/tunnel kind is never LAN, whatever the name.
-+        assert!(!is_lan_interface(Os::Macos, &iface(1, "en9", Kind::Tunnel, "", &[])));
++        assert!(!is_lan_interface(Os::Macos, &iface(1, "en9", Kind::Tunnel, "", &[]), &[]));
 +    }
 +
 +    #[test]
 +    fn windows_adapters() {
 +        let w = |kind: Kind, desc: &str| {
-+            is_lan_interface(Os::Windows, &iface(1, "{GUID}", kind, desc, &[]))
++            let i = win(1, kind, desc, true, 1, &[]);
++            is_lan_interface(Os::Windows, &i, std::slice::from_ref(&i))
 +        };
 +        assert!(w(Kind::Ethernet, "Ethernet Intel(R) Ethernet Connection I219-V"));
 +        assert!(w(Kind::Wireless, "Wi-Fi Intel(R) Wi-Fi 6 AX201 160MHz"));
@@ -816,12 +1182,12 @@ index 000000000000..a54b399f58f8
 +            "2001:db8:1::1".parse::<std::net::Ipv6Addr>().unwrap()
 +        );
 +        let ifs = vec![
-+            iface(12, "{A}", Kind::Ethernet, "Ethernet Realtek PCIe GbE", &[("192.168.1.40", 24)]),
-+            iface(30, "{B}", Kind::Ethernet, "OpenVPN TAP-Windows6", &[("10.8.0.6", 24)]),
++            win(12, Kind::Ethernet, "Ethernet Realtek PCIe GbE", true, 0xa, &[("192.168.1.40", 24)]),
++            win(30, Kind::Ethernet, "OpenVPN TAP-Windows6", false, 0xb, &[("10.8.0.6", 24)]),
 +        ];
 +        assert_eq!(
 +            check(Os::Windows, &mapped("192.168.1.40", 21118), &mapped("192.168.1.20", 5), &ifs),
-+            Ok("{A}".into())
++            Ok("{12}".into())
 +        );
 +        assert!(matches!(
 +            check(Os::Windows, &mapped("10.8.0.6", 21118), &mapped("10.8.0.1", 5), &ifs),
@@ -845,8 +1211,9 @@ index 000000000000..a54b399f58f8
 +            }
 +        };
 +        assert!(!accept_one(sa(&format!("127.0.0.1:{port}"))).await, "loopback admitted");
-+        let lan = local_interfaces().into_iter().find_map(|i| {
-+            is_lan_interface(this_os(), &i)
++        let all = local_interfaces();
++        let lan = all.iter().find_map(|i| {
++            is_lan_interface(this_os(), i, &all)
 +                .then(|| i.nets.iter().find(|(ip, p)| ip.is_ipv4() && *p >= 8 && *p <= 30).map(|(ip, _)| *ip))
 +                .flatten()
 +        });
@@ -857,6 +1224,66 @@ index 000000000000..a54b399f58f8
 +            ),
 +            None => eprintln!("no IPv4 LAN interface on this machine; LAN half skipped"),
 +        }
++    }
++
++    #[test]
++    fn bind_plan_covers_only_lan_addresses_with_link_local_scope() {
++        let plan = bind_plan(Os::Macos, &mac_ifaces(), 21118);
++        let addrs: Vec<String> = plan.iter().map(|(_, a)| a.to_string()).collect();
++        assert_eq!(
++            addrs,
++            [
++                "192.168.1.20:21118",
++                "[fe80::1c2:3ff:fe04:506%6]:21118",
++                "[2001:db8:1:2::20]:21118",
++                "10.0.0.5:21118"
++            ]
++        );
++        assert!(plan.iter().all(|(i, _)| *i == 6 || *i == 7), "no lo0/utun/bridge/ppp");
++    }
++
++    /// Gate review (receiving interface): the macOS listeners are pinned to the LAN interface.
++    /// A connection to the LAN address is accepted; loopback has no listener at all, and a socket
++    /// pinned to en0 cannot complete a handshake that arrived elsewhere (here: loopback).
++    #[cfg(target_os = "macos")]
++    #[hbb_common::tokio::test]
++    async fn pinned_listeners_accept_on_the_lan_address_only() {
++        use hbb_common::tokio::net::TcpStream;
++        use std::time::Duration;
++        let ifs = local_interfaces();
++        let Some((idx, lan_ip)) = ifs.iter().find_map(|i| {
++            is_lan_interface(Os::Macos, i, &ifs)
++                .then(|| i.nets.iter().find(|(ip, _)| ip.is_ipv4()).map(|(ip, _)| (i.index, *ip)))
++                .flatten()
++        }) else {
++            eprintln!("no IPv4 LAN interface; skipped");
++            return;
++        };
++        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
++        let mut l = LanListeners::new(port);
++        l.refresh();
++        assert!(l.bound().contains(&(idx, SocketAddr::new(lan_ip, port))), "{:?}", l.bound());
++        let _c = TcpStream::connect(SocketAddr::new(lan_ip, port)).await.unwrap();
++        let (s, peer) = l.next(2000).await.expect("LAN connection accepted");
++        assert_eq!(s.local_addr().unwrap().ip(), lan_ip);
++        assert!(admit(s.local_addr().unwrap(), peer).await);
++        let lo = hbb_common::tokio::time::timeout(
++            Duration::from_secs(2),
++            TcpStream::connect(("127.0.0.1", port)),
++        )
++        .await;
++        assert!(!matches!(lo, Ok(Ok(_))), "loopback reached the direct server");
++        // The pinning itself: a listener on 127.0.0.1 pinned to the LAN interface never
++        // completes a loopback handshake.
++        let pinned = LanListeners::bind_pinned(idx, "127.0.0.1:0".parse().unwrap()).unwrap();
++        let p2 = pinned.local_addr().unwrap().port();
++        let r = hbb_common::tokio::time::timeout(
++            Duration::from_secs(2),
++            TcpStream::connect(("127.0.0.1", p2)),
++        )
++        .await;
++        assert!(!matches!(r, Ok(Ok(_))), "pinned socket completed a handshake from another interface");
++        drop(l);
 +    }
 +
 +    #[test]
@@ -874,11 +1301,12 @@ index 000000000000..a54b399f58f8
 +        assert_eq!(tcp_ports_except(65535), "1-65534");
 +        assert_eq!(tcp_ports_except(65534), "1-65533,65535");
 +        let r = windows_inbound_rules("RemoteSmith Service", "C:\\Program Files\\RemoteSmith\\RemoteSmith.exe", 21118);
-+        assert_eq!(r.len(), 3);
++        assert_eq!(r.len(), 4);
 +        assert!(r.iter().all(|l| l.contains("name=\"RemoteSmith Service\" dir=in action=allow program=\"C:\\Program Files\\RemoteSmith\\RemoteSmith.exe\"")));
 +        assert!(r[0].ends_with(" protocol=udp"));
 +        assert!(r[1].ends_with(" protocol=tcp localport=1-21117,21119-65535"));
-+        assert!(r[2].ends_with(" protocol=tcp localport=21118 remoteip=localsubnet"));
++        assert!(r[2].ends_with(" protocol=tcp localport=21118 remoteip=localsubnet interfacetype=lan"));
++        assert!(r[3].ends_with(" protocol=tcp localport=21118 remoteip=localsubnet interfacetype=wireless"));
 +        // No rule opens the direct port to every source.
 +        assert!(!r.iter().any(|l| !l.contains("protocol=")));
 +    }
@@ -893,10 +1321,78 @@ index b37269296eb7..0d23668ff3fa 100644
  pub mod password_epoch;
 +pub mod direct_access;
 diff --git a/src/rendezvous_mediator.rs b/src/rendezvous_mediator.rs
-index ecac01867bbe..81929f1c86bd 100644
+index ecac01867bbe..adbf5c02fd9f 100644
 --- a/src/rendezvous_mediator.rs
 +++ b/src/rendezvous_mediator.rs
-@@ -1419,12 +1419,18 @@ async fn direct_server(server: ServerPtr) {
+@@ -1377,6 +1377,67 @@ fn get_direct_port() -> i32 {
+     port
+ }
+ 
++/// RemoteSmith (DEF-14, AC-51): on macOS the direct server listens per LAN address, pinned to
++/// its interface (weak host model; see remotesmith_trust::direct_access), not on the wildcard.
++#[cfg(target_os = "macos")]
++async fn direct_server(server: ServerPtr) {
++    use crate::remotesmith_trust::direct_access::{admit, LanListeners};
++    let mut listeners: Option<LanListeners> = None;
++    let mut refreshed = Instant::now();
++    loop {
++        let disabled = !option2bool(
++            OPTION_DIRECT_SERVER,
++            &Config::get_option(OPTION_DIRECT_SERVER),
++        ) || option2bool("stop-service", &Config::get_option("stop-service"));
++        let port = get_direct_port() as u16;
++        if disabled || listeners.as_ref().map_or(false, |l| l.port() != port) {
++            if listeners.take().is_some() {
++                log::info!("Exit direct access listen");
++            }
++        }
++        if disabled {
++            sleep(1.).await;
++            continue;
++        }
++        let l = listeners.get_or_insert_with(|| {
++            let mut l = LanListeners::new(port);
++            l.refresh();
++            refreshed = Instant::now();
++            log::info!("Direct server listening on: {:?}", l.bound());
++            l
++        });
++        if refreshed.elapsed() >= std::time::Duration::from_secs(3) {
++            l.refresh();
++            refreshed = Instant::now();
++        }
++        let Some((stream, addr)) = l.next(1000).await else {
++            continue;
++        };
++        stream.set_nodelay(true).ok();
++        let Ok(local_addr) = stream.local_addr() else {
++            continue;
++        };
++        let server = server.clone();
++        tokio::spawn(async move {
++            if !admit(local_addr, addr).await {
++                return;
++            }
++            allow_err!(
++                crate::server::create_tcp_connection(
++                    server,
++                    hbb_common::Stream::from(stream, local_addr),
++                    addr,
++                    // RemoteSmith: run the identity handshake on direct connections too (DEF-3).
++                    true,
++                    ConnectionMeta::default(),
++                )
++                .await
++            );
++        });
++    }
++}
++
++#[cfg(not(target_os = "macos"))]
+ async fn direct_server(server: ServerPtr) {
+     let mut listener = None;
+     let mut port = 0;
+@@ -1419,12 +1480,18 @@ async fn direct_server(server: ServerPtr) {
              }
              if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await {
                  stream.set_nodelay(true).ok();

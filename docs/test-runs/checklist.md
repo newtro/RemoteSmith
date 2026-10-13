@@ -376,12 +376,24 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
    VPN. Both are refused in the host log (`interface utun.. is not a LAN interface`, or
    `source is outside the local subnet of en0`); a RemoteSmith controller connecting that way
    gets no session (it reports the peer as gone / timed out, never a password prompt).
+3a. VPN with an overlapping subnet (receiving-interface check): give a VPN client an address
+   inside the host's LAN subnet (e.g. WireGuard peer `192.168.1.231/32` with the host's
+   `AllowedIPs` covering it, so the host routes replies to it over the tunnel), and from that
+   client `nc -vz <host LAN IP> 21118` through the tunnel. Mac host: the connection never
+   completes (the direct listeners are pinned to en0; `lsof -nP -iTCP:21118 -sTCP:LISTEN` shows
+   one listener per en0 address, none on `*`). Windows host: refused (strong host model and
+   the LAN/wireless-only firewall rule), and the log shows nothing or a refusal.
+3b. Windows with Hyper-V/WSL: on the PC, `Get-NetAdapter | ft Name,InterfaceDescription,MacAddress,HardwareInterface`.
+   Connecting from the LAN works when the PC reaches the LAN through a Hyper-V *external*
+   switch (vEthernet carrying the NIC's MAC); a connection to the PC's `vEthernet (WSL)` or
+   Default Switch address from a WSL/VM guest is refused (`interface ... is not a LAN interface`).
 4. Routed, non-local subnet: from a device on another VLAN/subnet that can route to the host's
    LAN address (or a phone hotspot NATed through a router port-forward, if available),
    `nc -vz <host LAN IP> 21118`: refused, host log `source is outside the local subnet`.
 5. Windows firewall (PC as host): `netsh advfirewall firewall show rule name="RemoteSmith Service" verbose`
-   lists four rules: Out (any), In UDP (any port), In TCP local ports `1-21117,21119-65535`, and
-   In TCP local port `21118` with RemoteIP `LocalSubnet` and edge traversal off. With the VPN of
+   lists the Out rule (any), In UDP (any port), In TCP local ports `1-21117,21119-65535`, and
+   In TCP local port `21118` with RemoteIP `LocalSubnet`, InterfaceTypes `LAN` / `Wireless`
+   (netsh: two rules, one per type; MSI: one rule with both) and edge traversal off. With the VPN of
    step 3 connected on the PC, the attempt to 21118 from a VPN peer is dropped by the firewall
    (no log line on the host at all) or, if the VPN subnet counts as local, refused by the app
    (log line as in step 3). Repeat for the MSI install. Uninstall: `show rule` finds none.
@@ -406,6 +418,8 @@ or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VP
 2. Quit RemoteSmith on that peer: within about 15 s the tray shows it `unavailable: offline`
    with "not answering on the LAN (saved by address)" and a last-seen time, not "server
    unreachable".
+2a. Multihomed host (Ethernet and Wi-Fi on the same LAN), enrolled via its Ethernet IP: the
+   tray shows `reachable (LAN)`, whichever interface answers discovery first.
 3. Start it again and give the peer a different LAN IP (DHCP reservation change, or a manual
    address): the tray shows `unavailable: offline` with "answers on the LAN at <new IP>, not at
    the saved address" (never `reachable`, since a click would dial the old IP).
