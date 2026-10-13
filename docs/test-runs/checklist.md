@@ -478,3 +478,105 @@ bundled tray runs (`build/release/<version>/verify.txt`).
    `remotesmith-tray.exe`; the tray starts at the next sign-in.
 3. Uninstall (Settings > Apps, or RemoteSmith's uninstall). Expect the tray process gone and both
    `Run` values gone.
+
+## C1: network boundary and identity gaps (patches 0701-0705)
+
+**Setup.** As for B3 (release build on both machines, service installed, `direct-server=Y`, a
+permanent password). Mac logs `~/Library/Logs/RemoteSmith/` (the `--server` log for the host
+side), Windows `%APPDATA%\RemoteSmith\log\`. A third device on the same LAN with `nc` (any Mac
+or Linux box) and a VPN the host can join (WireGuard, Tailscale or the office VPN) help.
+
+### C1-1 (AC-51) Direct port 21118 refuses VPN and outside-subnet sources
+1. LAN positive: from the other machine, connect by the host's LAN IP. The session opens; the
+   host log shows `direct access from <ip>:<port> on LAN interface en0` (Windows: the adapter
+   GUID).
+2. Loopback: on the host, `nc -vz 127.0.0.1 21118` connects (TCP accept), but the host log shows
+   `direct access from 127.0.0.1:... refused: interface lo0 is not a LAN interface` and no
+   handshake follows (`nc 127.0.0.1 21118 | xxd` prints nothing and the connection closes).
+3. VPN source (a routed VPN, no NAT onto the LAN: plain WireGuard/Tailscale peer-to-peer, not a
+   Tailscale subnet router or a VPN server on the LAN that masquerades; those make remote users
+   look like a LAN host, which no layer-3 check can tell apart). Join the host and a second
+   device to the VPN. From the second device, `nc -vz <host VPN address> 21118` and `nc -vz <host LAN address> 21118` over the
+   VPN. Both are refused in the host log (`interface utun.. is not a LAN interface`, or
+   `source is outside the local subnet of en0`); a RemoteSmith controller connecting that way
+   gets no session (it reports the peer as gone / timed out, never a password prompt).
+3a. VPN with an overlapping subnet (receiving-interface check): give a VPN client an address
+   inside the host's LAN subnet (e.g. WireGuard peer `192.168.1.231/32` with the host's
+   `AllowedIPs` covering it, so the host routes replies to it over the tunnel), and from that
+   client `nc -vz <host LAN IP> 21118` through the tunnel. Mac host: the connection never
+   completes (the direct listeners are pinned to en0; `lsof -nP -iTCP:21118 -sTCP:LISTEN` shows
+   one listener per en0 address, none on `*`). Windows host: refused (strong host model and
+   the LAN/wireless-only firewall rule), and the log shows nothing or a refusal.
+   Known limit (deferred, not a failure of this step): a VPN built with asymmetric routing or
+   proxy ARP for the LAN prefix can still complete a handshake on macOS (IP_BOUND_IF pins the
+   reply path, it does not filter ingress), and on Windows a VPN client that enables weak host
+   mode on its adapter (e.g. GlobalProtect) defeats the destination-owner check. Both need an
+   attacker on such a VPN; the identity check and the password still stand. Note the VPN
+   product if step 3a connects.
+3b. Windows with Hyper-V/WSL: on the PC, `Get-NetAdapter | ft Name,InterfaceDescription,MacAddress,HardwareInterface`.
+   Connecting from the LAN works when the PC reaches the LAN through a Hyper-V *external*
+   switch (vEthernet carrying the NIC's MAC; the NIC itself has no IP and is matched from the
+   full interface table); a connection to the PC's `vEthernet (WSL)` or
+   Default Switch address from a WSL/VM guest is refused (`interface ... is not a LAN interface`).
+4. Routed, non-local subnet: from a device on another VLAN/subnet that can route to the host's
+   LAN address (or a phone hotspot NATed through a router port-forward, if available),
+   `nc -vz <host LAN IP> 21118`: refused, host log `source is outside the local subnet`.
+5. Windows firewall (PC as host): `netsh advfirewall firewall show rule name="RemoteSmith Service" verbose`
+   lists the Out rule (any), In UDP (any port), In TCP local ports `1-21117,21119-65535`, and
+   In TCP local port `21118` with RemoteIP `LocalSubnet`, InterfaceTypes `LAN` / `Wireless`
+   (netsh: two rules, one per type; MSI: one rule with both) and edge traversal off. With the VPN of
+   step 3 connected on the PC, the attempt to 21118 from a VPN peer is dropped by the firewall
+   (no log line on the host at all) or, if the VPN subnet counts as local, refused by the app
+   (log line as in step 3). Repeat for the MSI install. Uninstall: `show rule` finds none.
+6. Scan flood: `for i in $(seq 200); do nc -z 127.0.0.1 21118; done` on the host: at most one
+   refusal line per second in the log, with "(N more refused in the last second)", and the
+   service stays responsive (a LAN connect right after still opens).
+7. Moved by DHCP (C1-3 covers the tray side): not applicable here.
+
+### C1-2 (AC-43, FLOW-2) LAN-only host shows its fingerprint before any registration
+1. On a host set up with "Direct LAN only" (B1-2) that never had an ID server (fresh profile:
+   move its config aside first), open Settings > About: the Fingerprint is shown (not blank),
+   and the tray's status shows the same value.
+2. From the controller, connect by the host's LAN IP: the "Confirm peer identity" dialog shows
+   exactly that fingerprint. Confirm; the session opens with the password.
+3. Repeat with the roles swapped (both machines LAN-only, fresh profiles): each machine's
+   fingerprint differs from the other's, and each controller dialog matches the host it dialled.
+
+### C1-3 (AC-20, AC-21) A peer enrolled by IP shows as reachable on the LAN
+1. With no ID server reachable (LAN-only, or the server stopped), enroll the other machine by its
+   LAN IP (B3-1 step 7). In the tray, that peer (listed under its IP) shows
+   `reachable (LAN)` within one probe round (about 15 s), and one click opens a session.
+2. Quit RemoteSmith on that peer: within about 15 s the tray shows it `unavailable: offline`
+   with "not answering on the LAN (saved by address)" and a last-seen time, not "server
+   unreachable".
+2a. Multihomed host (Ethernet and Wi-Fi on the same LAN), enrolled via its Ethernet IP: the
+   tray shows `reachable (LAN)`, whichever interface answers discovery first.
+3. Start it again and give the peer a different LAN IP (DHCP reservation change, or a manual
+   address): the tray shows `unavailable: offline` with "answers on the LAN at <new IP>, not at
+   the saved address" (never `reachable`, since a click would dial the old IP).
+
+### C1-4 (AC-39, AC-43) Forget peer ends its sessions; the next connection enrolls again
+1. Enroll the peer (B3-1) with a remembered password; open a session to it.
+2. Disconnect the network on the host (unplug or turn Wi-Fi off) so the controller's session
+   enters "Reconnecting...". While it retries, open the controller's main window and remove
+   the peer (peer card > Remove).
+3. The session window shows "Peer forgotten" ("This peer was forgotten, so this session
+   ended...") and stops retrying; restore the host's network: the session does **not**
+   reconnect, and the host log shows no new login.
+4. The peer file is gone and stays gone (Mac: `~/Library/Preferences/ai.johnnycode.RemoteSmith/peers/<id>.toml`),
+   even after waiting a minute: no password was re-saved.
+5. Connect to the peer again: the first-use dialog appears (B3-1) and the password is asked for.
+
+### C1-5 (AC-45) "Server unreachable" within 10 s
+1. Controller off the host's LAN (phone hotspot). Make the ID server unreachable: stop the
+   Lightsail instance, or on the controller blackhole its address
+   (Mac: `sudo route add -host <server IP> 127.0.0.2 -blackhole`; remove afterwards with
+   `sudo route delete -host <server IP>`).
+2. Connect to the peer by ID and start a stopwatch: within 10 s the session shows
+   "Server unreachable: the ID server did not answer within 10 s ..." (controller log:
+   "ID server not reached within 10s; giving up"). No automatic retry starts.
+3. Stop only hbbs/hbbr on the VM (the PLAN §14 recipe: the VM answers, the port refuses), or
+   point the controller's ID server at an unresolvable name: the session shows
+   "Server unreachable: cannot connect to the ID server (<OS error>) ..." at once.
+4. With the server back, connect: the session opens normally (relay included; a relayed session
+   taking longer than 10 s to set up after the server answered is not cut).
