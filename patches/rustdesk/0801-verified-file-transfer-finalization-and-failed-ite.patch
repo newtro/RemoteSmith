@@ -1,0 +1,1331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:30:14 -0400
+Subject: remotesmith(0801): verified file-transfer finalization and
+ failed-item reporting
+
+AC-18, AC-48, DEF-6 (whole-product review finding 2). Upstream dropped
+write errors on the controller (io_loop "to-do"), renamed the
+.download staging file to the final name without checking it and
+ignored rename failures, so a full disk could leave a partial file under
+the final name with a "done" status.
+
+- TransferJob::write records the first open/write/finalize failure,
+  removes that file's staging data and refuses every later block, so a
+  gap is never covered by the blocks after it.
+- Finalizing a file (on switch to the next file and when the sender is
+  done) flushes and syncs it, which surfaces deferred write errors,
+  requires the sender's end-of-file block (every file ends with an empty
+  block), that the staging file holds every byte written and exactly the
+  size the sender listed, and only then renames it into place. The
+  protocol carries no content hash. A source that changed size after it
+  was listed fails that file ("source changed during transfer or data
+  lost"). A compressed block that does not decompress fails the job
+  (upstream's decompress returned an empty buffer). Any failure removes
+  the staging file this job created; verified data whose rename failed
+  (e.g. a locked destination) stays staged through later failures and
+  cancellation, and staging the job did not create is never removed.
+- Controller downloads: a write failure cancels the job at the sender and
+  reports it failed with the file name and OS error; a Done that crosses
+  the cancel is ignored, so a failed item never flips to done. Done runs
+  the verified finalize before reporting.
+- Host uploads (CM): NewWrite now carries each file's size; a write
+  failure fails the job once and drops it; WriteDone reports an error
+  instead of done when finalizing fails.
+- When the sender reports an error, a fully received last file is kept
+  (verified) and a partial one removed.
+- Stale staging: when the receiver decides to skip a file, a
+  .download/.digest pair whose digest matches that file's listed size and
+  mtime (an interrupted transfer of the same source) is removed; nothing
+  is removed before the decision. Writing a file replaces an existing
+  pair only if its .digest is RustDesk's; other files at those names fail
+  the item ("not overwritten") instead of being clobbered.
+- Failures are terminal: once a job is reported failed (own write or
+  finalize failure, or an Error from the sender), a later Done or Error
+  for it is ignored, so e.g. a host that sends Error then Done for an
+  unreadable last file never shows success. This applies to transfer
+  jobs only; file operations (remove, create, rename) reuse their id for
+  later replies and are not affected.
+
+Tests through the real handlers: client::io_loop::tests (complete
+download, sender Error then Done, short data with end-of-file, rename
+failure while advancing plus cancel, corrupt compressed block, skip
+decision with user and stale staging files, a failed file operation
+followed by a success under the same id) and
+ui_cm_interface::tests::upload_is_verified_before_done. Unit tests
+(libs/base, fs::tests): complete files renamed with mtime, short
+file never finalized, short earlier file fails on switch and later blocks
+refused, unwritable destination, rename failure, file that changed size,
+resume completion and changed-source refusal, stale staging cleanup,
+and an ignored macOS test that fills a 5 MB hdiutil disk image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libs/base/src/fs.rs      | 575 +++++++++++++++++++++++++++++++++++++--
+ src/client/io_loop.rs    | 329 +++++++++++++++++++++-
+ src/ipc.rs               |   3 +
+ src/server/connection.rs |   1 +
+ src/ui_cm_interface.rs   |  94 ++++++-
+ 5 files changed, 957 insertions(+), 45 deletions(-)
+
+diff --git a/libs/base/src/fs.rs b/libs/base/src/fs.rs
+index 1adb59077972..d301158e29e6 100644
+--- a/libs/base/src/fs.rs
++++ b/libs/base/src/fs.rs
+@@ -417,6 +417,25 @@ pub struct TransferJob {
+     default_overwrite_strategy: Option<bool>,
+     #[serde(skip_serializing)]
+     digest: FileDigest,
++    // RemoteSmith(0801, AC-18/AC-48): the first write or finalize failure. Once set, the job
++    // takes no more blocks and is reported failed, never done.
++    #[serde(skip_serializing)]
++    write_error: Option<String>,
++    // The file being written: bytes it holds (resume offset + blocks written), the resume
++    // offset, and whether the sender's end-of-file block (an empty block) has arrived.
++    #[serde(skip_serializing)]
++    file_bytes: u64,
++    #[serde(skip_serializing)]
++    file_offset: u64,
++    #[serde(skip_serializing)]
++    file_eof: bool,
++    // The staging pair of the file being written was created (or resumed) by this job and may
++    // be removed by it. Cleared once the file is renamed into place, or kept staged because
++    // only the rename failed.
++    #[serde(skip_serializing)]
++    own_staging: bool,
++    #[serde(skip_serializing)]
++    is_write: bool,
+ }
+ 
+ #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+@@ -587,6 +606,7 @@ impl TransferJob {
+             files: Vec::new(),
+             total_size: 0,
+             enable_overwrite_detection,
++            is_write: true,
+             ..Default::default()
+         }
+     }
+@@ -704,32 +724,103 @@ impl TransferJob {
+         }
+     }
+ 
+-    pub fn modify_time(&self) {
+-        if self.r#type == JobType::Printer {
+-            return;
++    /// RemoteSmith(0801, AC-18/AC-48): finish the file being written. Flush and sync it (a
++    /// deferred write error such as a full disk surfaces here), check that the sender's
++    /// end-of-file block arrived, that the staging file holds every byte written and exactly
++    /// the size the sender listed, and only then rename it to the final name. (The protocol
++    /// has no content hash.) A source that changed size after it was listed fails that file.
++    /// On failure the staging file is removed (kept if only the rename failed, e.g. a locked
++    /// destination) and the error returned: incomplete data never gets the final name. A no-op
++    /// when no file is open (nothing written, or skipped).
++    async fn finalize_file(&mut self) -> ResultType<()> {
++        if self.r#type == JobType::Printer
++            || !matches!(self.data_stream, Some(DataStream::FileStream(_)))
++        {
++            return Ok(());
+         }
+-        if let DataSource::FilePath(p) = &self.data_source {
+-            let file_num = self.file_num as usize;
+-            if file_num < self.files.len() {
+-                let entry = &self.files[file_num];
+-                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+-                    return;
+-                };
+-                let download_path = format!("{}.download", get_string(&path));
+-                let digest_path = format!("{}.digest", get_string(&path));
+-                std::fs::remove_file(digest_path).ok();
+-                std::fs::rename(download_path, &path).ok();
+-                filetime::set_file_mtime(
+-                    &path,
+-                    filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
+-                )
+-                .ok();
++        let mut keep_staging = false;
++        let res = self.finalize_open_file(&mut keep_staging).await;
++        if res.is_err() && !keep_staging {
++            self.remove_download_file();
++        }
++        res
++    }
++
++    async fn finalize_open_file(&mut self, keep_staging: &mut bool) -> ResultType<()> {
++        if let Some(DataStream::FileStream(mut file)) = self.data_stream.take() {
++            file.flush().await?;
++            file.sync_all().await?;
++        }
++        let DataSource::FilePath(p) = &self.data_source else {
++            return Ok(());
++        };
++        let Some(entry) = self.files.get(self.file_num as usize) else {
++            bail!("Wrong file number");
++        };
++        let Some(path) = self.resolve_entry_path(p, &entry.name) else {
++            bail!("Invalid file name");
++        };
++        let download_path = format!("{}.download", get_string(&path));
++        let digest_path = format!("{}.digest", get_string(&path));
++        let on_disk = std::fs::metadata(&download_path)?.len();
++        if !self.file_eof {
++            bail!("incomplete file: transfer stopped after {} bytes", on_disk);
++        }
++        if on_disk != self.file_bytes {
++            bail!(
++                "incomplete file: {} of {} bytes written",
++                on_disk,
++                self.file_bytes
++            );
++        }
++        if on_disk != entry.size {
++            bail!(
++                "source changed during transfer or data lost: received {} bytes, {} listed",
++                on_disk,
++                entry.size
++            );
++        }
++        *keep_staging = true;
++        // Verified: from here the staging data is kept even if the rename fails.
++        self.own_staging = false;
++        std::fs::rename(&download_path, &path)?;
++        std::fs::remove_file(digest_path).ok();
++        filetime::set_file_mtime(
++            &path,
++            filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
++        )
++        .ok();
++        Ok(())
++    }
++
++    /// RemoteSmith(0801): the sender is done (or has given up). Finalize the last file and
++    /// return the job's write failure, if any. `None` means every written file is in place.
++    pub async fn finish(&mut self) -> Option<String> {
++        if self.write_error.is_none() {
++            if let Err(err) = self.finalize_file().await {
++                self.write_error = Some(self.item_error(err));
+             }
+         }
++        self.write_error.clone()
+     }
+ 
+-    pub fn remove_download_file(&self) {
+-        if self.r#type == JobType::Printer {
++    /// The write failure recorded for this job, if any.
++    pub fn write_error(&self) -> Option<&str> {
++        self.write_error.as_deref()
++    }
++
++    fn item_error(&self, err: hbb_common::anyhow::Error) -> String {
++        match self.files.get(self.file_num as usize) {
++            Some(f) if !f.name.is_empty() => format!("{}: {}", f.name, err),
++            _ => err.to_string(),
++        }
++    }
++
++    /// Remove the current file's staging pair. RemoteSmith(0801): only when this job created
++    /// it and it is not verified data kept after a failed rename; anything else at those
++    /// names (a user's file, another transfer's data) is left alone.
++    pub fn remove_download_file(&mut self) {
++        if self.r#type == JobType::Printer || !std::mem::take(&mut self.own_staging) {
+             return;
+         }
+         if let DataSource::FilePath(p) = &self.data_source {
+@@ -760,21 +851,40 @@ impl TransferJob {
+         }
+     }
+ 
++    /// Write one block. RemoteSmith(0801): the first failure (open, write, or finalizing the
++    /// previous file) removes that file's staging data and is recorded; later blocks are
++    /// refused, so a gap can never be papered over by the blocks that follow it.
+     pub async fn write(&mut self, block: FileTransferBlock) -> ResultType<()> {
++        if let Some(err) = &self.write_error {
++            bail!("{}", err);
++        }
++        let res = self.write_block(block).await;
++        if let Err(err) = res {
++            if matches!(self.data_source, DataSource::FilePath(_)) {
++                self.data_stream.take();
++                self.remove_download_file();
++            }
++            let err = self.item_error(err);
++            self.write_error = Some(err.clone());
++            bail!("{}", err);
++        }
++        Ok(())
++    }
++
++    async fn write_block(&mut self, block: FileTransferBlock) -> ResultType<()> {
+         if block.id != self.id {
+             bail!("Wrong id");
+         }
+         match &self.data_source {
+             DataSource::FilePath(p) => {
++                let p = p.clone();
++                let p = &p;
+                 let file_num = block.file_num as usize;
+                 if file_num >= self.files.len() {
+                     bail!("Wrong file number");
+                 }
+                 if file_num != self.file_num as usize || self.data_stream.is_none() {
+-                    self.modify_time();
+-                    if let Some(DataStream::FileStream(file)) = self.data_stream.as_mut() {
+-                        file.sync_all().await?;
+-                    }
++                    self.finalize_file().await?;
+                     self.file_num = block.file_num;
+                     let entry = &self.files[file_num];
+                     let (path, digest_path) = if self.r#type == JobType::Printer {
+@@ -795,11 +905,22 @@ impl TransferJob {
+                         )
+                     };
+                     if let Some(dp) = digest_path.as_ref() {
++                        // RemoteSmith(0801): replace only staging data RustDesk wrote.
++                        if !staging_is_replaceable(&path, dp) {
++                            bail!(
++                                "{} or {} already exists and is not transfer staging data; \
++                                 not overwritten",
++                                path,
++                                dp
++                            );
++                        }
+                         if Path::new(dp).exists() {
+                             std::fs::remove_file(dp)?;
+                         }
+                     }
+                     self.data_stream = Some(DataStream::FileStream(File::create(&path).await?));
++                    self.own_staging = true;
++                    (self.file_bytes, self.file_offset, self.file_eof) = (0, 0, false);
+                     if let Some(dp) = digest_path.as_ref() {
+                         std::fs::write(dp, json!(self.digest).to_string()).ok();
+                     }
+@@ -813,12 +934,18 @@ impl TransferJob {
+         }
+         if block.compressed {
+             let tmp = decompress(&block.data);
++            // decompress() returns an empty buffer on error; the sender only compresses
++            // non-empty data, so an empty result is a corrupt block, not an empty one.
++            if tmp.is_empty() && !block.data.is_empty() {
++                bail!("corrupt compressed block");
++            }
+             self.data_stream
+                 .as_mut()
+                 .ok_or(anyhow!("data stream is None"))?
+                 .write_all(&tmp)
+                 .await?;
+             self.finished_size += tmp.len() as u64;
++            self.file_bytes += tmp.len() as u64;
+         } else {
+             self.data_stream
+                 .as_mut()
+@@ -826,7 +953,10 @@ impl TransferJob {
+                 .write_all(&block.data)
+                 .await?;
+             self.finished_size += block.data.len() as u64;
++            self.file_bytes += block.data.len() as u64;
+         }
++        // The sender ends every file with an empty block (TransferJob::read at end of file).
++        self.file_eof |= block.data.is_empty();
+         self.transferred += block.data.len() as u64;
+         Ok(())
+     }
+@@ -1153,13 +1283,50 @@ impl TransferJob {
+             };
+             if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                 self.data_stream = Some(DataStream::FileStream(f));
++                (self.file_bytes, self.file_offset, self.file_eof) = (offset, offset, false);
++                // The writer branch (resuming our own staging) is the only one that opens
++                // `.download`; the reader branch opens the final file.
++                self.own_staging = Path::new(&download_path).exists()
++                    && Path::new(&digest_path).exists();
+                 self.transferred += offset;
+                 self.finished_size += offset;
+             }
+         }
+     }
+ 
++    /// RemoteSmith(0801, AC-48): the receiver decided to skip file `file_num`. A staging pair
++    /// for it that an interrupted earlier transfer of this same source file left behind (its
++    /// `.digest` matches the file's listed size and mtime) is removed; anything else at those
++    /// names is kept. (Writing the file instead replaces the staging pair, see `write`.)
++    fn remove_stale_staging(&mut self, file_num: usize) {
++        let (DataSource::FilePath(p), Some(entry)) = (&self.data_source, self.files.get(file_num))
++        else {
++            return;
++        };
++        if !self.is_write
++            || self.r#type != JobType::Generic
++            || (file_num == self.file_num as usize && self.data_stream.is_some())
++        {
++            return;
++        }
++        let Some(path) = self.resolve_entry_path(p, &entry.name) else {
++            return;
++        };
++        let download = format!("{}.download", get_string(&path));
++        let digest = format!("{}.digest", get_string(&path));
++        let owned = Path::new(&download).is_file()
++            && read_staging_digest(&digest)
++                .map_or(false, |d| d.size == entry.size && d.modified == entry.modified_time);
++        if owned {
++            std::fs::remove_file(&download).ok();
++            std::fs::remove_file(&digest).ok();
++        }
++    }
++
+     pub async fn confirm(&mut self, r: &FileTransferSendConfirmRequest) -> bool {
++        if let Some(file_transfer_send_confirm_request::Union::Skip(true)) = r.union {
++            self.remove_stale_staging(r.file_num as usize);
++        }
+         if self.file_num() != r.file_num {
+             // This branch will always be hit if:
+             // 1. `confirm()` is called in `ui_cm_interface.rs`
+@@ -1445,6 +1612,21 @@ pub fn transform_windows_path(entries: &mut Vec<FileEntry>) {
+     }
+ }
+ 
++/// The `.digest` RustDesk writes next to a `.download` staging file, if `path` is one.
++fn read_staging_digest(path: &str) -> Option<FileDigest> {
++    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
++}
++
++/// RemoteSmith(0801): whether a new transfer may replace what is at the staging names: nothing
++/// is there, or the `.digest` is RustDesk's (then the pair is an earlier transfer's staging).
++fn staging_is_replaceable(download: &str, digest: &str) -> bool {
++    if Path::new(digest).exists() {
++        read_staging_digest(digest).is_some()
++    } else {
++        !Path::new(download).exists()
++    }
++}
++
+ pub enum DigestCheckResult {
+     IsSame,
+     NeedConfirm(FileTransferDigest),
+@@ -1810,4 +1992,347 @@ mod tests {
+             .expect_err("verbatim drive absolute path must be rejected");
+         assert_err_contains(err, "absolute path");
+     }
++
++    // RemoteSmith(0801, AC-18/AC-48): staged writes are verified before they get the final
++    // name, and a failed write fails the job.
++
++    fn sized_entry(name: &str, size: u64) -> FileEntry {
++        let mut entry = new_file_entry(name);
++        entry.size = size;
++        entry.modified_time = 1_600_000_000;
++        entry
++    }
++
++    fn sized_job(id: i32, dir: &Path, files: Vec<FileEntry>) -> TransferJob {
++        std::fs::create_dir_all(dir).unwrap();
++        TransferJob::new_write(
++            id,
++            JobType::Generic,
++            "/fake/remote".to_string(),
++            DataSource::FilePath(dir.to_path_buf()),
++            0,
++            false,
++            true,
++            false,
++        )
++        .with_files(files)
++        .unwrap()
++    }
++
++    fn block(id: i32, file_num: i32, data: &[u8]) -> FileTransferBlock {
++        FileTransferBlock {
++            id,
++            file_num,
++            data: data.to_vec().into(),
++            ..Default::default()
++        }
++    }
++
++    fn names_in(dir: &Path) -> Vec<String> {
++        let mut v: Vec<String> = std::fs::read_dir(dir)
++            .unwrap()
++            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
++            .collect();
++        v.sort();
++        v
++    }
++
++    #[tokio::test]
++    async fn complete_files_are_renamed_into_place() {
++        let tmp = TestTempDir::new("rs_xfer_ok");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(
++            2001,
++            &dir,
++            vec![sized_entry("a.bin", 5), sized_entry("empty", 0), sized_entry("sub/c", 3)],
++        );
++        // As the sender sends them: data blocks, then an empty end-of-file block per file.
++        job.write(block(2001, 0, b"he")).await.unwrap();
++        job.write(block(2001, 0, b"llo")).await.unwrap();
++        job.write(block(2001, 0, b"")).await.unwrap();
++        job.write(block(2001, 1, b"")).await.unwrap();
++        job.write(block(2001, 2, b"xyz")).await.unwrap();
++        job.write(block(2001, 2, b"")).await.unwrap();
++        assert_eq!(job.finish().await, None);
++        assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), b"hello");
++        assert_eq!(std::fs::read(dir.join("empty")).unwrap(), b"");
++        assert_eq!(std::fs::read(dir.join("sub/c")).unwrap(), b"xyz");
++        assert_eq!(names_in(&dir), vec!["a.bin", "empty", "sub"]);
++        assert_eq!(names_in(&dir.join("sub")), vec!["c"]);
++        let mtime = std::fs::metadata(dir.join("a.bin")).unwrap().modified().unwrap();
++        assert_eq!(
++            mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
++            1_600_000_000
++        );
++    }
++
++    #[tokio::test]
++    async fn short_file_never_gets_the_final_name() {
++        let tmp = TestTempDir::new("rs_xfer_short");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2002, &dir, vec![sized_entry("a.bin", 10)]);
++        job.write(block(2002, 0, b"1234")).await.unwrap(); // no end-of-file block
++        let err = job.finish().await.expect("a short file must fail the job");
++        assert!(err.starts_with("a.bin: incomplete") && err.contains("after 4"), "{}", err);
++        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
++    }
++
++    #[tokio::test]
++    async fn short_earlier_file_fails_on_switch_and_later_blocks_are_refused() {
++        let tmp = TestTempDir::new("rs_xfer_switch");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(
++            2003,
++            &dir,
++            vec![sized_entry("a", 3), sized_entry("b", 2), sized_entry("c", 1)],
++        );
++        job.write(block(2003, 0, b"abc")).await.unwrap();
++        job.write(block(2003, 0, b"")).await.unwrap();
++        job.write(block(2003, 1, b"b")).await.unwrap(); // the sender stopped mid-file
++        let err = job.write(block(2003, 2, b"c")).await.unwrap_err().to_string();
++        assert!(err.starts_with("b: incomplete"), "{}", err);
++        // The job stays failed: nothing more is written and finish reports the failure.
++        assert!(job.write(block(2003, 2, b"c")).await.is_err());
++        assert_eq!(job.finish().await.as_deref(), Some(err.as_str()));
++        assert_eq!(job.write_error(), Some(err.as_str()));
++        assert_eq!(names_in(&dir), vec!["a"]); // completed file intact, nothing else
++        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"abc");
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn unwritable_destination_fails_the_job() {
++        use std::os::unix::fs::PermissionsExt;
++        let tmp = TestTempDir::new("rs_xfer_ro");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2004, &dir, vec![sized_entry("a", 3), sized_entry("b", 1)]);
++        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
++        let err = job.write(block(2004, 0, b"abc")).await.unwrap_err().to_string();
++        assert!(err.starts_with("a: "), "{}", err);
++        assert!(job.write(block(2004, 1, b"b")).await.is_err());
++        assert!(job.finish().await.is_some());
++        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
++    }
++
++    #[tokio::test]
++    async fn rename_failure_is_reported_and_staging_kept() {
++        let tmp = TestTempDir::new("rs_xfer_rename");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2005, &dir, vec![sized_entry("a", 3)]);
++        // A non-empty directory where the file should go: the rename cannot succeed.
++        std::fs::create_dir_all(dir.join("a/keep")).unwrap();
++        job.write(block(2005, 0, b"abc")).await.unwrap();
++        job.write(block(2005, 0, b"")).await.unwrap();
++        let err = job.finish().await.expect("rename failure must fail the job");
++        assert!(err.starts_with("a: "), "{}", err);
++        // The verified data is kept in staging (e.g. a destination locked on Windows); a new
++        // transfer of the file clears it.
++        assert_eq!(names_in(&dir), vec!["a", "a.digest", "a.download"]);
++        assert!(dir.join("a/keep").is_dir());
++    }
++
++    #[tokio::test]
++    async fn short_data_with_end_of_file_fails_that_file() {
++        // Gate review: data that ends early but is properly terminated is still incomplete.
++        let tmp = TestTempDir::new("rs_xfer_short_eof");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2007, &dir, vec![sized_entry("a", 5)]);
++        job.write(block(2007, 0, b"abc")).await.unwrap();
++        job.write(block(2007, 0, b"")).await.unwrap();
++        let err = job.finish().await.expect("short data must fail");
++        assert!(err.contains("received 3 bytes, 5 listed"), "{}", err);
++        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
++    }
++
++    #[tokio::test]
++    async fn source_that_grew_fails_that_file() {
++        let tmp = TestTempDir::new("rs_xfer_grow");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2009, &dir, vec![sized_entry("log", 3)]);
++        job.write(block(2009, 0, b"abcde")).await.unwrap();
++        job.write(block(2009, 0, b"")).await.unwrap();
++        let err = job.finish().await.expect("a changed source must fail");
++        assert!(err.starts_with("log: source changed during transfer"), "{}", err);
++        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
++    }
++
++    #[tokio::test]
++    async fn corrupt_compressed_block_fails_the_job() {
++        let tmp = TestTempDir::new("rs_xfer_zstd");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2010, &dir, vec![sized_entry("a", 5)]);
++        let mut b = block(2010, 0, b"not zstd data");
++        b.compressed = true;
++        let err = job.write(b).await.unwrap_err().to_string();
++        assert!(err.contains("corrupt compressed block"), "{}", err);
++        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
++    }
++
++    #[tokio::test]
++    async fn verified_file_survives_failure_while_advancing_and_cancel() {
++        // Gate review: A verified, its rename fails (destination in use), then B's first
++        // block arrives: the failure handling and a cancel must keep A's staged data.
++        let tmp = TestTempDir::new("rs_xfer_advance");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2011, &dir, vec![sized_entry("a", 3), sized_entry("b", 1)]);
++        std::fs::create_dir_all(dir.join("a/keep")).unwrap();
++        job.write(block(2011, 0, b"abc")).await.unwrap();
++        job.write(block(2011, 0, b"")).await.unwrap();
++        let err = job.write(block(2011, 1, b"b")).await.unwrap_err().to_string();
++        assert!(err.starts_with("a: "), "{}", err);
++        job.remove_download_file(); // what a cancel does
++        assert_eq!(names_in(&dir), vec!["a", "a.digest", "a.download"]);
++        assert_eq!(std::fs::read(dir.join("a.download")).unwrap(), b"abc");
++    }
++
++    async fn resume_onto(size: u64) -> (TestTempDir, Option<String>) {
++        let tmp = TestTempDir::new("rs_xfer_resume");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(2008, &dir, vec![sized_entry("a", size)]);
++        std::fs::write(dir.join("a.download"), b"abc").unwrap();
++        std::fs::write(dir.join("a.digest"), b"{}").unwrap();
++        let req = FileTransferSendConfirmRequest {
++            id: 2008,
++            file_num: 0,
++            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(3)),
++            ..Default::default()
++        };
++        job.confirm(&req).await;
++        job.write(block(2008, 0, b"de")).await.unwrap();
++        job.write(block(2008, 0, b"")).await.unwrap();
++        let res = job.finish().await;
++        (tmp, res)
++    }
++
++    #[tokio::test]
++    async fn resumed_file_is_completed_and_checked_against_the_listing() {
++        let (tmp, res) = resume_onto(5).await;
++        assert_eq!(res, None);
++        assert_eq!(std::fs::read(tmp.join("dst/a")).unwrap(), b"abcde");
++        assert_eq!(names_in(&tmp.join("dst")), vec!["a"]);
++        // The source changed since the interrupted session: refused, nothing finalized.
++        let (tmp, res) = resume_onto(6).await;
++        assert!(res.unwrap().contains("source changed"));
++        assert!(names_in(&tmp.join("dst")).is_empty());
++    }
++
++    fn skip(id: i32, file_num: i32) -> FileTransferSendConfirmRequest {
++        FileTransferSendConfirmRequest {
++            id,
++            file_num,
++            union: Some(file_transfer_send_confirm_request::Union::Skip(true)),
++            ..Default::default()
++        }
++    }
++
++    #[tokio::test]
++    async fn skipping_removes_only_this_files_own_stale_staging() {
++        let tmp = TestTempDir::new("rs_xfer_stale");
++        let dir = tmp.join("dst");
++        let mut job = sized_job(
++            2012,
++            &dir,
++            vec![sized_entry("ours", 4), sized_entry("report", 4), sized_entry("other", 4)],
++        );
++        let ours = r#"{"size":4,"modified":1600000000}"#;
++        for name in ["ours", "report", "other"] {
++            std::fs::write(dir.join(name), b"dest").unwrap();
++            std::fs::write(dir.join(format!("{name}.download")), b"st").unwrap();
++        }
++        std::fs::write(dir.join("ours.digest"), ours).unwrap(); // left by a crash: ours
++        std::fs::write(dir.join("report.digest"), b"user notes").unwrap(); // user files
++        std::fs::write(dir.join("other.digest"), r#"{"size":9,"modified":1}"#).unwrap();
++        // Before any decision (the digest check) nothing is touched.
++        let digest = FileTransferDigest {
++            file_size: 4,
++            last_modified: 1_600_000_000,
++            ..Default::default()
++        };
++        for name in ["ours", "report", "other"] {
++            let t = get_string(&dir.join(name));
++            assert!(is_write_need_confirmation(false, &t, &digest).is_ok());
++        }
++        assert_eq!(names_in(&dir).len(), 9);
++        for n in 0..3 {
++            job.confirm(&skip(2012, n)).await;
++        }
++        // Only the pair whose digest matches this file's listing is removed.
++        assert_eq!(
++            names_in(&dir),
++            vec![
++                "other", "other.digest", "other.download", "ours", "report", "report.digest",
++                "report.download"
++            ]
++        );
++    }
++
++    #[tokio::test]
++    async fn writing_never_replaces_files_that_are_not_staging_data() {
++        let tmp = TestTempDir::new("rs_xfer_userfile");
++        let dir = tmp.join("dst");
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("report.download"), b"user data").unwrap();
++        let mut job = sized_job(2013, &dir, vec![sized_entry("report", 1)]);
++        let err = job.write(block(2013, 0, b"x")).await.unwrap_err().to_string();
++        assert!(err.contains("not overwritten"), "{}", err);
++        job.remove_download_file();
++        assert_eq!(std::fs::read(dir.join("report.download")).unwrap(), b"user data");
++        assert_eq!(names_in(&dir), vec!["report.download"]);
++        // An earlier transfer's staging (RustDesk digest) is replaced as before.
++        std::fs::write(dir.join("report.digest"), r#"{"size":9,"modified":1}"#).unwrap();
++        let mut job = sized_job(2014, &dir, vec![sized_entry("report", 1)]);
++        job.write(block(2014, 0, b"x")).await.unwrap();
++        job.write(block(2014, 0, b"")).await.unwrap();
++        assert_eq!(job.finish().await, None);
++        assert_eq!(names_in(&dir), vec!["report"]);
++    }
++
++    /// A real full disk: a 5 MB disk image (macOS `hdiutil`) and an 8 MB file. The write that
++    /// hits ENOSPC (directly, or deferred to the flush) fails the job and nothing gets the final
++    /// name. Run with: cargo test -p base --lib disk_full -- --ignored
++    #[cfg(target_os = "macos")]
++    #[ignore]
++    #[tokio::test]
++    async fn disk_full_fails_the_job() {
++        let tmp = TestTempDir::new("rs_xfer_full");
++        std::fs::create_dir_all(&tmp.path).unwrap();
++        let img = tmp.join("small.dmg");
++        let mnt = tmp.join("mnt");
++        let run = |args: &[&str]| {
++            let st = std::process::Command::new("hdiutil").args(args).status().unwrap();
++            assert!(st.success(), "hdiutil {:?}", args);
++        };
++        run(&["create", "-size", "5m", "-fs", "HFS+", "-volname", "rsfull", "-quiet", &get_string(&img)]);
++        run(&["attach", "-nobrowse", "-quiet", "-mountpoint", &get_string(&mnt), &get_string(&img)]);
++        struct Detach(String);
++        impl Drop for Detach {
++            fn drop(&mut self) {
++                let _ = std::process::Command::new("hdiutil")
++                    .args(["detach", "-quiet", "-force", &self.0])
++                    .status();
++            }
++        }
++        let _detach = Detach(get_string(&mnt));
++        let dir = mnt.join("dst");
++        let chunk = vec![7u8; 128 * 1024];
++        let mut job = sized_job(2006, &dir, vec![sized_entry("small", 4), sized_entry("big", 8 << 20)]);
++        job.write(block(2006, 0, b"done")).await.unwrap();
++        job.write(block(2006, 0, b"")).await.unwrap();
++        let mut failed = None;
++        for _ in 0..64 {
++            if let Err(e) = job.write(block(2006, 1, &chunk)).await {
++                failed = Some(e.to_string());
++                break;
++            }
++        }
++        let err = match failed {
++            Some(e) => e,
++            None => job.finish().await.expect("a full disk must fail the job"),
++        };
++        assert!(err.starts_with("big: "), "{}", err);
++        assert_eq!(job.finish().await.as_deref(), Some(err.as_str()));
++        let names = names_in(&dir);
++        assert_eq!(names, vec!["small"], "completed file intact, no partial file: {:?}", names);
++    }
+ }
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index 8e3473dbb5cd..8a840ad28e5f 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -82,6 +82,11 @@ pub struct Remote<T: InvokeUiSession> {
+     read_jobs: Vec<fs::TransferJob>,
+     write_jobs: Vec<fs::TransferJob>,
+     remove_jobs: HashMap<i32, RemoveJob>,
++    // RemoteSmith(0801): transfer jobs already reported failed; a late Done or Error for one
++    // is ignored. Cleared when the id is used for a new job.
++    failed_write_jobs: HashSet<i32>,
++    #[cfg(test)]
++    job_reports: Vec<(i32, Option<String>)>,
+     timer: crate::RustDeskInterval,
+     last_update_jobs_status: (Instant, HashMap<i32, u64>),
+     // Set after PeerInfo for this round, not when the transport connects.
+@@ -135,6 +140,9 @@ impl<T: InvokeUiSession> Remote<T> {
+             read_jobs: Vec::new(),
+             write_jobs: Vec::new(),
+             remove_jobs: Default::default(),
++            failed_write_jobs: Default::default(),
++            #[cfg(test)]
++            job_reports: Default::default(),
+             timer: crate::rustdesk_interval(time::interval(SEC30)),
+             last_update_jobs_status: (Instant::now(), Default::default()),
+             is_connected: false,
+@@ -607,6 +615,8 @@ impl<T: InvokeUiSession> Remote<T> {
+                 }
+             }
+         }
++        #[cfg(test)]
++        self.job_reports.push((id, err.clone()));
+         if let Some(err) = err {
+             self.handler.job_error(id, err, file_num);
+         } else {
+@@ -876,6 +886,7 @@ impl<T: InvokeUiSession> Remote<T> {
+             }
+             Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
+                 log::info!("send files, is remote {}", is_remote);
++                self.failed_write_jobs.remove(&id);
+                 let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
+                 if is_remote {
+                     log::debug!("New job {}, write to {} from remote {}", id, to, path);
+@@ -949,6 +960,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                 }
+             }
+             Data::AddJob((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
++                self.failed_write_jobs.remove(&id);
+                 let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
+                 if is_remote {
+                     log::debug!(
+@@ -1355,7 +1367,7 @@ impl<T: InvokeUiSession> Remote<T> {
+         });
+         msg_out.set_file_action(file_action);
+         allow_err!(peer.send(&msg_out).await);
+-        if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
++        if let Some(mut job) = fs::remove_job(id, &mut self.write_jobs) {
+             job.remove_download_file();
+         }
+         let _ = fs::remove_job(id, &mut self.read_jobs);
+@@ -2024,22 +2036,38 @@ impl<T: InvokeUiSession> Remote<T> {
+                             }
+                         }
+                         Some(file_response::Union::Block(block)) => {
++                            let mut failed = None;
+                             if let Some(job) = fs::get_job(block.id, &mut self.write_jobs) {
+-                                if let Err(_err) = job.write(block).await {
+-                                    // to-do: add "skip" for writing job
+-                                }
+-                                if job.r#type == fs::JobType::Generic {
++                                if let Err(err) = job.write(block).await {
++                                    // RemoteSmith(0801, AC-18/AC-48): a write failure (e.g. a
++                                    // full disk) fails the job instead of being dropped.
++                                    failed = Some((job.id(), job.file_num(), job.r#type, err));
++                                } else if job.r#type == fs::JobType::Generic {
+                                     self.update_jobs_status();
+                                 }
+                             }
++                            if let Some((id, file_num, job_type, err)) = failed {
++                                log::error!("file transfer job {} failed: {}", id, err);
++                                self.cancel_transfer_job(id, peer).await;
++                                if job_type == fs::JobType::Generic {
++                                    self.failed_write_jobs.insert(id);
++                                    self.handle_job_status(id, file_num, Some(err.to_string()));
++                                }
++                            }
+                         }
+                         Some(file_response::Union::Done(d)) => {
++                            if self.failed_write_jobs.contains(&d.id) {
++                                // Already reported failed; the sender finished before our cancel.
++                                return true;
++                            }
+                             let mut err: Option<String> = None;
+                             let mut job_type = fs::JobType::Generic;
+                             let mut printer_data = None;
+-                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {
+-                                job.modify_time();
+-                                err = job.job_error();
++                            let mut is_transfer = false;
++                            if let Some(mut job) = fs::remove_job(d.id, &mut self.write_jobs) {
++                                is_transfer = true;
++                                // RemoteSmith(0801): verify and finalize before reporting done.
++                                err = job.finish().await.or_else(|| job.job_error());
+                                 job_type = job.r#type;
+                                 printer_data = match job.get_buf_data().await {
+                                     Ok(d) => d,
+@@ -2051,6 +2079,9 @@ impl<T: InvokeUiSession> Remote<T> {
+                             }
+                             match job_type {
+                                 fs::JobType::Generic => {
++                                    if err.is_some() && is_transfer {
++                                        self.failed_write_jobs.insert(d.id);
++                                    }
+                                     self.handle_job_status(d.id, d.file_num, err);
+                                 }
+                                 fs::JobType::Printer => {
+@@ -2087,12 +2118,31 @@ impl<T: InvokeUiSession> Remote<T> {
+                             }
+                         }
+                         Some(file_response::Union::Error(e)) => {
+-                            let job_type = fs::remove_job(e.id, &mut self.write_jobs)
+-                                .or_else(|| fs::remove_job(e.id, &mut self.read_jobs))
+-                                .map(|j| j.r#type)
+-                                .unwrap_or(fs::JobType::Generic);
+-                            match job_type {
++                            if self.failed_write_jobs.contains(&e.id) {
++                                // Already reported failed with our own reason; keep that one.
++                                return true;
++                            }
++                            let mut job_type = None;
++                            if let Some(mut job) = fs::remove_job(e.id, &mut self.write_jobs) {
++                                // RemoteSmith(0801): keep a fully received last file (verified),
++                                // drop a partial one.
++                                if let Some(err) = job.finish().await {
++                                    log::warn!("job {}: {}", e.id, err);
++                                }
++                                job_type = Some(job.r#type);
++                            }
++                            let job_type = job_type
++                                .or_else(|| fs::remove_job(e.id, &mut self.read_jobs).map(|j| j.r#type));
++                            // Only a transfer job's failure is terminal; file operations
++                            // (remove, create, rename) reuse their id for later replies.
++                            let is_transfer = job_type.is_some();
++                            match job_type.unwrap_or(fs::JobType::Generic) {
+                                 fs::JobType::Generic => {
++                                    // Terminal: a Done after this Error (e.g. a sender that
++                                    // could not read its last file) must not report success.
++                                    if is_transfer {
++                                        self.failed_write_jobs.insert(e.id);
++                                    }
+                                     self.handle_job_status(e.id, e.file_num, Some(e.error));
+                                 }
+                                 fs::JobType::Printer => {
+@@ -3062,6 +3112,259 @@ mod tests {
+             "a clipboard after the login was held back"
+         );
+     }
++
++    // RemoteSmith(0801): downloads through the real message handlers.
++
++    #[tokio::test]
++    async fn a_failed_file_operation_does_not_swallow_its_later_replies() {
++        // Remote folder deletion reuses one id per file: a locked file's error must not
++        // make the next file's success disappear (round-2 gate review).
++        let (mut remote, mut peer, _far) = remote_and_peer().await;
++        let reply = |m: Message| m.write_to_bytes().unwrap();
++        let err = reply(fs::new_error(7100, "locked.txt: Permission denied", 0));
++        assert!(remote.handle_msg_from_peer(&err, &mut peer).await);
++        let ok = reply(fs::new_done(7100, 1));
++        assert!(remote.handle_msg_from_peer(&ok, &mut peer).await);
++        assert_eq!(
++            remote.job_reports,
++            vec![
++                (7100, Some("locked.txt: Permission denied".to_owned())),
++                (7100, None)
++            ]
++        );
++        assert!(remote.failed_write_jobs.is_empty());
++    }
++
++    fn file_response(set: impl FnOnce(&mut FileResponse)) -> Vec<u8> {
++        let mut fr = FileResponse::new();
++        set(&mut fr);
++        let mut msg = Message::new();
++        msg.set_file_response(fr);
++        msg.write_to_bytes().unwrap()
++    }
++
++    fn entry(name: &str, size: u64) -> FileEntry {
++        FileEntry {
++            name: name.to_owned(),
++            size,
++            modified_time: 1_600_000_000,
++            ..Default::default()
++        }
++    }
++
++    struct Download {
++        remote: Remote<FlutterHandler>,
++        peer: Stream,
++        _far: Stream,
++        dir: std::path::PathBuf,
++        id: i32,
++    }
++
++    impl Download {
++        /// A download job `id` of `files` into a fresh directory, as the UI and peer set it up.
++        async fn start(id: i32, files: Vec<FileEntry>) -> Self {
++            let (mut remote, mut peer, far) = remote_and_peer().await;
++            let dir = std::env::temp_dir().join(format!(
++                "rs_io_loop_xfer_{}_{}",
++                std::process::id(),
++                hbb_common::rand::random::<u32>()
++            ));
++            std::fs::create_dir_all(&dir).unwrap();
++            let ui = Data::SendFiles((
++                id,
++                fs::JobType::Generic,
++                "/remote/dir".to_owned(),
++                dir.to_string_lossy().to_string(),
++                0,
++                false,
++                true,
++            ));
++            assert!(remote.handle_msg_from_ui(ui, &mut peer).await);
++            let mut d = Self { remote, peer, _far: far, dir, id };
++            d.recv(file_response(|fr| {
++                fr.set_dir(FileDirectory {
++                    id,
++                    path: "/remote/dir".to_owned(),
++                    entries: files,
++                    ..Default::default()
++                })
++            }))
++            .await;
++            d
++        }
++
++        async fn recv(&mut self, bytes: Vec<u8>) {
++            assert!(self.remote.handle_msg_from_peer(&bytes, &mut self.peer).await);
++        }
++
++        async fn block(&mut self, file_num: i32, data: &[u8]) {
++            let (id, data) = (self.id, data.to_vec());
++            self.recv(file_response(|fr| {
++                fr.set_block(FileTransferBlock {
++                    id,
++                    file_num,
++                    data: data.into(),
++                    ..Default::default()
++                })
++            }))
++            .await;
++        }
++
++        async fn done(&mut self, file_num: i32) {
++            self.recv(fs::new_done(self.id, file_num).write_to_bytes().unwrap()).await;
++        }
++
++        async fn error(&mut self, file_num: i32, err: &str) {
++            self.recv(fs::new_error(self.id, err, file_num).write_to_bytes().unwrap()).await;
++        }
++
++        fn names(&self) -> Vec<String> {
++            let mut v: Vec<String> = std::fs::read_dir(&self.dir)
++                .unwrap()
++                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
++                .collect();
++            v.sort();
++            v
++        }
++    }
++
++    impl Drop for Download {
++        fn drop(&mut self) {
++            std::fs::remove_dir_all(&self.dir).ok();
++        }
++    }
++
++    #[tokio::test]
++    async fn complete_download_reports_done_once() {
++        let mut d = Download::start(7000, vec![entry("a", 3), entry("b", 0)]).await;
++        d.block(0, b"abc").await;
++        d.block(0, b"").await;
++        d.block(1, b"").await;
++        d.done(1).await;
++        assert_eq!(d.remote.job_reports, vec![(7000, None)]);
++        assert_eq!(d.names(), vec!["a", "b"]);
++    }
++
++    #[tokio::test]
++    async fn sender_error_then_done_stays_failed() {
++        // Gate review: a host that cannot read its last file sends Error, then Done.
++        let mut d = Download::start(7001, vec![entry("a", 3), entry("b", 2)]).await;
++        d.block(0, b"abc").await;
++        d.block(0, b"").await;
++        d.error(1, "b: Permission denied").await;
++        d.done(1).await;
++        assert_eq!(
++            d.remote.job_reports,
++            vec![(7001, Some("b: Permission denied".to_owned()))]
++        );
++        assert_eq!(d.names(), vec!["a"]); // the completed file is kept
++    }
++
++    #[tokio::test]
++    async fn short_download_with_end_of_file_is_a_failed_item() {
++        let mut d = Download::start(7002, vec![entry("a", 5)]).await;
++        d.block(0, b"abc").await;
++        d.block(0, b"").await;
++        d.done(0).await;
++        assert_eq!(d.remote.job_reports.len(), 1);
++        let err = d.remote.job_reports[0].1.clone().expect("must be a failure");
++        assert!(err.contains("received 3 bytes, 5 listed"), "{}", err);
++        assert!(d.names().is_empty(), "{:?}", d.names());
++    }
++
++    #[tokio::test]
++    async fn write_failure_cancels_and_a_late_done_is_ignored() {
++        let mut d = Download::start(7003, vec![entry("a", 3), entry("b", 1)]).await;
++        // The destination of `a` is a non-empty directory: the verified file cannot be
++        // renamed (as with a file held open on Windows). The failure surfaces when `b` starts.
++        std::fs::create_dir_all(d.dir.join("a/keep")).unwrap();
++        d.block(0, b"abc").await;
++        d.block(0, b"").await;
++        d.block(1, b"b").await;
++        d.done(1).await;
++        assert_eq!(d.remote.job_reports.len(), 1, "{:?}", d.remote.job_reports);
++        assert!(d.remote.job_reports[0].1.as_deref().unwrap().starts_with("a: "));
++        assert!(d.remote.write_jobs.is_empty());
++        // Cancelling the job kept a's verified data staged; nothing of b exists.
++        assert_eq!(d.names(), vec!["a", "a.digest", "a.download"]);
++    }
++
++    #[tokio::test]
++    async fn corrupt_compressed_block_fails_the_download() {
++        let mut d = Download::start(7004, vec![entry("a", 4)]).await;
++        let id = d.id;
++        d.recv(file_response(|fr| {
++            fr.set_block(FileTransferBlock {
++                id,
++                file_num: 0,
++                data: b"not zstd".to_vec().into(),
++                compressed: true,
++                ..Default::default()
++            })
++        }))
++        .await;
++        d.block(0, b"").await;
++        d.done(0).await;
++        assert_eq!(d.remote.job_reports.len(), 1);
++        assert!(d.remote.job_reports[0].1.as_deref().unwrap().contains("corrupt"));
++        assert!(d.names().is_empty(), "{:?}", d.names());
++    }
++
++    #[tokio::test]
++    async fn skip_decision_removes_only_own_stale_staging() {
++        // Overwrite detection on: the peer sends a digest per file and the user decides.
++        let (remote, peer, far) = remote_and_peer().await;
++        remote.handler.lc.write().unwrap().version = hbb_common::get_version_number("1.5.0");
++        let mut d = Download { remote, peer, _far: far, dir: std::env::temp_dir(), id: 7005 };
++        d.dir = std::env::temp_dir().join(format!(
++            "rs_io_loop_skip_{}_{}",
++            std::process::id(),
++            hbb_common::rand::random::<u32>()
++        ));
++        std::fs::create_dir_all(&d.dir).unwrap();
++        for name in ["report", "ours"] {
++            std::fs::write(d.dir.join(name), b"dest").unwrap();
++            std::fs::write(d.dir.join(format!("{name}.download")), b"st").unwrap();
++        }
++        std::fs::write(d.dir.join("report.digest"), b"user notes").unwrap();
++        std::fs::write(d.dir.join("ours.digest"), r#"{"size":4,"modified":1600000000}"#).unwrap();
++        let ui = Data::SendFiles((
++            7005,
++            fs::JobType::Generic,
++            "/remote/dir".to_owned(),
++            d.dir.to_string_lossy().to_string(),
++            0,
++            false,
++            true,
++        ));
++        assert!(d.remote.handle_msg_from_ui(ui, &mut d.peer).await);
++        d.recv(file_response(|fr| {
++            fr.set_dir(FileDirectory {
++                id: 7005,
++                path: "/remote/dir".to_owned(),
++                entries: vec![entry("report", 4), entry("ours", 4)],
++                ..Default::default()
++            })
++        }))
++        .await;
++        for file_num in 0..2 {
++            d.recv(file_response(|fr| {
++                fr.set_digest(FileTransferDigest {
++                    id: 7005,
++                    file_num,
++                    file_size: 4,
++                    last_modified: 1_600_000_000,
++                    ..Default::default()
++                })
++            }))
++            .await;
++            // The existing destination asks the user; nothing is removed before the answer.
++            assert_eq!(d.names().len(), 6, "{:?}", d.names());
++            let skip = Data::SetConfirmOverrideFile((7005, file_num, false, false, false));
++            assert!(d.remote.handle_msg_from_ui(skip, &mut d.peer).await);
++        }
++        assert_eq!(d.names(), vec!["ours", "report", "report.digest", "report.download"]);
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/ipc.rs b/src/ipc.rs
+index 1d6dd42c894c..2d40a281e27e 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -170,6 +170,9 @@ pub enum FS {
+         overwrite_detection: bool,
+         total_size: u64,
+         conn_id: i32,
++        // RemoteSmith(0801): announced size of each file, so the host can verify what it got.
++        #[serde(default)]
++        file_sizes: Vec<u64>,
+     },
+     CancelWrite {
+         id: i32,
+diff --git a/src/server/connection.rs b/src/server/connection.rs
+index 51661851e4a1..3ae6fc32607f 100644
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -3834,6 +3834,7 @@ impl Connection {
+                                     overwrite_detection: od,
+                                     total_size: r.total_size,
+                                     conn_id: self.inner.id(),
++                                    file_sizes: r.files.iter().map(|f| f.size).collect(),
+                                 });
+                                 self.post_file_audit(
+                                     FileAuditType::RemoteReceive,
+diff --git a/src/ui_cm_interface.rs b/src/ui_cm_interface.rs
+index ee64eaaf5ed1..c78340d69baa 100644
+--- a/src/ui_cm_interface.rs
++++ b/src/ui_cm_interface.rs
+@@ -1068,13 +1068,16 @@ async fn handle_fs(
+             overwrite_detection,
+             total_size,
+             conn_id,
++            file_sizes,
+         } => {
+             // Convert files to FileEntry
+             let file_entries: Vec<FileEntry> = files
+                 .drain(..)
+-                .map(|f| FileEntry {
++                .enumerate()
++                .map(|(i, f)| FileEntry {
+                     name: f.0,
+                     modified_time: f.1,
++                    size: file_sizes.get(i).copied().unwrap_or_default(),
+                     ..Default::default()
+                 })
+                 .collect();
+@@ -1101,7 +1104,7 @@ async fn handle_fs(
+             write_jobs.push(job);
+         }
+         ipc::FS::CancelWrite { id } => {
+-            if let Some(job) = fs::remove_job(id, write_jobs) {
++            if let Some(mut job) = fs::remove_job(id, write_jobs) {
+                 job.remove_download_file();
+                 if let Some(tx) = tx_log {
+                     if let Err(e) = tx.send(serialize_transfer_job(&job, false, true, "")) {
+@@ -1111,14 +1114,24 @@ async fn handle_fs(
+             }
+         }
+         ipc::FS::WriteDone { id, file_num } => {
+-            if let Some(job) = fs::remove_job(id, write_jobs) {
+-                job.modify_time();
+-                send_raw(fs::new_done(id, file_num), tx);
+-                tx_log.map(|tx| tx.send(serialize_transfer_job(&job, true, false, "")));
++            if let Some(mut job) = fs::remove_job(id, write_jobs) {
++                // RemoteSmith(0801, AC-18): verify and finalize before reporting done.
++                if let Some(err) = job.finish().await {
++                    log::error!("upload job {} failed: {}", id, err);
++                    tx_log.map(|tx| tx.send(serialize_transfer_job(&job, false, false, &err)));
++                    send_raw(fs::new_error(id, err, file_num), tx);
++                } else {
++                    send_raw(fs::new_done(id, file_num), tx);
++                    tx_log.map(|tx| tx.send(serialize_transfer_job(&job, true, false, "")));
++                }
+             }
+         }
+         ipc::FS::WriteError { id, file_num, err } => {
+-            if let Some(job) = fs::remove_job(id, write_jobs) {
++            if let Some(mut job) = fs::remove_job(id, write_jobs) {
++                // RemoteSmith(0801): keep a fully received last file (verified), drop a partial one.
++                if let Some(e) = job.finish().await {
++                    log::warn!("upload job {}: {}", id, e);
++                }
+                 tx_log.map(|tx| tx.send(serialize_transfer_job(&job, false, false, &err)));
+                 send_raw(fs::new_error(job.id(), err, file_num), tx);
+             }
+@@ -1140,6 +1153,14 @@ async fn handle_fs(
+                     })
+                     .await
+                 {
++                    // RemoteSmith(0801, AC-18/AC-48): the job is failed once (the controller
++                    // then stops sending) and its staging data is already removed.
++                    log::error!("upload job {} failed: {}", id, err);
++                    if let Some(job) = fs::remove_job(id, write_jobs) {
++                        tx_log.map(|tx| {
++                            tx.send(serialize_transfer_job(&job, false, false, &err.to_string()))
++                        });
++                    }
+                     send_raw(fs::new_error(id, err, file_num), &tx);
+                 }
+             }
+@@ -1890,4 +1911,63 @@ mod tests {
+ 
+         let _ = fs::remove_dir_all(&base_dir);
+     }
++
++    // RemoteSmith(0801): host-side uploads through handle_fs, as the server process drives it.
++    #[cfg(not(any(target_os = "ios")))]
++    async fn upload(id: i32, dir: &std::path::Path, size: u64, blocks: &[&[u8]]) -> Vec<Message> {
++        let (tx, mut rx) = unbounded_channel();
++        let (mut write_jobs, mut read_jobs) = (Vec::new(), Vec::new());
++        let mut msgs = vec![ipc::FS::NewWrite {
++            path: dir.to_string_lossy().to_string(),
++            id,
++            file_num: 0,
++            files: vec![("up.bin".to_owned(), 1_600_000_000)],
++            overwrite_detection: false,
++            total_size: size,
++            conn_id: 1,
++            file_sizes: vec![size],
++        }];
++        for b in blocks {
++            msgs.push(ipc::FS::WriteBlock {
++                id,
++                file_num: 0,
++                data: b.to_vec().into(),
++                compressed: false,
++            });
++        }
++        msgs.push(ipc::FS::WriteDone { id, file_num: 0 });
++        for m in msgs {
++            handle_fs(m, &mut write_jobs, &mut read_jobs, &tx, None, 1).await;
++        }
++        let mut out = Vec::new();
++        while let Ok(Data::RawMessage(bytes)) = rx.try_recv() {
++            out.push(Message::parse_from_bytes(&bytes).unwrap());
++        }
++        out
++    }
++
++    #[test]
++    #[cfg(not(any(target_os = "ios")))]
++    fn upload_is_verified_before_done() {
++        use base::message_proto::file_response;
++        let dir = std::env::temp_dir().join(format!("rs_cm_upload_{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        let kind = |m: &Message| match &m.file_response().union {
++            Some(file_response::Union::Done(_)) => "done".to_owned(),
++            Some(file_response::Union::Error(e)) => format!("error: {}", e.error),
++            other => format!("{:?}", other),
++        };
++        let rt = Runtime::new().unwrap();
++        // Short data, properly terminated: an error, never done, and no final file.
++        let out = rt.block_on(upload(8001, &dir, 5, &[b"abc", b""]));
++        assert_eq!(out.len(), 1);
++        assert!(kind(&out[0]).contains("received 3 bytes, 5 listed"), "{}", kind(&out[0]));
++        assert!(!dir.join("up.bin").exists() && !dir.join("up.bin.download").exists());
++        // Complete data: done, file in place.
++        let out = rt.block_on(upload(8002, &dir, 3, &[b"abc", b""]));
++        assert_eq!(out.iter().map(kind).collect::<Vec<_>>(), vec!["done"]);
++        assert_eq!(fs::read(dir.join("up.bin")).unwrap(), b"abc");
++        let _ = fs::remove_dir_all(&dir);
++    }
+ }

@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:34:49 -0400
+Subject: remotesmith(0803): no-display state in All-displays mode
+
+AC-52, DEF-5 (whole-product review finding 14). When the host's display
+list became empty while the client viewed All displays, sync_peer_info
+went to updateCurDisplay, which returns early without a display
+rectangle, so the last frame stayed up with no explanation. Upstream's
+"No Displays" message existed only for a single selected display.
+
+The empty list is now decided first, in every view mode
+(remotesmith/display_topology.dart): the client releases held keys,
+held mouse buttons and local input capture, and shows "No display
+available". The message can be closed without ending the session, so
+the view resumes if a display comes back.
+
+Test: flutter/test/remotesmith_display_topology_test.dart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ flutter/lib/models/input_model.dart           | 14 ++++++
+ flutter/lib/models/model.dart                 | 15 +++++--
+ flutter/lib/remotesmith/display_topology.dart | 43 +++++++++++++++++++
+ .../remotesmith_display_topology_test.dart    | 35 +++++++++++++++
+ 4 files changed, 104 insertions(+), 3 deletions(-)
+ create mode 100644 flutter/lib/remotesmith/display_topology.dart
+ create mode 100644 flutter/test/remotesmith_display_topology_test.dart
+
+diff --git a/flutter/lib/models/input_model.dart b/flutter/lib/models/input_model.dart
+index 6c66a4d5b83e..b20c8ba6e7a1 100644
+--- a/flutter/lib/models/input_model.dart
++++ b/flutter/lib/models/input_model.dart
+@@ -9,6 +9,7 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
+ import 'package:flutter/gestures.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter/widgets.dart';
++import 'package:flutter_hbb/remotesmith/display_topology.dart';
+ import 'package:flutter_hbb/main.dart';
+ import 'package:flutter_hbb/utils/multi_window_manager.dart';
+ import 'package:get/get.dart';
+@@ -1273,6 +1274,19 @@ class InputModel {
+     onRemoteSmithReleaseCapture?.call();
+   }
+ 
++  /// RemoteSmith (AC-52, DEF-5): the host has no display left, so nothing on screen can take
++  /// input. Release held keys and mouse buttons on the host, then local capture.
++  void remoteSmithReleaseHeldInput() {
++    toReleaseKeys.release(handleKeyEvent);
++    toReleaseRawKeys.release(handleRawKeyEvent);
++    for (final name in heldMouseButtons(_lastButtons)) {
++      _sendMouseUnchecked(
++          'up', MouseButtons.values.firstWhere((b) => b.value == name));
++    }
++    _lastButtons = 0;
++    remoteSmithReleaseCapture();
++  }
++
+   void disposeRelativeMouseMode() {
+     _relativeMouse.dispose();
+     onRelativeMouseModeDisabled = null;
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index 813f0bfe4240..9edd08f86988 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
+ import 'package:flutter/scheduler.dart';
+ import 'package:flutter_hbb/common/widgets/peers_view.dart';
+ import 'package:flutter_hbb/consts.dart';
++import 'package:flutter_hbb/remotesmith/display_topology.dart';
+ import 'package:flutter_hbb/models/ab_model.dart';
+ import 'package:flutter_hbb/models/chat_model.dart';
+ import 'package:flutter_hbb/models/cm_file_model.dart';
+@@ -1720,12 +1721,20 @@ class FfiModel with ChangeNotifier {
+       _pi.displays.value = newDisplays;
+       _pi.displaysCount.value = _pi.displays.length;
+ 
+-      if (_pi.currentDisplay == kAllDisplayValue) {
++      // RemoteSmith (AC-52, DEF-5): the empty list is handled first, in every view mode.
++      final update = displaysUpdate(
++          displayCount: _pi.displays.length,
++          currentDisplay: _pi.currentDisplay,
++          allDisplaysValue: kAllDisplayValue);
++      if (update == DisplaysUpdate.noDisplay) {
++        parent.target?.inputModel.remoteSmithReleaseHeldInput();
++        msgBox(sessionId, 'custom-nook-nocancel-hasclose-error', 'Prompt',
++            'No display available', '', parent.target!.dialogManager);
++      } else if (_pi.currentDisplay == kAllDisplayValue) {
+         updateCurDisplay(sessionId);
+         // to-do: What if the displays are changed?
+       } else {
+-        if (_pi.currentDisplay >= 0 &&
+-            _pi.currentDisplay < _pi.displays.length) {
++        if (update == DisplaysUpdate.updateView) {
+           updateCurDisplay(sessionId);
+         } else {
+           if (_pi.displays.isNotEmpty) {
+diff --git a/flutter/lib/remotesmith/display_topology.dart b/flutter/lib/remotesmith/display_topology.dart
+new file mode 100644
+index 000000000000..95a1518c70ab
+--- /dev/null
++++ b/flutter/lib/remotesmith/display_topology.dart
+@@ -0,0 +1,43 @@
++/// RemoteSmith display topology policy (DEF-5, AC-52).
++///
++/// Upstream only noticed an empty display list when a single display was selected; in
++/// All-displays mode it kept the last frame and the old display geometry. The empty case is now
++/// decided first, whatever the view mode.
++library;
++
++/// What to do when the host reports a new display list.
++enum DisplaysUpdate {
++  /// No display left: show "No display available" and release held input.
++  noDisplay,
++
++  /// The current selection (one display, or all of them) still exists: refresh the view.
++  updateView,
++
++  /// The selected display is gone but others remain: switch to a remaining one.
++  switchDisplay,
++}
++
++/// [currentDisplay] is the selected display index, or [allDisplaysValue] in All-displays mode.
++DisplaysUpdate displaysUpdate({
++  required int displayCount,
++  required int currentDisplay,
++  required int allDisplaysValue,
++}) {
++  if (displayCount <= 0) return DisplaysUpdate.noDisplay;
++  if (currentDisplay == allDisplaysValue) return DisplaysUpdate.updateView;
++  if (currentDisplay >= 0 && currentDisplay < displayCount) {
++    return DisplaysUpdate.updateView;
++  }
++  return DisplaysUpdate.switchDisplay;
++}
++
++/// The mouse buttons held in a Flutter pointer `buttons` bitmask, by their RustDesk names
++/// (kPrimaryButton, kSecondaryButton, kMiddleMouseButton, kBackMouseButton,
++/// kForwardMouseButton).
++List<String> heldMouseButtons(int buttons) => [
++      if (buttons & 0x01 != 0) 'left',
++      if (buttons & 0x02 != 0) 'right',
++      if (buttons & 0x04 != 0) 'wheel',
++      if (buttons & 0x08 != 0) 'back',
++      if (buttons & 0x10 != 0) 'forward',
++    ];
+diff --git a/flutter/test/remotesmith_display_topology_test.dart b/flutter/test/remotesmith_display_topology_test.dart
+new file mode 100644
+index 000000000000..b86c537e55f6
+--- /dev/null
++++ b/flutter/test/remotesmith_display_topology_test.dart
+@@ -0,0 +1,35 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:flutter_hbb/remotesmith/display_topology.dart';
++
++void main() {
++  const all = -1;
++  DisplaysUpdate decide(int count, int current) => displaysUpdate(
++      displayCount: count, currentDisplay: current, allDisplaysValue: all);
++
++  test('the last display going away is the no-display state in every view mode', () {
++    // AC-52: All-displays mode used to skip this and keep a frozen frame.
++    expect(decide(0, all), DisplaysUpdate.noDisplay);
++    expect(decide(0, 0), DisplaysUpdate.noDisplay);
++    expect(decide(0, 2), DisplaysUpdate.noDisplay);
++  });
++
++  test('a remaining selection refreshes the view', () {
++    expect(decide(1, all), DisplaysUpdate.updateView);
++    expect(decide(3, all), DisplaysUpdate.updateView);
++    expect(decide(2, 0), DisplaysUpdate.updateView);
++    expect(decide(2, 1), DisplaysUpdate.updateView);
++  });
++
++  test('a removed selected display switches to a remaining one', () {
++    expect(decide(1, 1), DisplaysUpdate.switchDisplay);
++    expect(decide(2, 5), DisplaysUpdate.switchDisplay);
++    expect(decide(2, -7), DisplaysUpdate.switchDisplay);
++  });
++
++  test('held buttons are decoded from the pointer bitmask', () {
++    expect(heldMouseButtons(0), isEmpty);
++    expect(heldMouseButtons(0x01), ['left']);
++    expect(heldMouseButtons(0x03), ['left', 'right']);
++    expect(heldMouseButtons(0x1f), ['left', 'right', 'wheel', 'back', 'forward']);
++  });
++}
