@@ -24,7 +24,7 @@ fi
 rs_pin="$(git ls-tree HEAD vendor/rustdesk | awk '{print $3}')"
 if [[ "$(uname)" == Darwin && -f vendor/rustdesk/src/bridge_generated.rs ]] \
    && rustup toolchain list 2>/dev/null | grep -q '^1\.81' \
-   && git -C vendor/rustdesk log --format=%s "$rs_pin..HEAD" 2>/dev/null | grep -q '^remotesmith(0201)'; then
+   && git -C vendor/rustdesk log --format=%s "$rs_pin..HEAD" 2>/dev/null | grep '^remotesmith(0201)' >/dev/null; then
   echo "== rustdesk patch unit tests (keyboard::rs_keymap)"
   (
     # shellcheck disable=SC1091  # sourced relative to the repo root
@@ -51,6 +51,21 @@ if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/src/remotesmith/mod.rs \
   )
 else
   echo "== fork: RemoteSmith unit tests skipped (needs scripts/apply-patches.sh + scripts/build-mac.sh first)"
+fi
+# File-transfer staging/finalize tests carried by patch 0801 (crate `base`, no bridge needed).
+if [[ "$(uname -s)" == Darwin && -f vendor/rustdesk/libs/base/Cargo.toml ]] \
+   && git -C vendor/rustdesk log --format=%s "$rs_pin..HEAD" 2>/dev/null | grep '^remotesmith(0801)' >/dev/null \
+   && rustup toolchain list 2>/dev/null | grep -q '^1\.81'; then
+  echo "== fork: file-transfer tests (cargo test -p base --lib fs::, Rust 1.81)"
+  (
+    # shellcheck source=scripts/lib/mac-env.sh
+    source scripts/lib/mac-env.sh
+    cd vendor/rustdesk
+    RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" CARGO_TARGET_DIR="$CARGO_TARGET_CACHE" \
+      cargo test --locked -p base --lib fs::
+  )
+else
+  echo "== fork: file-transfer tests skipped (needs scripts/apply-patches.sh and the Rust 1.81 toolchain)"
 fi
 # The fork's RemoteSmith Flutter tests (patch 0502), with the pinned Flutter from bootstrap-mac.sh.
 if compgen -G "vendor/rustdesk/flutter/test/remotesmith_*_test.dart" >/dev/null \
