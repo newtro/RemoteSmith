@@ -1,5 +1,6 @@
-# RemoteSmith CI: apply patches/ onto vendor/rustdesk (RustDesk 1.5.0), then build
-# the macOS arm64 and Windows x64 Flutter apps.
+# RemoteSmith CI: apply patches/ onto vendor/rustdesk (RustDesk 1.5.0), run the RemoteSmith
+# test suites (sidecar, fork Rust, fork Flutter), then build the macOS arm64 and Windows x64
+# Flutter apps. The build jobs need the `tests` gate, so a red suite produces no artifacts.
 #
 # Every build job mirrors the matching job in upstream RustDesk 1.5.0's
 # vendor/rustdesk/.github/workflows/flutter-build.yml (and bridge.yml /
@@ -185,6 +186,261 @@ jobs:
             ./vendor/rustdesk/flutter/macos/Runner/bridge_generated.h
             ./vendor/rustdesk/flutter/ios/Runner/bridge_generated.h
 
+  # ---------------------------------------------------------------------------------------------
+  # RemoteSmith test suites (not in upstream). The same suites scripts/verify.sh runs locally.
+  # Every build job needs `tests`, the gate at the end of this block, so no artifact is produced
+  # from a red suite. Kept as separate jobs so the build jobs above/below stay upstream mirrors.
+  # ---------------------------------------------------------------------------------------------
+
+  # sidecar/ has its own toolchain (sidecar/rust-toolchain.toml), not vendor/rustdesk's pins.
+  test-sidecar-macos:
+    name: "test: sidecar (macOS)"
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sidecar
+        shell: bash
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: "RemoteSmith: Install the sidecar toolchain (sidecar/rust-toolchain.toml)"
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          if [[ -z "$channel" ]]; then echo "::error::no channel in sidecar/rust-toolchain.toml"; exit 1; fi
+          # Components and target as listed in rust-toolchain.toml, so rustup never auto-installs mid-run.
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy \
+            --target x86_64-pc-windows-msvc --no-self-update
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: sidecar-macos-14
+          workspaces: sidecar -> target
+
+      - name: "RemoteSmith: sidecar cargo fmt --check"
+        run: cargo fmt --check
+
+      - name: "RemoteSmith: sidecar cargo clippy -D warnings"
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: "RemoteSmith: sidecar cargo test"
+        run: cargo test --locked
+
+  test-sidecar-windows:
+    name: "test: sidecar (Windows)"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sidecar
+        shell: bash
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: "RemoteSmith: Install the sidecar toolchain (sidecar/rust-toolchain.toml)"
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          if [[ -z "$channel" ]]; then echo "::error::no channel in sidecar/rust-toolchain.toml"; exit 1; fi
+          # Components and target as listed in rust-toolchain.toml, so rustup never auto-installs mid-run.
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy \
+            --target x86_64-pc-windows-msvc --no-self-update
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: sidecar-windows
+          workspaces: sidecar -> target
+
+      - name: "RemoteSmith: sidecar cargo clippy -D warnings"
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: "RemoteSmith: sidecar cargo test"
+        run: cargo test --locked
+
+  # The fork's Rust unit tests: the whole `cargo test --lib` of the patched vendor/rustdesk with the
+  # macOS build's features (upstream's tests plus every RemoteSmith module), and hbb_common's.
+  # Same toolchain, vcpkg and bridge inputs as the aarch64-apple-darwin build job.
+  test-fork-rust-macos:
+    name: "test: fork Rust unit tests (macOS)"
+    needs: [generate-bridge]
+    runs-on: macos-14
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: vendor/rustdesk
+    env:
+      TARGET: aarch64-apple-darwin
+      VCPKG_TRIPLET: arm64-osx
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: "RemoteSmith: Apply patches"
+        working-directory: .
+        shell: bash
+        run: |
+          git config --global user.name "RemoteSmith CI"
+          git config --global user.email "ci@remotesmith.invalid"
+          bash scripts/apply-patches.sh
+
+      - name: Install build runtime
+        run: |
+          brew install llvm
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          # NASM 2.16.x, as the build job (vcpkg's aom and friends need 2.x, not brew's 3.x).
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: fork-test-macos-14
+          workspaces: vendor/rustdesk -> target
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./vendor/rustdesk
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          vcpkgJsonGlob: vendor/rustdesk/vcpkg.json
+          doNotCache: false
+
+      # Same files-backend cache and key as the aarch64-apple-darwin build job, so they share it.
+      - name: "RemoteSmith: Configure vcpkg binary cache"
+        shell: bash
+        run: |
+          dir="${RUNNER_TEMP}/vcpkg-binary-cache"
+          mkdir -p "$dir"
+          echo "VCPKG_BINARY_CACHE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$dir,readwrite" >> "$GITHUB_ENV"
+
+      - name: "RemoteSmith: Restore vcpkg binary cache"
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vendor/rustdesk/vcpkg.json', 'vendor/rustdesk/res/vcpkg/**', 'vendor/rustdesk/res/vcpkg-triplets/**') }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: "RemoteSmith: fork cargo test --lib (macOS features)"
+        run: cargo test --locked --lib --features flutter,hwcodec,unix-file-copy-paste,screencapturekit
+
+      # hbb_common's config tests share process-wide config state, hence one thread.
+      - name: "RemoteSmith: hbb_common cargo test --lib"
+        run: cargo test --locked -p hbb_common --lib -- --test-threads=1
+
+  # The fork's RemoteSmith Flutter tests (flutter/test/remotesmith_*_test.dart), with the same
+  # Flutter, Flutter patches and bridge files as the aarch64-apple-darwin build job.
+  test-fork-flutter-macos:
+    name: "test: fork Flutter tests (macOS)"
+    needs: [generate-bridge]
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: vendor/rustdesk
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: "RemoteSmith: Apply patches"
+        working-directory: .
+        shell: bash
+        run: |
+          git config --global user.name "RemoteSmith CI"
+          git config --global user.email "ci@remotesmith.invalid"
+          bash scripts/apply-patches.sh
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+            git apply ${{ github.workspace }}/vendor/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./vendor/rustdesk
+
+      - name: "RemoteSmith: fork Flutter tests (remotesmith_*_test.dart)"
+        working-directory: vendor/rustdesk/flutter
+        shell: bash
+        run: |
+          shopt -s nullglob
+          tests=(test/remotesmith_*_test.dart)
+          if ((${#tests[@]} == 0)); then echo "::error::no flutter/test/remotesmith_*_test.dart in the patched tree"; exit 1; fi
+          flutter test --timeout 120s "${tests[@]}"
+
+  # The gate the build jobs need. It runs only when every suite and ci-lint passed.
+  tests:
+    name: "tests passed (gate)"
+    needs: [ci-lint, test-sidecar-macos, test-sidecar-windows, test-fork-rust-macos, test-fork-flutter-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: "RemoteSmith: All test suites passed"
+        run: echo "ci-lint, sidecar (macOS, Windows), fork Rust and fork Flutter tests passed"
+
   # Mirrors third-party-RustDeskTempTopMostWindow.yml for the x64 matrix entry
   # (windows-2022, Release, x64, Windows10). The DLL goes into the Windows bundle.
   build-RustDeskTempTopMostWindow:
@@ -219,7 +475,7 @@ jobs:
   # Mirrors flutter-build.yml build-for-windows-flutter, x86_64-pc-windows-msvc matrix entry.
   build-for-windows-flutter:
     name: x86_64-pc-windows-msvc
-    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge, tests]
     runs-on: windows-2022
     timeout-minutes: 240
     defaults:
@@ -478,7 +734,7 @@ jobs:
   # Mirrors flutter-build.yml build-for-macOS, aarch64-apple-darwin matrix entry, minus signing.
   build-for-macOS:
     name: aarch64-apple-darwin
-    needs: [generate-bridge]
+    needs: [generate-bridge, tests]
     runs-on: macos-14
     timeout-minutes: 240
     defaults:

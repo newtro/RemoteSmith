@@ -1,6 +1,6 @@
 # CI
 
-One GitHub Actions workflow, [`.github/workflows/build.yml`](../.github/workflows/build.yml). It applies the RemoteSmith patches onto `vendor/rustdesk` (RustDesk 1.5.0) and builds the macOS arm64 and Windows x64 Flutter apps.
+One GitHub Actions workflow, [`.github/workflows/build.yml`](../.github/workflows/build.yml). It applies the RemoteSmith patches onto `vendor/rustdesk` (RustDesk 1.5.0), runs the RemoteSmith test suites, and builds the macOS arm64 and Windows x64 Flutter apps.
 
 ## Triggers
 
@@ -16,11 +16,18 @@ A newer run on the same ref cancels the older one (`concurrency` group per workf
 |---|---|---|
 | `ci-lint` | ubuntu-latest | `bash -n` on `scripts/*.sh` and `deploy/server/*.sh`. It also runs actionlint 1.7.12 (checksum-verified) on the workflows, with shellcheck on `run:` blocks, and `scripts/check-private.sh` (no public IP literals; AC-33). |
 | `generate-bridge` | ubuntu-22.04 | flutter_rust_bridge 1.80.1 codegen with Flutter 3.22.3 and Rust 1.75, run on the **patched** `src/flutter_ffi.rs`. Uploads `bridge-artifact`. |
+| `test-sidecar-macos` (`test: sidecar (macOS)`) | macos-14 | `cargo fmt --check`, `cargo clippy --locked --all-targets -D warnings` and `cargo test --locked` in `sidecar/`, on the toolchain `sidecar/rust-toolchain.toml` pins (not vendor/rustdesk's). |
+| `test-sidecar-windows` (`test: sidecar (Windows)`) | windows-latest | Sidecar clippy and tests on Windows, natively (the named-pipe IPC code paths). |
+| `test-fork-rust-macos` (`test: fork Rust unit tests (macOS)`) | macos-14 | Needs `generate-bridge`. The patched fork's whole `cargo test --locked --lib --features flutter,hwcodec,unix-file-copy-paste,screencapturekit` (upstream's tests plus every RemoteSmith module: keymap, identity/trust, reconnect, IPC, readiness, setup), then `cargo test -p hbb_common --lib -- --test-threads=1` (branding defaults, no default servers, LAN-only selection; the config tests share global state). Same Rust 1.81, vcpkg cache and bridge files as the mac build. |
+| `test-fork-flutter-macos` (`test: fork Flutter tests (macOS)`) | macos-14 | Needs `generate-bridge`. `flutter test` on every `flutter/test/remotesmith_*_test.dart` of the patched tree, with Flutter 3.24.5 and upstream's Flutter patches. Fails if there are none. |
+| `tests` (`tests passed (gate)`) | ubuntu-latest | Needs `ci-lint` and the four test jobs. Both build jobs need it, so when any suite fails the builds are skipped and no artifact is uploaded. |
 | `build-RustDeskTempTopMostWindow (x64)` | windows-2022 | Builds `WindowInjection.dll`, which the Windows bundle uses for privacy mode. |
 | `x86_64-pc-windows-msvc` | windows-2022 | The Windows Flutter app: portable folder, self-extracting exe and MSI. |
 | `aarch64-apple-darwin` | macos-14 | The macOS Flutter app: unsigned `.dmg` and `.app.zip`. |
 
 Every job that touches the source runs `bash scripts/apply-patches.sh` first. If that script doesn't exist yet, the job logs a "Patches skipped" notice and builds stock RustDesk.
+
+The build jobs start only after the `tests` gate, so a run takes roughly the fork Rust test job (a debug build of the whole crate; longest on a cold cache) plus the build. That is the price of never producing artifacts from a red suite. The test jobs run in parallel with each other and with `build-RustDeskTempTopMostWindow`.
 
 The upstream build runs about 35 min on macOS and 40 min on Windows. Job timeouts are 180–240 min. The first run on a branch takes longer, because the vcpkg and cargo caches are cold.
 
@@ -81,5 +88,7 @@ The toolchain matches upstream:
 8. **Pinned action versions:** upstream's SHAs everywhere except `actions/cache`. Upstream's `bridge.yml` uses a v3 SHA; this workflow uses v5.1.0. Swatinem/rust-cache gets `workspaces: vendor/rustdesk -> target`, and run-vcpkg gets `vcpkgJsonGlob: vendor/rustdesk/vcpkg.json`.
 
 ## Local checks
+
+`scripts/verify.sh` runs the same suites locally when their inputs exist (the fork tests need `scripts/apply-patches.sh` and a `scripts/build-mac.sh` run first).
 
 `scripts/verify.sh` runs `actionlint` on the workflows when it is installed (`brew install actionlint`). You can also run `ci-lint` locally with `act push -j ci-lint -P ubuntu-latest=catthehacker/ubuntu:act-latest --container-architecture linux/amd64 --container-daemon-socket -`. The macOS and Windows jobs can't run under `act`, which only runs Linux containers.
