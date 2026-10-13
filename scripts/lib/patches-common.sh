@@ -32,6 +32,18 @@ hbb_pin() {
   awk '{print $3}' <<<"$line"
 }
 
+# A pin must be an upstream commit. If someone `git add`ed the submodule after apply-patches, the
+# superproject would now point at a local patch commit that exists nowhere else.
+require_upstream_pins() { # rustdesk-pin hbb-pin
+  local pair label dir pin
+  for pair in "vendor/rustdesk:$RUSTDESK_DIR:$1" "libs/hbb_common:$HBB_DIR:$2"; do
+    IFS=: read -r label dir pin <<<"$pair"
+    if git -C "$dir" log -1 --format=%s "$pin" 2>/dev/null | grep -E "$SUBJECT_RE" >/dev/null; then
+      die "$label is pinned to RemoteSmith patch commit ${pin:0:12}, not an upstream commit; restore the gitlink (git checkout HEAD -- vendor/rustdesk, or fix the rustdesk tree)"
+    fi
+  done
+}
+
 # Numbered patch files for one target, sorted by name, into the global array PATCHES.
 # Validates names and that no number is used twice.
 load_patches() { # patches-subdir

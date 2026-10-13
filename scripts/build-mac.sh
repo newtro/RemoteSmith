@@ -43,6 +43,7 @@ done
 # with upstream's defaults. Build the RemoteSmith fork only when it is exactly the patch stack.
 RD_PIN="$(rustdesk_pin)"
 HBB_PIN="$(hbb_pin)"
+require_upstream_pins "$RD_PIN" "$HBB_PIN"
 if ((stock)); then
   [[ "$(git -C "$RUSTDESK_DIR" rev-parse HEAD)" == "$RD_PIN" && "$(git -C "$HBB_DIR" rev-parse HEAD)" == "$HBB_PIN" ]] \
     || die "--stock builds upstream RustDesk, but the submodules are not at their pins (vendor/rustdesk ${RD_PIN:0:12}, libs/hbb_common ${HBB_PIN:0:12}).
