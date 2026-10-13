@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Flutter macOS app (arm64, unsigned) from vendor/rustdesk the way upstream CI does.
 # Output: build/mac/<PRODUCT_NAME>.app, i.e. RemoteSmith.app once the branding patches are applied
-# (+ build/mac/build-*.log). Run scripts/bootstrap-mac.sh first.
+# (+ build/mac/build-*.log). Run scripts/apply-patches.sh and scripts/bootstrap-mac.sh first.
 #
 # Mirrors, at RustDesk 1.5.0:
 #   bridge.yml:86-104            generate the flutter_rust_bridge files (CI does this on Linux)
@@ -9,8 +9,12 @@
 #   flutter-build.yml:911-920    MIN_MACOS_VERSION=12.3 edits, then
 #                                ./build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit
 #
-# Usage: scripts/build-mac.sh [--skip-bridge]
+# Usage: scripts/build-mac.sh [--skip-bridge] [--stock]
 #   --skip-bridge   reuse the existing generated bridge files even if the sources changed
+#   --stock         deliberately build unpatched upstream RustDesk: both submodules must sit at their
+#                   pinned commits. Without it the build refuses to start unless vendor/rustdesk and
+#                   libs/hbb_common are on branch remotesmith with exactly the patches/ commits
+#                   (what scripts/apply-patches.sh produces; no missing, extra or edited commits).
 #
 # The cargo target dir is shared across worktrees at ~/.cache/remotesmith/target-mac (build.py and
 # the Xcode project hard-code ../../target/release, so vendor/rustdesk/target is a symlink to it).
@@ -18,18 +22,47 @@
 set -euo pipefail
 # shellcheck source=lib/mac-env.sh
 source "$(dirname "$0")/lib/mac-env.sh"
+# shellcheck source=lib/patches-common.sh
+source "$(dirname "$0")/lib/patches-common.sh"
 
-skip_bridge=0
+skip_bridge=0 stock=0
 for arg in "$@"; do
   case "$arg" in
     --skip-bridge) skip_bridge=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --stock) stock=1 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
 
 [[ -f "$RUSTDESK_DIR/build.py" ]] || die "vendor/rustdesk is not checked out; run: git submodule update --init --recursive --depth 1"
 [[ -f "$RUSTDESK_DIR/libs/hbb_common/Cargo.toml" ]] || die "libs/hbb_common is not checked out; run: git submodule update --init --recursive --depth 1"
+
+# --- patch state -------------------------------------------------------------------------------
+# A fresh clone's submodules sit at the upstream pins, and building that gives stock RustDesk.app
+# with upstream's defaults. Build the RemoteSmith fork only when it is exactly the patch stack.
+RD_PIN="$(rustdesk_pin)"
+HBB_PIN="$(hbb_pin)"
+if ((stock)); then
+  [[ "$(git -C "$RUSTDESK_DIR" rev-parse HEAD)" == "$RD_PIN" && "$(git -C "$HBB_DIR" rev-parse HEAD)" == "$HBB_PIN" ]] \
+    || die "--stock builds upstream RustDesk, but the submodules are not at their pins (vendor/rustdesk ${RD_PIN:0:12}, libs/hbb_common ${HBB_PIN:0:12}).
+To get there: git submodule update --init --recursive --force (discards the patch branch checkout; scripts/apply-patches.sh recreates it)"
+  echo "warning: --stock: building UNPATCHED upstream RustDesk (upstream defaults, not RemoteSmith)" >&2
+else
+  stack_ok=1
+  check_patch_stack "$RUSTDESK_DIR" "$RD_PIN" vendor/rustdesk rustdesk || stack_ok=0
+  check_patch_stack "$HBB_DIR" "$HBB_PIN" libs/hbb_common hbb_common || stack_ok=0
+  ((stack_ok)) || die "vendor/rustdesk and libs/hbb_common must carry exactly the patches/ stack (problems above).
+Fresh clone or stale checkout: scripts/apply-patches.sh. New commits on top: scripts/export-patches.sh first.
+To build unpatched upstream RustDesk on purpose: scripts/build-mac.sh --stock"
+fi
+for d in "$RUSTDESK_DIR" "$HBB_DIR"; do
+  dirty="$(dirty_summary "$d")"
+  [[ -z "$dirty" ]] || printf 'warning: %s has uncommitted changes; they go into this build but are not in patches/:\n%s\n' \
+    "${d#"$REPO_ROOT"/}" "$dirty" >&2
+done
+
+# --- toolchain present -------------------------------------------------------------------------
 [[ -f "$FLUTTER_ROOT_DIR/.remotesmith-ok" && -f "$BRIDGE_FLUTTER_ROOT_DIR/.remotesmith-ok" && -x "$VCPKG_ROOT/vcpkg" \
    && -x "$TOOLS_DIR/bin/flutter_rust_bridge_codegen" ]] || die "toolchain incomplete; run scripts/bootstrap-mac.sh"
 [[ "$(lipo -archs "$FLUTTER_ROOT_DIR/bin/cache/artifacts/engine/darwin-x64-release/gen_snapshot_arm64" 2>/dev/null)" == arm64 ]] \

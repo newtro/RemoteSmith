@@ -83,3 +83,50 @@ patch_file_hashes() {
 # uses it to tell a patch file that changed or appeared since then (another unit's work, pulled
 # from main) from one this branch owns.
 manifest_path() { echo "$(git -C "$1" rev-parse --absolute-git-dir)/remotesmith-applied"; }
+
+# Check that a submodule checkout is exactly its applied patch stack: branch $PATCH_BRANCH checked
+# out, HEAD = pin + one commit per patch file in file-name order, each commit's export
+# byte-identical to its patch file (the same identity apply-patches.sh's guard uses). Prints what
+# is wrong to stderr and returns 1; returns 0 when the stack is exact. Uncommitted edits are not
+# checked here (see dirty_summary).
+check_patch_stack() { # repo-dir pin label patches-subdir
+  local dir="$1" pin="$2" label="$3" sub="$4" branch merges c i=0 n bad=0 commits=""
+  load_patches "$sub"
+  n=${#PATCHES[@]}
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ "$branch" != "$PATCH_BRANCH" ]]; then
+    echo "$label: HEAD is ${branch:+branch $branch}${branch:-detached at $(git -C "$dir" rev-parse --short=12 HEAD)}, not branch $PATCH_BRANCH" >&2
+    bad=1
+  fi
+  if ! git -C "$dir" merge-base --is-ancestor "$pin" HEAD 2>/dev/null; then
+    echo "$label: HEAD does not contain the pinned upstream commit ${pin:0:12}" >&2
+    return 1
+  fi
+  merges="$(git -C "$dir" rev-list --merges HEAD "^$pin")"
+  if [[ -n "$merges" ]]; then
+    echo "$label: merge commits above the pin" >&2
+    return 1
+  fi
+  commits="$(git -C "$dir" rev-list --reverse HEAD "^$pin")"
+  for c in $commits; do
+    if ((i >= n)); then
+      echo "$label: commit $(git -C "$dir" log -1 --format='%h %s' "$c") is not in patches/$sub (run scripts/export-patches.sh)" >&2
+      bad=1
+    elif [[ "$(commit_hash "$dir" "$c")" != "$(file_hash "${PATCHES[$i]}")" ]]; then
+      echo "$label: commit $(git -C "$dir" log -1 --format='%h %s' "$c") does not match patches/$sub/$(basename "${PATCHES[$i]}")" >&2
+      bad=1
+    fi
+    i=$((i + 1))
+  done
+  while ((i < n)); do
+    echo "$label: patches/$sub/$(basename "${PATCHES[$i]}") is not applied" >&2
+    bad=1
+    i=$((i + 1))
+  done
+  return "$bad"
+}
+
+# Tracked files with uncommitted changes in a submodule checkout (empty when clean).
+dirty_summary() { # repo-dir
+  git -C "$1" status --porcelain --untracked-files=no --ignore-submodules=all
+}
