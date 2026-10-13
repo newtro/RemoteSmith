@@ -43,12 +43,15 @@ the final name with a "done" status.
 - Failures are terminal: once a job is reported failed (own write or
   finalize failure, or an Error from the sender), a later Done or Error
   for it is ignored, so e.g. a host that sends Error then Done for an
-  unreadable last file never shows success.
+  unreadable last file never shows success. This applies to transfer
+  jobs only; file operations (remove, create, rename) reuse their id for
+  later replies and are not affected.
 
 Tests through the real handlers: client::io_loop::tests (complete
 download, sender Error then Done, short data with end-of-file, rename
 failure while advancing plus cancel, corrupt compressed block, skip
-decision with user and stale staging files) and
+decision with user and stale staging files, a failed file operation
+followed by a success under the same id) and
 ui_cm_interface::tests::upload_is_verified_before_done. Unit tests
 (libs/base, fs::tests): complete files renamed with mtime, short
 file never finalized, short earlier file fails on switch and later blocks
@@ -59,11 +62,11 @@ and an ignored macOS test that fills a 5 MB hdiutil disk image.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  libs/base/src/fs.rs      | 575 +++++++++++++++++++++++++++++++++++++--
- src/client/io_loop.rs    | 299 +++++++++++++++++++-
+ src/client/io_loop.rs    | 329 +++++++++++++++++++++-
  src/ipc.rs               |   3 +
  src/server/connection.rs |   1 +
  src/ui_cm_interface.rs   |  94 ++++++-
- 5 files changed, 929 insertions(+), 43 deletions(-)
+ 5 files changed, 957 insertions(+), 45 deletions(-)
 
 diff --git a/libs/base/src/fs.rs b/libs/base/src/fs.rs
 index 1adb59077972..d301158e29e6 100644
@@ -748,7 +751,7 @@ index 1adb59077972..d301158e29e6 100644
 +    }
  }
 diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
-index 8e3473dbb5cd..e17c92864a89 100644
+index 8e3473dbb5cd..8a840ad28e5f 100644
 --- a/src/client/io_loop.rs
 +++ b/src/client/io_loop.rs
 @@ -82,6 +82,11 @@ pub struct Remote<T: InvokeUiSession> {
@@ -807,7 +810,7 @@ index 8e3473dbb5cd..e17c92864a89 100644
              job.remove_download_file();
          }
          let _ = fs::remove_job(id, &mut self.read_jobs);
-@@ -2024,22 +2036,36 @@ impl<T: InvokeUiSession> Remote<T> {
+@@ -2024,22 +2036,38 @@ impl<T: InvokeUiSession> Remote<T> {
                              }
                          }
                          Some(file_response::Union::Block(block)) => {
@@ -845,29 +848,33 @@ index 8e3473dbb5cd..e17c92864a89 100644
 -                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {
 -                                job.modify_time();
 -                                err = job.job_error();
++                            let mut is_transfer = false;
 +                            if let Some(mut job) = fs::remove_job(d.id, &mut self.write_jobs) {
++                                is_transfer = true;
 +                                // RemoteSmith(0801): verify and finalize before reporting done.
 +                                err = job.finish().await.or_else(|| job.job_error());
                                  job_type = job.r#type;
                                  printer_data = match job.get_buf_data().await {
                                      Ok(d) => d,
-@@ -2051,6 +2077,9 @@ impl<T: InvokeUiSession> Remote<T> {
+@@ -2051,6 +2079,9 @@ impl<T: InvokeUiSession> Remote<T> {
                              }
                              match job_type {
                                  fs::JobType::Generic => {
-+                                    if err.is_some() {
++                                    if err.is_some() && is_transfer {
 +                                        self.failed_write_jobs.insert(d.id);
 +                                    }
                                      self.handle_job_status(d.id, d.file_num, err);
                                  }
                                  fs::JobType::Printer => {
-@@ -2087,12 +2116,27 @@ impl<T: InvokeUiSession> Remote<T> {
+@@ -2087,12 +2118,31 @@ impl<T: InvokeUiSession> Remote<T> {
                              }
                          }
                          Some(file_response::Union::Error(e)) => {
 -                            let job_type = fs::remove_job(e.id, &mut self.write_jobs)
 -                                .or_else(|| fs::remove_job(e.id, &mut self.read_jobs))
 -                                .map(|j| j.r#type)
+-                                .unwrap_or(fs::JobType::Generic);
+-                            match job_type {
 +                            if self.failed_write_jobs.contains(&e.id) {
 +                                // Already reported failed with our own reason; keep that one.
 +                                return true;
@@ -882,22 +889,46 @@ index 8e3473dbb5cd..e17c92864a89 100644
 +                                job_type = Some(job.r#type);
 +                            }
 +                            let job_type = job_type
-+                                .or_else(|| fs::remove_job(e.id, &mut self.read_jobs).map(|j| j.r#type))
-                                 .unwrap_or(fs::JobType::Generic);
-                             match job_type {
++                                .or_else(|| fs::remove_job(e.id, &mut self.read_jobs).map(|j| j.r#type));
++                            // Only a transfer job's failure is terminal; file operations
++                            // (remove, create, rename) reuse their id for later replies.
++                            let is_transfer = job_type.is_some();
++                            match job_type.unwrap_or(fs::JobType::Generic) {
                                  fs::JobType::Generic => {
 +                                    // Terminal: a Done after this Error (e.g. a sender that
 +                                    // could not read its last file) must not report success.
-+                                    self.failed_write_jobs.insert(e.id);
++                                    if is_transfer {
++                                        self.failed_write_jobs.insert(e.id);
++                                    }
                                      self.handle_job_status(e.id, e.file_num, Some(e.error));
                                  }
                                  fs::JobType::Printer => {
-@@ -3062,6 +3106,239 @@ mod tests {
+@@ -3062,6 +3112,259 @@ mod tests {
              "a clipboard after the login was held back"
          );
      }
 +
 +    // RemoteSmith(0801): downloads through the real message handlers.
++
++    #[tokio::test]
++    async fn a_failed_file_operation_does_not_swallow_its_later_replies() {
++        // Remote folder deletion reuses one id per file: a locked file's error must not
++        // make the next file's success disappear (round-2 gate review).
++        let (mut remote, mut peer, _far) = remote_and_peer().await;
++        let reply = |m: Message| m.write_to_bytes().unwrap();
++        let err = reply(fs::new_error(7100, "locked.txt: Permission denied", 0));
++        assert!(remote.handle_msg_from_peer(&err, &mut peer).await);
++        let ok = reply(fs::new_done(7100, 1));
++        assert!(remote.handle_msg_from_peer(&ok, &mut peer).await);
++        assert_eq!(
++            remote.job_reports,
++            vec![
++                (7100, Some("locked.txt: Permission denied".to_owned())),
++                (7100, None)
++            ]
++        );
++        assert!(remote.failed_write_jobs.is_empty());
++    }
 +
 +    fn file_response(set: impl FnOnce(&mut FileResponse)) -> Vec<u8> {
 +        let mut fr = FileResponse::new();
