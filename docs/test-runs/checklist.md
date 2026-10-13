@@ -354,3 +354,67 @@ macOS `~/Library/Preferences/ai.johnnycode.RemoteSmith/`, Windows `%APPDATA%\Rem
    Apps & features links go to github.com/newtro/RemoteSmith; the MSI license page shows the
    AGPL notice that credits RustDesk.
 3. Settings > About shows the AGPL notice, "Based on RustDesk" and the source link.
+
+## C2: transfer data safety, config import, no-display state (unit C2, patches 0801, 0803, 0998, hbb_common 0802)
+
+Fixtures: a folder `xfer/` with `a.bin` (1 MB), `big.bin` (20 MB, e.g. `mkfile -n 20m` /
+`fsutil file createnew big.bin 20971520`) and `z.txt` (a few bytes), in that order. A transfer
+"fails" in the UI when its row shows the error state with the file name and reason; it must
+never show done. The staging file of `<name>` is `<name>.download` (+ `<name>.digest`) next to
+the destination.
+
+### C2-1 (AC-18, AC-48) Download onto a full disk
+1. Mac controller: `hdiutil create -size 10m -fs HFS+ -volname small /tmp/small.dmg && hdiutil attach /tmp/small.dmg`.
+2. In the file manager, download `xfer/` from the Windows host into `/Volumes/small`.
+3. Expect: the job fails with `big.bin: ... No space left on device` (or `incomplete file`);
+   `a.bin` is in place and byte-identical (`shasum` both sides); there is no `big.bin`,
+   `big.bin.download` or `big.bin.digest`, and no `z.txt`. The host's transfer stops (no more
+   traffic in its connection window).
+4. Free space (`hdiutil detach /Volumes/small`, recreate at 40m, attach) and download `xfer/`
+   again, choosing Skip for the existing `a.bin`: the rest arrives byte-identical and the job
+   shows done.
+
+### C2-2 (AC-18, AC-48) Upload onto a full disk (host side)
+1. On the Windows host, create a small volume: Disk Management > Action > Create VHD, 10 MB,
+   initialise and format NTFS as `S:`.
+2. From the Mac, upload `xfer/` to `S:\`.
+3. Expect the same outcome as C2-1 on `S:\`: failed job naming `big.bin`, `a.bin` intact, no
+   `big.bin*` left, and the connection window's transfer log shows the job as failed, not done.
+
+### C2-3 (AC-48) Disconnect mid-transfer, then Resume
+1. Download `xfer/` (use a larger `big.bin`, e.g. 500 MB, so it takes several seconds).
+2. While `big.bin` is copying, pull the host's network cable (or disable Wi-Fi) for longer than
+   the reconnect window, then restore it.
+3. Expect: `a.bin` is complete and byte-identical; `big.bin` exists only as
+   `big.bin.download`/`.digest`; no `big.bin`.
+4. Reconnect and open the file manager: the job is listed paused with Resume. Resume: `big.bin`
+   completes byte-identical (`shasum`), the staging files are gone, `z.txt` arrives, job done.
+
+### C2-4 (AC-48) App crash mid-transfer, then a new transfer of the same folder
+1. Start downloading `xfer/` with the 500 MB `big.bin`; while it copies, kill the client
+   (`pkill -9 RemoteSmith` / Task Manager > End task).
+2. Expect: `a.bin` intact; `big.bin.download` and `big.bin.digest` left behind; no `big.bin`.
+3. Relaunch and start a **new** download of `xfer/` to the same folder (do not Resume), Skip
+   for `a.bin`: once the transfer reaches `big.bin`, its stale staging files are removed and
+   replaced; at the end `big.bin` and `z.txt` are byte-identical and no `*.download`/`*.digest`
+   remains. Repeat with Skip chosen for `big.bin` too: its stale staging files are still removed.
+
+### C2-5 (AC-52) Last display unplugged while viewing All displays
+1. Windows host with one monitor (or a laptop with the lid open and no external display). From
+   the Mac, connect and choose All displays in the toolbar's monitor menu.
+2. Hold the left mouse button down over the remote image (start a drag), then unplug the
+   host's monitor / switch it off so Windows drops it (on a laptop: Win+P > "Second screen only"
+   with nothing attached).
+3. Expect: the client shows "No display available" (with only a Close button); the drag is
+   released on the host (no stuck button once a display is back) and the Mac cursor is free.
+4. Close the message and plug the monitor back in: the session shows the display again
+   without reconnecting.
+5. Repeat with a single display selected instead of All: same message and behaviour.
+
+### C2-6 (finding 10) `--import-config` rejects a malformed options file
+1. Mac: copy `RemoteSmith.toml` and `RemoteSmith2.toml` from
+   `~/Library/Preferences/ai.johnnycode.RemoteSmith/` to `/tmp/imp/`.
+2. Overwrite `/tmp/imp/RemoteSmith2.toml` with `[options` (a syntax error) and touch it newer.
+3. Run `/Applications/RemoteSmith.app/Contents/MacOS/RemoteSmith --import-config /tmp/imp/RemoteSmith.toml`:
+   it prints `Invalid config file: ...` and both live config files are unchanged (`shasum` before/after);
+   the ID server setting still shows the old value.

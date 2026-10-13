@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:32:43 -0400
+Subject: remotesmith(0998): reject malformed config files on import
+
+Whole-product review finding 10. --import-config read both source files
+with load_path, so a malformed newer *2.toml became default (empty)
+options, passed validation and replaced the valid server options.
+
+The import now uses hbb_common's try_load_path (patch hbb_common 0802)
+and rejects a source file that does not parse, an options file that is
+empty, and one whose options did not all survive parsing (Config2's
+field deserializers turn a wrongly typed value into a default). Both
+files are still validated before either destination is written. A
+missing options file is still allowed.
+
+Test: remotesmith::setup::tests::malformed_import_is_rejected.
+
+Numbered 0998 (outside unit C2's 0800-0899 range) because
+src/remotesmith/setup.rs only exists once 0990 has moved the module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/remotesmith/setup.rs | 101 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/src/remotesmith/setup.rs b/src/remotesmith/setup.rs
+index 58ddb295508c..f5cf357a4431 100644
+--- a/src/remotesmith/setup.rs
++++ b/src/remotesmith/setup.rs
+@@ -226,6 +226,18 @@ pub fn validate_imported_options(
+     validate_option(OPTION_LAN_ONLY, get(OPTION_LAN_ONLY))
+ }
+ 
++/// How many entries the file's `options` table has (`usize::MAX` if `options` is not a table),
++/// or `None` if this TOML parser cannot read the file (confy's older parser then decides).
++fn raw_option_count(text: &str) -> Option<usize> {
++    use hbb_common::toml::Value;
++    let v: Value = hbb_common::toml::from_str(text).ok()?;
++    Some(match v.get("options") {
++        None => 0,
++        Some(Value::Table(t)) => t.len(),
++        Some(_) => usize::MAX,
++    })
++}
++
+ /// `--import-config` (upstream's logic, reordered): load both source files and validate the
+ /// server options **before** writing either destination, so a rejected import changes nothing.
+ /// Upstream's freshness rules are kept: the primary file is copied only when it is newer than
+@@ -239,15 +251,32 @@ pub fn import_config_files(
+     exe_time: std::time::SystemTime,
+ ) -> Result<(bool, bool), String> {
+     use hbb_common::{
+-        config::{load_path, store_path, Config, Config2},
++        config::{store_path, try_load_path, Config, Config2},
+         get_modified_time,
+     };
+-    let config: Config = load_path(src.into());
++    // RemoteSmith(0802): a source file that exists but does not parse is rejected; upstream's
++    // load_path would turn it into defaults, which could then overwrite valid settings.
++    let invalid = |e: hbb_common::anyhow::Error| format!("Invalid config file: {e}");
++    let config: Config = try_load_path(src.into()).map_err(invalid)?;
+     if config.is_empty() {
+         hbb_common::log::info!("Empty source config, skipped");
+         return Ok((false, false));
+     }
+-    let config2: Config2 = load_path(src2.into());
++    let text2 = std::fs::read_to_string(src2).ok();
++    if text2.as_deref().map_or(false, |t| t.trim().is_empty()) {
++        return Err(format!("Invalid config file: {} is empty", src2.display()));
++    }
++    let config2: Config2 = try_load_path(src2.into()).map_err(invalid)?;
++    // Config2's field deserializers turn a wrongly typed value into a default instead of an
++    // error, so also check that every option in the file survived parsing.
++    if let Some(n) = text2.as_deref().and_then(raw_option_count) {
++        if n != config2.options.len() {
++            return Err(format!(
++                "Invalid config file: {} has malformed options",
++                src2.display()
++            ));
++        }
++    }
+     validate_imported_options(&config2.options)?;
+     let write1 = get_modified_time(src) > get_modified_time(dst) && get_modified_time(src) < exe_time;
+     let write2 = get_modified_time(src2) > get_modified_time(dst2);
+@@ -667,6 +696,72 @@ mod tests {
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
++    /// Finding 10: a malformed (or truncated-to-empty) newer source file is rejected and leaves
++    /// both destinations byte-identical, instead of importing defaults over valid settings.
++    #[test]
++    fn malformed_import_is_rejected() {
++        let dir = std::env::temp_dir().join(format!(
++            "remotesmith-import-bad-{}-{}",
++            std::process::id(),
++            hbb_common::rand::random::<u32>()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let (dst, dst2) = (dir.join("dst.toml"), dir.join("dst2.toml"));
++        std::fs::write(&dst, "id = '111111111'\npassword = 'old'\n").unwrap();
++        std::fs::write(
++            &dst2,
++            format!("[options]\ncustom-rendezvous-server = 'old.example.com'\nkey = '{KEY}'\n"),
++        )
++        .unwrap();
++        let before = (std::fs::read(&dst).unwrap(), std::fs::read(&dst2).unwrap());
++        std::thread::sleep(std::time::Duration::from_millis(1100));
++        let (src, src2) = (dir.join("src.toml"), dir.join("src2.toml"));
++        let good_src = "id = '999999999'\npassword = 'new'\nkey_pair = [[1, 2, 3], [4, 5, 6]]\n";
++        let far_future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
++        let unchanged = || {
++            assert_eq!(std::fs::read(&dst).unwrap(), before.0);
++            assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        };
++        // A valid primary with a malformed, newer options file.
++        std::fs::write(&src, good_src).unwrap();
++        for bad2 in [
++            "[options\nkey = 'x'\n",
++            "[options]\nkey = \n",
++            "options = 3\n",
++            "[options]\ncustom-rendezvous-server = 7\n",
++            "",
++            "  \n",
++        ] {
++            std::fs::write(&src2, bad2).unwrap();
++            let err = import_config_files(&src, &src2, &dst, &dst2, far_future).unwrap_err();
++            assert!(err.starts_with("Invalid config file"), "{err}");
++            unchanged();
++        }
++        // A malformed primary is rejected too (upstream skipped it as "empty" at best).
++        std::fs::write(&src2, format!("[options]\ncustom-rendezvous-server = 'rs.example.com'\nkey = '{KEY}'\n")).unwrap();
++        std::fs::write(&src, "id = '999999999'\nkey_pair = [[1, 2, 3]\n").unwrap();
++        assert!(import_config_files(&src, &src2, &dst, &dst2, far_future).is_err());
++        unchanged();
++        // A missing options file is still allowed (nothing to import for it).
++        std::fs::write(&src, good_src).unwrap();
++        std::fs::remove_file(&src2).unwrap();
++        assert_eq!(import_config_files(&src, &src2, &dst, &dst2, far_future), Ok((true, false)));
++        assert_eq!(std::fs::read(&dst2).unwrap(), before.1);
++        // A file written by the app itself (confy's serializer) passes the option-count check.
++        let mut cfg2 = hbb_common::config::Config2::default();
++        for (k, v) in [
++            ("custom-rendezvous-server", "rs.example.com"),
++            ("key", KEY),
++            ("whitelist", "192.168.1.0/24,10.0.0.1"),
++            ("note", "quote \" and 'apostrophe' and \\ backslash"),
++        ] {
++            cfg2.options.insert(k.to_owned(), v.to_owned());
++        }
++        hbb_common::config::store_path(src2.clone(), cfg2).unwrap();
++        assert_eq!(import_config_files(&src, &src2, &dst, &dst2, far_future), Ok((false, true)));
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
+     #[test]
+     fn no_personal_defaults() {
+         // DEC-15 / AC-33: the source carries no server host or key.

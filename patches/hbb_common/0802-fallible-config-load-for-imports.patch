@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Smith <scott@newtrostudios.com>
+Date: Mon, 12 Oct 2026 20:32:43 -0400
+Subject: remotesmith(0802): fallible config load for imports
+
+Whole-product review finding 10 (DEC-10 import path). load_path turns
+a parse error into default values, which is right for the app's own
+files but lets a malformed imported file overwrite valid settings.
+try_load_path keeps "missing file = default" and returns an error for a
+file that exists but cannot be read or parsed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/config.rs b/src/config.rs
+index 9ad49dc5ba07..2211463d4ddd 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -603,6 +603,23 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
+     cfg
+ }
+ 
++/// RemoteSmith(0802): like [`load_path`], but a file that exists and cannot be read or parsed
++/// is an error instead of silently becoming the default. A missing file is still the default.
++/// For imports, where a malformed file must be rejected rather than overwrite good settings.
++pub fn try_load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default>(
++    file: PathBuf,
++) -> crate::ResultType<T> {
++    match confy::load_path(&file) {
++        Ok(config) => Ok(config),
++        Err(confy::ConfyError::GeneralLoadError(err))
++            if err.kind() == std::io::ErrorKind::NotFound =>
++        {
++            Ok(T::default())
++        }
++        Err(err) => crate::bail!("{}: {}", file.display(), err),
++    }
++}
++
+ #[inline]
+ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultType<()> {
+     #[cfg(not(windows))]
